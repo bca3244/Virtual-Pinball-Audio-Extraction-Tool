@@ -43,9 +43,6 @@ enum Cmd {
         /// ffmpeg.exe for encoding [default: Popper's own, else PATH; else Windows' MP3 encoder].
         #[arg(long)]
         ffmpeg: Option<PathBuf>,
-        /// Output format.
-        #[arg(long, value_enum, default_value_t = encode::Format::Mp3)]
-        format: encode::Format,
         /// Recordings at once [default: half the CPU cores less one, 1 to 6].
         #[arg(long)]
         parallel: Option<usize>,
@@ -60,6 +57,9 @@ struct Common {
     /// Only these tables (Popper GameName, display name, or ROM name; repeatable).
     #[arg(long = "game", short = 'g')]
     games: Vec<String>,
+    /// Output format (scan uses it to find clips already recorded).
+    #[arg(long, value_enum, default_value_t = encode::Format::Mp3)]
+    format: encode::Format,
     /// Clip length in seconds (5 to 60).
     #[arg(long, default_value_t = capture::DEFAULT_SECONDS)]
     seconds: u32,
@@ -81,10 +81,10 @@ struct Common {
 }
 
 impl Common {
-    fn options(&self, format: encode::Format) -> record::Options {
+    fn options(&self) -> record::Options {
         record::Options {
             seconds: capture::clamp_seconds(self.seconds),
-            format,
+            format: self.format,
             force: self.force,
             retry: self.retry,
             include_hidden: self.include_hidden,
@@ -179,7 +179,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Cmd::Restore { .. } => unreachable!("handled above"),
         Cmd::Scan(common) => {
-            let opts = common.options(encode::Format::Mp3);
+            let opts = common.options();
             let entries = record::plan(&db, &cache, &opts)?;
             print_plan(&entries);
             Ok(())
@@ -188,11 +188,11 @@ fn run(cli: Cli) -> Result<()> {
             common,
             pinmame_dll,
             ffmpeg,
-            format,
             parallel,
             dry_run,
         } => {
-            let opts = common.options(format);
+            let format = common.format;
+            let opts = common.options();
             let entries = record::plan(&db, &cache, &opts)?;
             let todo = entries
                 .iter()

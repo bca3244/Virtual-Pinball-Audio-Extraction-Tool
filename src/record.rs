@@ -686,6 +686,8 @@ impl Runner<'_> {
             }
             Outcome::Nothing | Outcome::NotStarted => {
                 s.nothing += 1;
+                // A clip from an earlier run is no longer this ROM's music.
+                self.cache.remove_clips(&job.rom, self.opts.seconds);
                 let reason = if outcome == Outcome::Nothing {
                     "the ROM gave no music"
                 } else {

@@ -26,9 +26,31 @@ impl Cache {
         Ok(Cache { dir })
     }
 
-    /// `clips\<rom>-<secs>s` (no extension: the encoder adds it).
+    /// `clips\<rom>-<secs>s-v<n>` (no extension: the encoder adds it).
+    /// The version keeps clips from an older recorder (which could save
+    /// an idle sound board's static as music) from ever being reused.
     pub fn clip_stem(&self, rom: &str, seconds: u32) -> PathBuf {
-        self.dir.join("clips").join(format!("{rom}-{seconds}s"))
+        self.dir
+            .join("clips")
+            .join(format!("{rom}-{seconds}s-v{CLIP_VERSION}"))
+    }
+
+    /// Forgets every cached clip of this ROM at this length, in any format
+    /// and from any recorder version.
+    pub fn remove_clips(&self, rom: &str, seconds: u32) {
+        let prefix = format!("{rom}-{seconds}s").to_ascii_lowercase();
+        let Ok(dir) = std::fs::read_dir(self.dir.join("clips")) else {
+            return;
+        };
+        for e in dir.flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            let rest = name.strip_prefix(&prefix);
+            if rest.is_some_and(|r| r.starts_with('.') || r.starts_with("-v")) {
+                if let Err(err) = std::fs::remove_file(e.path()) {
+                    log::warn!("couldn't delete {}: {err}", e.path().display());
+                }
+            }
+        }
     }
 
     /// A clip of this ROM at this length in exactly this format. Files
@@ -99,6 +121,10 @@ fn describe(p: &Path) -> String {
 /// "no music" verdicts are tried again.
 const RECORDER_VERSION: u32 = 2;
 
+/// Bumped when clips recorded before it can't be trusted (v2: static
+/// from an idle sound board is no longer taken for music).
+const CLIP_VERSION: u32 = 2;
+
 pub fn fingerprint(zip: &Path, nvram: Option<&Path>) -> String {
     let siblings = zip
         .parent()
@@ -153,6 +179,31 @@ mod tests {
         );
         std::fs::write(dir.path().join("parent.zip"), b"1").unwrap();
         assert_ne!(one, fingerprint(&zip, None));
+    }
+
+    #[test]
+    fn old_clips_are_ignored_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(Some(dir.path())).unwrap();
+        let clips = dir.path().join("clips");
+        // A clip from before the static guard: never reused.
+        std::fs::write(clips.join("diner_l4-30s.ogg"), [0u8; 2048]).unwrap();
+        assert!(c.clip("diner_l4", 30, "ogg").is_none());
+        std::fs::write(
+            c.clip_stem("diner_l4", 30).with_extension("mp3"),
+            [0u8; 2048],
+        )
+        .unwrap();
+        std::fs::write(clips.join("diner_l3-30s.ogg"), [0u8; 2048]).unwrap();
+        std::fs::write(clips.join("diner_l4-45s.ogg"), [0u8; 2048]).unwrap();
+        c.remove_clips("diner_l4", 30);
+        let mut left: Vec<_> = std::fs::read_dir(&clips)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["diner_l3-30s.ogg", "diner_l4-45s.ogg"]);
     }
 
     #[test]
