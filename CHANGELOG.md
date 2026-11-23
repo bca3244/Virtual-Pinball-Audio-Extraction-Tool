@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.11
+
+- The play and stop buttons are drawn as a triangle and a square instead of font symbols, which showed up as empty boxes on some PCs.
+
 ## 0.1.0-beta.10
 
 - A ⏵ button beside each table's Audio plays it in the window (⏹ stops it), one at a time, through the default sound device. Tables with a clip already recorded but not yet installed can be previewed the same way. Files the built-in decoders can't read open in the default player instead.

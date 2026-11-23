@@ -17,6 +17,53 @@ use vp_audio_extract::encode::Format;
 use vp_audio_extract::record::{self, Entry, Status};
 use vp_audio_extract::{backup, capture, encode, popper, state};
 
+/// A small play (triangle) or stop (square) button, drawn rather than
+/// taken from a font glyph, which the default fonts may lack.
+fn play_button(ui: &mut egui::Ui, on: bool, enabled: bool) -> egui::Response {
+    let size = egui::vec2(20.0, 18.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    if ui.is_rect_visible(rect) {
+        let v = if enabled {
+            ui.style().interact(&resp)
+        } else {
+            &ui.visuals().widgets.noninteractive
+        };
+        let p = ui.painter();
+        p.rect(
+            rect,
+            v.corner_radius,
+            v.weak_bg_fill,
+            v.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let c = rect.center();
+        let color = v.fg_stroke.color;
+        if on {
+            p.rect_filled(
+                egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0)),
+                1.0,
+                color,
+            );
+        } else {
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(-3.5, -5.0),
+                    c + egui::vec2(5.0, 0.0),
+                    c + egui::vec2(-3.5, 5.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+    resp
+}
+
 // ---- logging into the window ---------------------------------------------
 
 const LOG_LINES: usize = 1000;
@@ -833,18 +880,13 @@ impl App {
                         };
                         if let Some(p) = clip {
                             let on = playing.as_deref() == Some(p.as_path());
-                            let b = ui
-                                .add_enabled(
-                                    !busy || on,
-                                    egui::Button::new(if on { "⏹" } else { "⏵" }).small(),
-                                )
-                                .on_hover_text(if on {
-                                    "Stop"
-                                } else if matches!(r.entry.status, Status::Cached(_)) {
-                                    "Play the clip that Record would install"
-                                } else {
-                                    "Play this table's Audio media"
-                                });
+                            let b = play_button(ui, on, !busy || on).on_hover_text(if on {
+                                "Stop"
+                            } else if matches!(r.entry.status, Status::Cached(_)) {
+                                "Play the clip that Record would install"
+                            } else {
+                                "Play this table's Audio media"
+                            });
                             if b.clicked() {
                                 player.toggle(p);
                             }
