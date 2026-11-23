@@ -55,6 +55,9 @@ struct WorkerCli {
     /// Start from a copy of this nvram file.
     #[arg(long)]
     nvram: Option<PathBuf>,
+    /// A DIP switch bank to set, as bank=value (repeatable).
+    #[arg(long = "dip")]
+    dips: Vec<String>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -82,6 +85,14 @@ pub fn run_worker_if_requested() {
             mechanics: w.mechanics,
         },
         nvram: w.nvram,
+        dips: w
+            .dips
+            .iter()
+            .filter_map(|d| {
+                let (b, v) = d.split_once('=')?;
+                Some((b.trim().parse().ok()?, v.trim().parse().ok()?))
+            })
+            .collect(),
     };
     record::terminate(record::worker_main(&a));
 }

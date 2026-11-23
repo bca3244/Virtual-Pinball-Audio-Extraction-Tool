@@ -307,6 +307,8 @@ pub struct WorkerArgs {
     pub debug: pinmame::Debug,
     /// Start from a copy of this nvram file instead of a blank one.
     pub nvram: Option<PathBuf>,
+    /// DIP switch banks to set (bank, value), as the table script does.
+    pub dips: Vec<(i32, i64)>,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -319,6 +321,7 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
         capture::Timeline::NORMAL
     };
     pinmame::set_debug(a.debug);
+    pinmame::set_dips(a.dips.clone());
     let run = match pinmame::run(
         &a.dll,
         &a.scratch,
@@ -709,18 +712,17 @@ impl Runner<'_> {
         nvram: Option<&Path>,
     ) -> Result<Outcome> {
         std::fs::create_dir_all(tmp)?;
-        let trough = job
+        let script = job
             .entries
             .iter()
             .filter_map(|e| e.table.as_deref())
             .filter(|t| t.is_file())
-            .find_map(|t| {
-                vpx::read_script(t)
-                    .ok()
-                    .map(|s| vpx::start_switches(&s))
-                    .filter(|v| !v.is_empty())
-            })
+            .find_map(|t| vpx::read_script(t).ok());
+        let trough = script
+            .as_deref()
+            .map(vpx::start_switches)
             .unwrap_or_default();
+        let dips = script.as_deref().map(vpx::dip_switches).unwrap_or_default();
         let exe = std::env::current_exe().context("finding this exe")?;
         let mut cmd = Command::new(exe);
         cmd.arg("worker")
@@ -742,6 +744,9 @@ impl Runner<'_> {
         }
         for d in &job.entries[0].rom_dirs {
             cmd.arg("--rom-dir").arg(d);
+        }
+        for (bank, value) in &dips {
+            cmd.arg("--dip").arg(format!("{bank}={value}"));
         }
         if !trough.is_empty() {
             cmd.arg("--trough").arg(

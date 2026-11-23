@@ -3,6 +3,7 @@
 //! ported from VRTableManager's `RomAudio.TroughSwitchesIn` (MIT).
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -92,14 +93,91 @@ pub fn rom_name(script: &str) -> Option<String> {
 }
 
 /// Comma-separated integers at the start of `s` (spaces allowed).
-fn int_list(s: &str) -> Vec<i32> {
-    let list: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == ',' || c.is_whitespace())
-        .collect();
+/// `Const` values in the script (`Const swTrough1=11, swTrough2=12`), by
+/// lower-case name, so switch lists written with names can be read.
+fn consts(script: &str) -> HashMap<String, i32> {
+    let mut out = HashMap::new();
+    for raw in script.lines() {
+        let line = raw.trim();
+        let Some(rest) = after_ci(line, "const ").filter(|_| starts_ci(line, "const ")) else {
+            continue;
+        };
+        let rest = rest.split('\'').next().unwrap_or("");
+        for part in rest.split([',', ':']) {
+            if let Some((name, value)) = part.split_once('=') {
+                if let Ok(v) = value.trim().parse::<i32>() {
+                    out.insert(name.trim().to_ascii_lowercase(), v);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A comma-separated list of switch numbers or `Const` names, up to the
+/// closing bracket or a comment. Anything else counts as 0.
+fn int_list(s: &str, consts: &HashMap<String, i32>) -> Vec<i32> {
+    let list = s.split([')', '\'', ':']).next().unwrap_or("");
     list.split(',')
-        .map(|x| x.trim().parse().unwrap_or(0))
+        .map(|x| {
+            let x = x.trim();
+            x.parse()
+                .ok()
+                .or_else(|| consts.get(&x.to_ascii_lowercase()).copied())
+                .unwrap_or(0)
+        })
         .collect()
+}
+
+/// An integer expression as scripts write DIP settings: sums of products
+/// of numbers (`0*1 + 1*2 + 1*128`), `&H` hex allowed. None if it's
+/// anything else.
+fn eval_sum(expr: &str) -> Option<i64> {
+    let e: String = expr.chars().filter(|c| !matches!(c, '(' | ')')).collect();
+    let num = |t: &str| {
+        let t = t.trim();
+        match t.get(..2) {
+            Some(h) if h.eq_ignore_ascii_case("&h") => i64::from_str_radix(&t[2..], 16).ok(),
+            _ => t.parse::<i64>().ok(),
+        }
+    };
+    e.split('+')
+        .map(|term| term.split('*').map(num).product::<Option<i64>>())
+        .sum()
+}
+
+/// DIP switch banks the script sets: `Controller.Dip(0) = (0*1 + 1*2 ...)`.
+/// Some machines (Bally 6803, Special Force) won't start a game without
+/// them.
+pub fn dip_switches(script: &str) -> Vec<(i32, i64)> {
+    let mut out: Vec<(i32, i64)> = Vec::new();
+    for raw in script.lines() {
+        let line = raw.trim();
+        if is_comment(line) {
+            continue;
+        }
+        let Some(rest) = after_ci(line, "controller.dip") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let Some((bank, rest)) = rest.split_once(')') else {
+            continue;
+        };
+        let Ok(bank) = bank.trim().parse::<i32>() else {
+            continue;
+        };
+        let Some(expr) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let expr = expr.split(['\'', ':']).next().unwrap_or("");
+        if let Some(v) = eval_sum(expr).filter(|v| (0..=0xFFFF_FFFF).contains(v)) {
+            out.retain(|(b, _)| *b != bank);
+            out.push((bank, v));
+        }
+    }
+    out
 }
 
 /// Position just after `pat` in `line` (case-insensitive).
@@ -148,6 +226,7 @@ fn switches_on(line: &str) -> Vec<i32> {
 /// switch), `.InitSwitches Array(32, 33, 34)` inside `With bsTrough`, or
 /// `Sub sw32_Hit: Controller.Switch(32) = 1` on trough lines.
 pub fn trough_switches(script: &str) -> Vec<i32> {
+    let consts = consts(script);
     let mut found = Vec::new();
     let mut in_trough_with = false;
     for raw in script.lines() {
@@ -164,7 +243,7 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
             let rest = rest.trim_start().trim_start_matches('(').trim_start();
             if let Some(rest) = after_ci(rest, "array") {
                 if let Some(rest) = rest.trim_start().strip_prefix('(') {
-                    found.extend(int_list(rest));
+                    found.extend(int_list(rest, &consts));
                     continue;
                 }
             }
@@ -172,7 +251,7 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
         if let Some(rest) = after_ci(line, ".initsw") {
             if rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
                 found.extend(
-                    int_list(rest.trim_start().trim_start_matches('('))
+                    int_list(rest.trim_start().trim_start_matches('('), &consts)
                         .into_iter()
                         .skip(1),
                 );
@@ -199,6 +278,7 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
 /// them without the script, so the ROM thinks the mechanism is stuck and
 /// won't start a game.
 pub fn mech_rest_switches(script: &str) -> Vec<i32> {
+    let consts = consts(script);
     let mut out = Vec::new();
     for raw in script.lines() {
         let line = raw.trim();
@@ -211,7 +291,7 @@ pub fn mech_rest_switches(script: &str) -> Vec<i32> {
         if !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
             continue;
         }
-        let n = int_list(rest.trim_start().trim_start_matches('('));
+        let n = int_list(rest.trim_start().trim_start_matches('('), &consts);
         if let [sw, 0, _, ..] = n[..] {
             if sw > 0 && !out.contains(&sw) {
                 out.push(sw);
@@ -244,6 +324,26 @@ mod tests {
         assert_eq!(mech_rest_switches(s), vec![84, 82]);
         let t = "bsTrough.InitSw 0, 15, 16, 0, 0, 0, 0, 0\n";
         assert_eq!(start_switches(&format!("{t}{s}")), vec![15, 16, 84, 82]);
+    }
+
+    #[test]
+    fn switch_lists_by_const_name() {
+        let s = "Const swOuthole=9,swUpDownRamp=10,swTrough1=11,swTrough2=12,swTrough3=13\n\
+                 Const swClockWheel = 59 ' clock\n\
+                 Set bsTrough = New cvpmTrough\nWith bsTrough\n .initSwitches Array(swTrough1,swTrough2,swTrough3)\nEnd With\n\
+                 With WheelMech\n .AddSw swClockWheel, 0, 0\nEnd With\n";
+        assert_eq!(start_switches(s), vec![11, 12, 13, 59]);
+    }
+
+    #[test]
+    fn dip_settings() {
+        let s =
+            "  Controller.Dip(0) = (0*1 + 1*2 + 0*4 + 0*8 + 0*16 + 0*32 + 0*64 + 0*128) '01-08\n\
+                 Controller.Dip(1) = (0*1 + 0*2 + 0*4 + 1*8 + 1*16 + 1*32 + 1*64 + 1*128) '09-16\n\
+                 'Controller.Dip(2) = 255\n\
+                 Controller.Dip(3) = &H67\n\
+                 Controller.Dip(4) = x\n";
+        assert_eq!(dip_switches(s), vec![(0, 2), (1, 248), (3, 103)]);
     }
 
     #[test]

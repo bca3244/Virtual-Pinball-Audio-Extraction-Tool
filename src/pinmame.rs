@@ -36,6 +36,14 @@ pub struct Debug {
 
 static DEBUG: OnceLock<Debug> = OnceLock::new();
 
+/// DIP switch banks to set once the machine runs (bank, value).
+static DIPS: OnceLock<Vec<(i32, i64)>> = OnceLock::new();
+
+/// Sets the DIP switches the table script sets; call before [`run`].
+pub fn set_dips(d: Vec<(i32, i64)>) {
+    let _ = DIPS.set(d);
+}
+
 /// Sets the diagnostic variations; call before [`run`].
 pub fn set_debug(d: Debug) {
     let _ = DEBUG.set(d);
@@ -447,6 +455,9 @@ pub fn run(
     let set_handle_keyboard = sym!(b"PinmameSetHandleKeyboard\0", SetIntFn);
     let set_handle_mechanics = sym!(b"PinmameSetHandleMechanics\0", SetIntFn);
     let set_switch = sym!(b"PinmameSetSwitch\0", SetSwitchFn);
+    let set_dip = unsafe { lib.get::<SetSwitchFn>(b"PinmameSetDIP\0") }
+        .ok()
+        .map(|s| *s);
     let get_game = unsafe { lib.get::<GetGameFn>(b"PinmameGetGame\0") }
         .ok()
         .map(|s| *s);
@@ -519,11 +530,25 @@ pub fn run(
     let mut until = max;
     let mut music: Option<f64> = None;
     let mut no_music = false;
+    let mut dips_set = false;
     let (mut shown, mut last_text) = (0, String::new());
     let mut loud: Option<capture::Loudness> = None;
     while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
         // machine is up: setting switches right after PinmameRun crashes it.
+        if !dips_set {
+            // As the script does before the game reads them; PinMAME takes
+            // them only once the emulation runs.
+            if let (Some(set_dip), Some(dips)) = (set_dip, DIPS.get()) {
+                for &(bank, value) in dips {
+                    unsafe { set_dip(bank, value as u32 as c_int) };
+                }
+                if !dips.is_empty() {
+                    println!("DIP switches: {dips:?}");
+                }
+            }
+            dips_set = true;
+        }
         if !balls_in && clock.elapsed().as_secs_f64() > 2.0 && now() > 2.0 {
             for &sw in trough {
                 unsafe { set_switch(sw, 1) };
