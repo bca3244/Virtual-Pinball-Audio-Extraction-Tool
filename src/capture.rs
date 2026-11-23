@@ -369,6 +369,22 @@ fn noisy(loud: &Loudness, first: usize, last: usize) -> bool {
     noisy * 2 > loud_blocks.len()
 }
 
+/// How a finished clip sounds: seconds of real sound in it (100 ms blocks
+/// above the quiet level, and above -30 dB of its loudest block, since the
+/// clip is normalised), and whether most of those are static.
+pub fn assess(samples: &[i16], channels: u32, rate: u32) -> (f64, bool) {
+    let mut l = Loudness::new(channels, rate, Some(0));
+    l.update(samples);
+    let peak = l.rms.iter().cloned().fold(0.0, f64::max);
+    let floor = QUIET.max(peak * 0.03);
+    let loud: Vec<usize> = (0..l.rms.len()).filter(|&i| l.rms[i] > floor).collect();
+    let noisy = loud.iter().filter(|&&i| l.zcr[i] > NOISY_ZCR).count();
+    (
+        loud.len() as f64 * 0.1,
+        !loud.is_empty() && noisy * 2 > loud.len(),
+    )
+}
+
 /// From the music after Start (the coin chimes before it, and a short Start
 /// sound, are dropped), cut at the first 3 s of silence after it and at
 /// `seconds`, normalised to 0.8 FS (at most 32x gain) and faded out over the
@@ -604,6 +620,23 @@ mod tests {
         let peak = c.iter().map(|&v| (v as i32).abs()).max().unwrap();
         assert!(peak > 25000, "normalised: {peak}");
         assert!((c[c.len() - 2] as i32).abs() < 200, "faded out");
+    }
+
+    #[test]
+    fn assess_counts_sound_and_static() {
+        let rate = 1000u32;
+        // 2 s of a 50 Hz tone, then 8 s of near silence.
+        let mut v: Vec<i16> = (0..2000)
+            .map(|i| ((i as f64 * 0.314).sin() * 8000.0) as i16)
+            .collect();
+        v.extend(std::iter::repeat_n(0i16, 8000));
+        let (loud, noisy) = assess(&v, 1, rate);
+        assert!((loud - 2.0).abs() < 0.15, "{loud}");
+        assert!(!noisy);
+        let hiss: Vec<i16> = (0..3000)
+            .map(|i| if i % 2 == 0 { 3000 } else { -3000 })
+            .collect();
+        assert!(assess(&hiss, 1, rate).1);
     }
 
     #[test]

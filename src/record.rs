@@ -669,9 +669,14 @@ impl Runner<'_> {
             }
             let clip = tmp.join("clip.wav");
             // Unreadable (antivirus holding it?): trust the worker.
-            let Some(len) = wav_seconds(&clip) else {
+            let Ok(pcm) = wav::read(&clip) else {
                 return o;
             };
+            let (len, noisy) = capture::assess(&pcm.samples, pcm.channels as u32, pcm.rate);
+            if noisy {
+                log::info!("{}: the recording is mostly static", job.rom);
+                return Outcome::Nothing;
+            }
             if len >= enough {
                 return o;
             }
@@ -1006,55 +1011,12 @@ fn full_enough(seconds: u32) -> f64 {
     (seconds as f64 * 0.5).min(10.0)
 }
 
-/// Length of a PCM WAV file in seconds, from its `fmt ` and `data` chunks.
-fn wav_seconds(path: &Path) -> Option<f64> {
-    let b = std::fs::read(path).ok()?;
-    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
-        return None;
-    }
-    let (mut at, mut byte_rate, mut data) = (12usize, None, None);
-    while at + 8 <= b.len() {
-        let id = &b[at..at + 4];
-        let size = u32::from_le_bytes(b[at + 4..at + 8].try_into().ok()?) as usize;
-        let body = at + 8;
-        if id == b"fmt " && body + 12 <= b.len() {
-            byte_rate = Some(u32::from_le_bytes(b[body + 8..body + 12].try_into().ok()?));
-        } else if id == b"data" {
-            data = Some(size.min(b.len() - body));
-        }
-        at = body + size + (size & 1);
-    }
-    let rate = byte_rate.filter(|&r| r > 0)?;
-    Some(data? as f64 / rate as f64)
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
-    fn wav_length_and_jingle_threshold() {
-        use super::{full_enough, wav_seconds};
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("a.wav");
-        let (rate, ch) = (44100u32, 2u16);
-        let data = vec![0u8; (rate * ch as u32 * 2 * 3) as usize];
-        let mut w = Vec::new();
-        w.extend(b"RIFF");
-        w.extend((36 + data.len() as u32).to_le_bytes());
-        w.extend(b"WAVEfmt ");
-        w.extend(16u32.to_le_bytes());
-        w.extend(1u16.to_le_bytes());
-        w.extend(ch.to_le_bytes());
-        w.extend(rate.to_le_bytes());
-        w.extend((rate * ch as u32 * 2).to_le_bytes());
-        w.extend((ch * 2).to_le_bytes());
-        w.extend(16u16.to_le_bytes());
-        w.extend(b"data");
-        w.extend((data.len() as u32).to_le_bytes());
-        w.extend(&data);
-        std::fs::write(&p, w).unwrap();
-        assert!((wav_seconds(&p).unwrap() - 3.0).abs() < 1e-9);
-        assert_eq!(full_enough(30), 10.0);
-        assert_eq!(full_enough(10), 5.0);
+    fn jingle_threshold() {
+        assert_eq!(super::full_enough(30), 10.0);
+        assert_eq!(super::full_enough(10), 5.0);
     }
 
     #[test]
