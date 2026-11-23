@@ -165,16 +165,20 @@ fn table_path(emu: &Emulator, game: &Game) -> Option<PathBuf> {
 /// Every Visual Pinball table and what would happen to it.
 pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
     let emus = db.emulators()?;
-    let wanted = |g: &Game| {
-        opts.games.is_empty()
-            || opts.games.iter().any(|w| {
-                w.eq_ignore_ascii_case(&g.name)
-                    || w.eq_ignore_ascii_case(&g.display)
-                    || g.rom.as_deref().is_some_and(|r| w.eq_ignore_ascii_case(r))
-            })
+    // A filter names a table by GameName or display name, whole or without
+    // its "(Maker Year)" tail, or by ROM name (Popper's, else the script's).
+    let base = |n: &str| n.split(" (").next().unwrap_or(n).trim().to_string();
+    let by_name = |g: &Game| {
+        opts.games.iter().any(|w| {
+            [g.name.as_str(), g.display.as_str()]
+                .iter()
+                .any(|n| w.eq_ignore_ascii_case(n) || w.trim().eq_ignore_ascii_case(&base(n)))
+                || g.rom.as_deref().is_some_and(|r| w.eq_ignore_ascii_case(r))
+        })
     };
     let mut out = Vec::new();
-    for game in db.games(opts.include_hidden)?.into_iter().filter(wanted) {
+    for game in db.games(opts.include_hidden)? {
+        let name_hit = opts.games.is_empty() || by_name(&game);
         let Some(emu) = emus
             .iter()
             .find(|e| e.id == game.emu_id && e.is_visual_pinball())
@@ -182,6 +186,16 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             continue;
         };
         let table = table_path(emu, &game);
+        if !name_hit {
+            let rom = table
+                .as_deref()
+                .filter(|t| t.is_file())
+                .and_then(|t| vpx::read_script(t).ok())
+                .and_then(|s| vpx::rom_name(&s));
+            if !rom.is_some_and(|r| opts.games.iter().any(|w| w.eq_ignore_ascii_case(&r))) {
+                continue;
+            }
+        }
         let mut entry = Entry {
             game: game.clone(),
             emu: emu.clone(),
@@ -961,7 +975,8 @@ mod tests {
              INSERT INTO Emulators VALUES (1, 'Visual Pinball X', NULL, NULL, NULL, NULL);
              CREATE TABLE Games (GameID INTEGER, EMUID INTEGER, GameName TEXT, GameDisplay TEXT, GameFileName TEXT, ROM TEXT, Visible INTEGER);
              INSERT INTO Games VALUES (1, 1, 'Medieval Madness (Williams 1997)', 'Medieval Madness', 'mm.vpx', 'mm_109c', 1);
-             INSERT INTO Games VALUES (2, 1, 'Other', NULL, 'o.vpx', 'other', 1);",
+             INSERT INTO Games VALUES (2, 1, 'Other', NULL, 'o.vpx', 'other', 1);
+             INSERT INTO Games VALUES (3, 1, 'Diner (Williams 1990)', 'Diner (Williams 1990)', 'd.vpx', NULL, 1);",
         )
         .unwrap();
         let db = Db::from_conn(c);
@@ -970,6 +985,7 @@ mod tests {
             "medieval madness",
             "MM_109C",
             "Medieval Madness (Williams 1997)",
+            "Medieval Madness ",
         ] {
             let mut o = opts(dir.path());
             o.games = vec![w.into()];
@@ -977,5 +993,10 @@ mod tests {
             assert_eq!(p.len(), 1, "{w}");
             assert!(matches!(p[0].status, Status::NoMediaDir));
         }
+        let mut o = opts(dir.path());
+        o.games = vec!["diner".into()];
+        let p = plan(&db, &cache, &o).unwrap();
+        assert_eq!(p.len(), 1, "display name without its (Maker Year)");
+        assert_eq!(p[0].game.name, "Diner (Williams 1990)");
     }
 }
