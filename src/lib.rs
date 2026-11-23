@@ -4,6 +4,7 @@
 //! as the table's PinUP Popper Audio media. Shared by the command line
 //! (`vp-audio-extract.exe`) and the window (`vp-audio-extract-gui.exe`).
 
+pub mod backup;
 pub mod capture;
 pub mod encode;
 pub mod pinmame;
@@ -34,6 +35,8 @@ struct WorkerCli {
     rom_dirs: Vec<PathBuf>,
     #[arg(long, value_delimiter = ',')]
     trough: Vec<i32>,
+    #[arg(long)]
+    slow: bool,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -52,6 +55,7 @@ pub fn run_worker_if_requested() {
         dll: w.dll,
         rom_dirs: w.rom_dirs,
         trough: w.trough,
+        slow: w.slow,
     };
     record::terminate(record::worker_main(&a));
 }

@@ -272,14 +272,28 @@ pub struct WorkerArgs {
     pub dll: PathBuf,
     pub rom_dirs: Vec<PathBuf>,
     pub trough: Vec<i32>,
+    /// The slow-boot timeline (the retry for a ROM that gave no music).
+    pub slow: bool,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
 /// returns the exit code. The caller must end the process straight after
 /// (see [`terminate`]): the emulator is still running.
 pub fn worker_main(a: &WorkerArgs) -> i32 {
-    let total = capture::run_seconds(a.seconds);
-    let run = match pinmame::run(&a.dll, &a.scratch, &a.rom, &a.rom_dirs, &a.trough, total) {
+    let timeline = if a.slow {
+        capture::Timeline::SLOW
+    } else {
+        capture::Timeline::NORMAL
+    };
+    let run = match pinmame::run(
+        &a.dll,
+        &a.scratch,
+        &a.rom,
+        &a.rom_dirs,
+        &a.trough,
+        timeline,
+        a.seconds,
+    ) {
         Ok(r) => r,
         Err(e) => {
             println!("{}: {e:#}", a.rom);
@@ -551,13 +565,21 @@ impl Runner<'_> {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
-        let outcome = match self.spawn_worker(job, &tmp) {
+        let attempt = |slow| match self.spawn_worker(job, &tmp, slow) {
             Ok(o) => o,
             Err(e) => {
                 log::warn!("{}: {e:#}", job.rom);
                 Outcome::Failed
             }
         };
+        let mut outcome = attempt(false);
+        if outcome == Outcome::Nothing && !self.cancelled() {
+            // Some machines boot slowly or ignore inputs for a while after
+            // their self-test: once more, with everything later.
+            log::info!("{}: no music; trying again with a slower start", job.rom);
+            let _ = std::fs::remove_dir_all(&tmp);
+            outcome = attempt(true);
+        }
         let mut s = summary.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
             Outcome::Recorded => {
@@ -596,7 +618,7 @@ impl Runner<'_> {
         outcome
     }
 
-    fn spawn_worker(&self, job: &Job, tmp: &Path) -> Result<Outcome> {
+    fn spawn_worker(&self, job: &Job, tmp: &Path, slow: bool) -> Result<Outcome> {
         std::fs::create_dir_all(tmp)?;
         let trough = job
             .entries
@@ -623,6 +645,9 @@ impl Runner<'_> {
             .arg(self.opts.seconds.to_string())
             .arg("--dll")
             .arg(&self.dll);
+        if slow {
+            cmd.arg("--slow");
+        }
         for d in &job.entries[0].rom_dirs {
             cmd.arg("--rom-dir").arg(d);
         }
@@ -671,7 +696,12 @@ impl Runner<'_> {
                 })
             })
             .collect();
-        let limit = Duration::from_secs_f64(capture::run_seconds(self.opts.seconds) * 1.5 + 60.0);
+        let timeline = if slow {
+            capture::Timeline::SLOW
+        } else {
+            capture::Timeline::NORMAL
+        };
+        let limit = Duration::from_secs_f64(timeline.max_seconds(self.opts.seconds) * 1.5 + 60.0);
         let started = Instant::now();
         let status = loop {
             if let Some(st) = child.try_wait()? {

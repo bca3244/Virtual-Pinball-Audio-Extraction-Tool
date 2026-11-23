@@ -16,6 +16,9 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
+
+/// The run's timeline, for the key callback.
+static TIMELINE: OnceLock<capture::Timeline> = OnceLock::new();
 use std::time::{Duration, Instant};
 
 const PINMAME_MAX_PATH: usize = 512;
@@ -145,7 +148,10 @@ unsafe extern "system" fn on_audio_updated(
 
 unsafe extern "system" fn is_key_pressed(key: c_int, _user: *mut c_void) -> c_int {
     let t = now();
-    let down = capture::key_down(key, t);
+    let down = TIMELINE
+        .get()
+        .unwrap_or(&capture::Timeline::NORMAL)
+        .key_down(key, t);
     if down && key == capture::KEY_NUMBER_1 {
         let s = &*SHARED;
         let f = s.frames.load(Ordering::Acquire) as i64;
@@ -277,9 +283,11 @@ fn copy_into(zip: &Path, roms: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs `rom` for `total` emulated seconds in `scratch` (which gets
+/// Runs `rom` on `timeline` in `scratch` (which gets
 /// roms\, nvram\ and cfg\ of its own, so the cabinet's real nvram, scores
-/// and settings are never touched) and returns its sound. The emulator is
+/// and settings are never touched) and returns its sound. The run waits for
+/// the music after Start and goes on until a `seconds` clip of it is
+/// recorded, or gives up [`capture::WAIT_FOR_MUSIC`] after Start. The emulator is
 /// left running: the caller writes its result and ends the process, because
 /// `PinmameStop` joins the game thread and can hang forever on a stuck ROM.
 pub fn run(
@@ -288,8 +296,11 @@ pub fn run(
     rom: &str,
     rom_dirs: &[PathBuf],
     trough: &[i32],
-    total: f64,
+    timeline: capture::Timeline,
+    seconds: u32,
 ) -> Result<RunResult> {
+    let _ = TIMELINE.set(timeline);
+    let max = timeline.max_seconds(seconds);
     let roms = scratch.join("roms");
     for sub in ["roms", "nvram", "cfg"] {
         std::fs::create_dir_all(scratch.join(sub))?;
@@ -360,7 +371,7 @@ pub fn run(
     }));
     {
         let mut audio = SHARED.audio.lock().unwrap_or_else(|e| e.into_inner());
-        audio.reserve(SAMPLE_RATE as usize * 2 * (total as usize + 5));
+        audio.reserve(SAMPLE_RATE as usize * 2 * (max as usize + 5));
     }
     unsafe { set_config(config) };
 
@@ -403,9 +414,12 @@ pub fn run(
         return Err(NotStarted::Refused(status).into());
     }
     let clock = Instant::now();
-    let give_up = total * 1.5 + 15.0;
+    let give_up = max * 1.5 + 15.0;
     let mut balls_in = false;
-    while now() < total && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
+    // Until the music is found, the run may last `max`; then a clip of it.
+    let mut until = max;
+    let mut loud: Option<capture::Loudness> = None;
+    while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
         // machine is up: setting switches right after PinmameRun crashes it.
         if !balls_in && clock.elapsed().as_secs_f64() > 2.0 && now() > 2.0 {
@@ -414,9 +428,30 @@ pub fn run(
             }
             balls_in = true;
         }
+        let s = &*SHARED;
+        let start = s.start_frame.load(Ordering::Acquire);
+        if until == max && start >= 0 {
+            let channels = s.channels.load(Ordering::Relaxed);
+            let l = loud.get_or_insert_with(|| {
+                capture::Loudness::new(
+                    channels,
+                    s.rate.load(Ordering::Relaxed),
+                    Some(start as u64 * channels as u64),
+                )
+            });
+            l.update(&s.audio.lock().unwrap_or_else(|e| e.into_inner()));
+            if let Some((first, _)) = capture::music_span(&l.rms) {
+                let at = l.time_of(first);
+                until = capture::end_after_music(at, seconds).min(max);
+                println!(
+                    "music {:.1} s after Start",
+                    at - start as f64 / s.rate.load(Ordering::Relaxed).max(1) as f64
+                );
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let end = if now() >= total - 0.5 {
+    let end = if now() >= until - 0.5 {
         RunEnd::Finished
     } else if unsafe { is_running() } == 0 {
         RunEnd::Stopped
@@ -463,9 +498,17 @@ mod tests {
     fn non_ascii_scratch_is_refused_not_a_verdict() {
         let dir = tempfile::tempdir().unwrap();
         let scratch = dir.path().join("Jürgen");
-        let e = run(Path::new("nope.dll"), &scratch, "xyz", &[], &[], 1.0)
-            .err()
-            .unwrap();
+        let e = run(
+            Path::new("nope.dll"),
+            &scratch,
+            "xyz",
+            &[],
+            &[],
+            capture::Timeline::NORMAL,
+            5,
+        )
+        .err()
+        .unwrap();
         assert!(e.downcast_ref::<NotStarted>().is_none(), "{e}");
     }
 
@@ -478,7 +521,8 @@ mod tests {
             "xyz",
             &[dir.path().to_path_buf()],
             &[],
-            1.0,
+            capture::Timeline::NORMAL,
+            5,
         )
         .err()
         .unwrap();

@@ -313,32 +313,6 @@ pub fn existing_audio(media_dir: &Path, game_name: &str) -> Option<PathBuf> {
     audio_files(media_dir, game_name).into_iter().next()
 }
 
-/// Moves all of the game's Audio media into `backup` (kept, so a removal
-/// can be undone by moving the files back). Returns where each went.
-pub fn remove_audio(media_dir: &Path, game_name: &str, backup: &Path) -> Result<Vec<PathBuf>> {
-    let files = audio_files(media_dir, game_name);
-    if files.is_empty() {
-        return Ok(Vec::new());
-    }
-    std::fs::create_dir_all(backup).with_context(|| format!("creating {}", backup.display()))?;
-    let mut moved = Vec::new();
-    for f in files {
-        let dest = backup.join(f.file_name().context("no file name")?);
-        // A rename can't cross drives: copy, then delete.
-        if std::fs::rename(&f, &dest).is_err() {
-            std::fs::copy(&f, &dest).with_context(|| format!("backing up {}", f.display()))?;
-            std::fs::remove_file(&f).with_context(|| format!("removing {}", f.display()))?;
-        }
-        log::info!(
-            "{game_name}: removed {} (kept in {})",
-            f.display(),
-            backup.display()
-        );
-        moved.push(dest);
-    }
-    Ok(moved)
-}
-
 /// Puts `clip` in place as `<media>\Audio\<GameName>.<ext>`: written beside
 /// it under a name Popper ignores, then renamed, so Popper never sees half a
 /// file. Refuses to replace an existing file unless `force`.
@@ -425,31 +399,6 @@ mod tests {
         assert!(existing_audio(dir.path(), "AFM").is_some());
         std::fs::write(audio.join("Other.txt"), b"x").unwrap();
         assert!(existing_audio(dir.path(), "Other").is_none());
-    }
-
-    #[test]
-    fn remove_moves_every_audio_file_to_the_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        let audio = audio_dir(dir.path());
-        std::fs::create_dir_all(&audio).unwrap();
-        for f in [
-            "Tron.mp3",
-            "TRON01.ogg",
-            "Tron Legacy.mp3",
-            "Tron.txt",
-            "Tron123.mp3",
-        ] {
-            std::fs::write(audio.join(f), b"x").unwrap();
-        }
-        let backup = dir.path().join("backup");
-        let moved = remove_audio(dir.path(), "Tron", &backup).unwrap();
-        assert_eq!(moved.len(), 2);
-        assert!(backup.join("Tron.mp3").is_file() && backup.join("TRON01.ogg").is_file());
-        assert!(existing_audio(dir.path(), "Tron").is_none());
-        assert!(audio.join("Tron Legacy.mp3").is_file());
-        assert!(remove_audio(dir.path(), "Tron", &backup)
-            .unwrap()
-            .is_empty());
     }
 
     #[test]

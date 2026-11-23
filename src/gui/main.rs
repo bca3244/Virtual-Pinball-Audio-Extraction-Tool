@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use vp_audio_extract::encode::Format;
 use vp_audio_extract::record::{self, Entry, Status};
-use vp_audio_extract::{capture, encode, popper, state};
+use vp_audio_extract::{backup, capture, encode, popper, state};
 
 // ---- logging into the window ---------------------------------------------
 
@@ -176,6 +176,17 @@ fn path_label(ui: &mut egui::Ui, path: Option<&Path>, none: &str) {
     }
 }
 
+/// "just now", "5 min ago", "3 h ago", "2 days ago".
+fn ago(now: u64, then: u64) -> String {
+    let s = now.saturating_sub(then);
+    match s {
+        0..60 => "just now".into(),
+        60..3600 => format!("{} min ago", s / 60),
+        3600..86400 => format!("{} h ago", s / 3600),
+        _ => format!("{} days ago", s / 86400),
+    }
+}
+
 // ---- the app ------------------------------------------------------------------
 
 /// A table is known by its emulator and Popper GameName (display names can repeat).
@@ -221,6 +232,8 @@ struct App {
     job: Option<Job>,
     confirm: Confirm,
     show_log: bool,
+    restore_open: bool,
+    batches: Vec<backup::Batch>,
     parallel: usize,
 }
 
@@ -252,6 +265,8 @@ impl App {
             job: None,
             confirm: Confirm::None,
             show_log: true,
+            restore_open: false,
+            batches: Vec::new(),
             parallel: record::default_parallel(),
         };
         app.rescan(&cc.egui_ctx);
@@ -390,26 +405,85 @@ impl App {
     }
 
     fn remove_selected(&mut self, ctx: &egui::Context) {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let backup = self.cache.join("removed").join(stamp.to_string());
+        let batch = backup::new_batch(&self.cache);
         let mut removed = 0;
         for e in self.selected().filter(|e| has_audio(e)) {
             let Some(media) = e.emu.media_dir.as_deref() else {
                 continue;
             };
-            match popper::remove_audio(media, &e.game.name, &backup) {
-                Ok(files) => removed += !files.is_empty() as usize,
+            match backup::remove_audio(media, &e.game.name, &batch) {
+                Ok(n) => removed += (n > 0) as usize,
                 Err(err) => log::warn!("{}: {err:#}", e.game.display),
             }
         }
-        log::info!(
-            "Removed audio from {removed} table(s); the files are kept in {}",
-            backup.display()
-        );
+        log::info!("Removed audio from {removed} table(s); Restore… puts it back");
         self.rescan(ctx);
+    }
+
+    fn open_restore(&mut self) {
+        self.batches = backup::list(&self.cache);
+        self.restore_open = true;
+    }
+
+    fn restore_window(&mut self, ctx: &egui::Context) {
+        if !self.restore_open {
+            return;
+        }
+        let mut close = false;
+        let mut restore: Option<usize> = None;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let modal = egui::Modal::new(egui::Id::unique("restore")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading("Restore removed audio");
+            if self.batches.is_empty() {
+                ui.label("Nothing to restore: no removed audio is kept.");
+            } else {
+                ui.label("Each removal is kept as a batch. Restoring puts the files back where they were; a file whose place has been taken by new audio is left in the batch.");
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for (i, b) in self.batches.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!self.job.is_some(), egui::Button::new("Restore")).clicked() {
+                                restore = Some(i);
+                            }
+                            let games = b.games();
+                            ui.label(format!("{} · {} table(s), {} file(s)", ago(now, b.time), games.len(), b.items.len()));
+                        });
+                        let games = b.games();
+                        let shown: Vec<&str> = games.iter().take(6).copied().collect();
+                        let more = games.len().saturating_sub(shown.len());
+                        let text = if more > 0 { format!("{} and {more} more", shown.join(", ")) } else { shown.join(", ") };
+                        ui.indent(b.dir.display().to_string(), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(text).weak()).wrap());
+                        });
+                        ui.separator();
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+        if let Some(i) = restore {
+            match backup::restore(&self.batches[i]) {
+                Ok(r) if r.skipped > 0 => log::info!(
+                    "Restored {} file(s); {} left in the batch because new audio is in their place",
+                    r.restored,
+                    r.skipped
+                ),
+                Ok(r) => log::info!("Restored {} file(s)", r.restored),
+                Err(e) => log::warn!("Restore failed: {e:#}"),
+            }
+            self.batches = backup::list(&self.cache);
+            self.rescan(ctx);
+        }
+        if close || modal.should_close() {
+            self.restore_open = false;
+        }
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -499,6 +573,13 @@ impl App {
             ui.separator();
             if ui.add_enabled(!busy, egui::Button::new("Rescan")).clicked() {
                 self.rescan(ui.ctx());
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Restore…"))
+                .on_hover_text("Put back audio removed earlier")
+                .clicked()
+            {
+                self.open_restore();
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -725,7 +806,7 @@ impl App {
             return;
         }
         let with_audio = self.selected().filter(|e| has_audio(e)).count();
-        let backup = self.cache.join("removed");
+        let backup_dir = backup::root(&self.cache);
         let mut go = false;
         let mut close = false;
         let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
@@ -734,8 +815,8 @@ impl App {
                 Confirm::Remove => {
                     ui.heading(format!("Remove audio from {with_audio} table(s)?"));
                     ui.label(format!(
-                        "Their Audio media files are moved out of Popper's media folders into {}, so you can put them back.",
-                        backup.display()
+                        "Their Audio media files are moved out of Popper's media folders into {}. Restore… puts them back.",
+                        backup_dir.display()
                     ));
                 }
                 _ => {
@@ -815,6 +896,7 @@ impl eframe::App for App {
             });
         egui::CentralPanel::default().show(ui, |ui| self.table(ui));
         self.dialogs(&ctx);
+        self.restore_window(&ctx);
     }
 }
 

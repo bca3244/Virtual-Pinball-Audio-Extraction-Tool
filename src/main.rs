@@ -1,7 +1,7 @@
 //! Command line for vp-audio-extract (see the library docs). The window
 //! version is `vp-audio-extract-gui`.
 
-use vp_audio_extract::{capture, encode, popper, record, state};
+use vp_audio_extract::{backup, capture, encode, popper, record, state};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -25,6 +25,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// List removed audio, or put a removal batch back (the GUI's Remove
+    /// keeps every removed file).
+    Restore {
+        /// The batch to restore: its number in the list (1 = newest). Lists them when left out.
+        batch: Option<usize>,
+    },
     /// List Visual Pinball tables and whether they have Audio media or can get it.
     Scan(Common),
     /// Record the music for tables without Audio media and install it.
@@ -137,11 +143,41 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Cmd::Restore { batch } = cli.command {
+        let cache = state::Cache::open(cli.cache.as_deref()).context("opening the cache folder")?;
+        let batches = backup::list(&cache.dir);
+        let Some(n) = batch else {
+            if batches.is_empty() {
+                println!("No removed audio is kept.");
+            }
+            for (i, b) in batches.iter().enumerate() {
+                println!(
+                    "{:>3}. {}  {} file(s): {}",
+                    i + 1,
+                    b.dir.display(),
+                    b.items.len(),
+                    b.games().join(", ")
+                );
+            }
+            return Ok(());
+        };
+        let b = batches
+            .get(n.wrapping_sub(1))
+            .with_context(|| format!("no batch {n} (run `restore` to list them)"))?;
+        let r = backup::restore(b)?;
+        log::info!(
+            "Restored {} file(s), {} left in the batch (new audio in their place)",
+            r.restored,
+            r.skipped
+        );
+        return Ok(());
+    }
     let popper_dir = popper::find(cli.popper.as_deref())?;
     log::debug!("Popper: {}", popper_dir.display());
     let db = popper::Db::open(&popper_dir)?;
     let cache = state::Cache::open(cli.cache.as_deref()).context("opening the cache folder")?;
     match cli.command {
+        Cmd::Restore { .. } => unreachable!("handled above"),
         Cmd::Scan(common) => {
             let opts = common.options(encode::Format::Mp3);
             let entries = record::plan(&db, &cache, &opts)?;
