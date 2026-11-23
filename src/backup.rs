@@ -30,14 +30,27 @@ pub fn new_batch(cache_dir: &Path) -> PathBuf {
     dir
 }
 
-/// Moves a file, across drives too (rename, else copy then delete).
+/// Moves a file, across drives too (rename, else copy then delete). On
+/// failure the file is where it was and nothing is left at `to`.
 fn move_file(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    std::fs::copy(from, to)
-        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
-    std::fs::remove_file(from).with_context(|| format!("removing {}", from.display()))?;
+    let mut part = to.as_os_str().to_owned();
+    part.push(".vpae-part");
+    let part = PathBuf::from(part);
+    let copied = std::fs::copy(from, &part)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| std::fs::rename(&part, to).map_err(anyhow::Error::from));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.context(format!("copying {} to {}", from.display(), to.display())));
+    }
+    if let Err(e) = std::fs::remove_file(from) {
+        // In use (Popper playing it?): leave it where it was.
+        let _ = std::fs::remove_file(to);
+        return Err(anyhow::Error::from(e).context(format!("removing {}", from.display())));
+    }
     Ok(())
 }
 
@@ -70,7 +83,14 @@ pub fn remove_audio(media_dir: &Path, game_name: &str, batch: &Path) -> Result<u
             n += 1;
         }
         move_file(&f, &batch.join(&stored))?;
-        writeln!(manifest, "{game_name}\t{stored}\t{}", f.display())?;
+        // A file in the batch with no line in the list would be lost: put it
+        // back if the line can't be written.
+        if let Err(e) = writeln!(manifest, "{game_name}\t{stored}\t{}", f.display())
+            .and_then(|()| manifest.flush())
+        {
+            let _ = move_file(&batch.join(&stored), &f);
+            return Err(anyhow::Error::from(e).context("writing the restore list"));
+        }
         log::info!(
             "{game_name}: removed {} (kept in {})",
             f.display(),
@@ -154,7 +174,8 @@ pub struct Restored {
 
 /// Puts a batch's files back where they were. A file whose place is taken
 /// (audio added since) stays in the batch rather than overwrite anything.
-/// The batch folder is deleted once it's empty.
+/// The batch folder is deleted once it's empty (anything not in the list
+/// keeps it).
 pub fn restore(batch: &Batch) -> Result<Restored> {
     let mut r = Restored::default();
     let mut left = String::new();
@@ -197,7 +218,8 @@ pub fn restore(batch: &Batch) -> Result<Restored> {
         left.push_str(&format!("{}\t{stored}\t{}\n", i.game, i.original.display()));
     }
     if left.is_empty() {
-        let _ = std::fs::remove_dir_all(&batch.dir);
+        let _ = std::fs::remove_file(batch.dir.join(MANIFEST));
+        let _ = std::fs::remove_dir(&batch.dir);
     } else {
         std::fs::write(batch.dir.join(MANIFEST), left).context("updating the restore list")?;
     }

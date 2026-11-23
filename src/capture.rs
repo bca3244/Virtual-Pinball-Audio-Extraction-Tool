@@ -50,8 +50,8 @@ impl Timeline {
     }
 
     /// The longest a run goes: Start, up to [`WAIT_FOR_MUSIC`] of waiting,
-    /// then a whole clip. A run ends sooner once the music has played for a
-    /// clip's length (see [`end_after_music`]).
+    /// then a whole clip. A run ends once the music has played for a clip's
+    /// length (see [`end_after_music`]), or soon after the wait with none.
     pub fn max_seconds(&self, clip_seconds: u32) -> f64 {
         self.start_at + WAIT_FOR_MUSIC + clamp_seconds(clip_seconds) as f64 + LEAD_IN
     }

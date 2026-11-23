@@ -287,7 +287,8 @@ fn copy_into(zip: &Path, roms: &Path) -> Result<()> {
 /// roms\, nvram\ and cfg\ of its own, so the cabinet's real nvram, scores
 /// and settings are never touched) and returns its sound. The run waits for
 /// the music after Start and goes on until a `seconds` clip of it is
-/// recorded, or gives up [`capture::WAIT_FOR_MUSIC`] after Start. The emulator is
+/// recorded, or gives up when none has begun [`capture::WAIT_FOR_MUSIC`]
+/// after Start. The emulator is
 /// left running: the caller writes its result and ends the process, because
 /// `PinmameStop` joins the game thread and can hang forever on a stuck ROM.
 pub fn run(
@@ -418,6 +419,8 @@ pub fn run(
     let mut balls_in = false;
     // Until the music is found, the run may last `max`; then a clip of it.
     let mut until = max;
+    let mut music: Option<f64> = None;
+    let mut no_music = false;
     let mut loud: Option<capture::Loudness> = None;
     while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
@@ -430,7 +433,9 @@ pub fn run(
         }
         let s = &*SHARED;
         let start = s.start_frame.load(Ordering::Acquire);
-        if until == max && start >= 0 {
+        if music.is_none() && start >= 0 {
+            let rate = s.rate.load(Ordering::Relaxed).max(1) as f64;
+            let start_t = start as f64 / rate;
             let channels = s.channels.load(Ordering::Relaxed);
             let l = loud.get_or_insert_with(|| {
                 capture::Loudness::new(
@@ -442,16 +447,18 @@ pub fn run(
             l.update(&s.audio.lock().unwrap_or_else(|e| e.into_inner()));
             if let Some((first, _)) = capture::music_span(&l.rms) {
                 let at = l.time_of(first);
-                until = capture::end_after_music(at, seconds).min(max);
-                println!(
-                    "music {:.1} s after Start",
-                    at - start as f64 / s.rate.load(Ordering::Relaxed).max(1) as f64
-                );
+                music = Some(at);
+                until = capture::end_after_music(at, seconds);
+                println!("music {:.1} s after Start", at - start_t);
+            } else if now() > start_t + capture::WAIT_FOR_MUSIC + 2.5 {
+                // Music is confirmed 2 s after it begins: none by now.
+                no_music = true;
+                break;
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let end = if now() >= until - 0.5 {
+    let end = if no_music || now() >= until - 0.5 {
         RunEnd::Finished
     } else if unsafe { is_running() } == 0 {
         RunEnd::Stopped
