@@ -40,6 +40,15 @@ struct WorkerCli {
     /// Also write the whole recording as a WAV (diagnostics).
     #[arg(long)]
     raw: Option<PathBuf>,
+    /// Don't press the service button (diagnostics).
+    #[arg(long)]
+    no_escape: bool,
+    /// Press Start this many times, 2 s apart (diagnostics).
+    #[arg(long, default_value_t = 1)]
+    start_presses: u32,
+    /// Print the alphanumeric displays as they change (diagnostics).
+    #[arg(long)]
+    show_display: bool,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -60,6 +69,11 @@ pub fn run_worker_if_requested() {
         trough: w.trough,
         slow: w.slow,
         raw: w.raw,
+        debug: pinmame::Debug {
+            no_escape: w.no_escape,
+            start_presses: w.start_presses,
+            show_display: w.show_display,
+        },
     };
     record::terminate(record::worker_main(&a));
 }

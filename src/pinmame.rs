@@ -19,6 +19,29 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 /// The run's timeline, for the key callback.
 static TIMELINE: OnceLock<capture::Timeline> = OnceLock::new();
+
+/// Diagnostic variations of a run (worker options, for finding out why a
+/// ROM won't start a game).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Debug {
+    /// Don't press the service (Escape) button.
+    pub no_escape: bool,
+    /// Press Start this many times, 2 s apart (0 or 1: once).
+    pub start_presses: u32,
+    /// Print the alphanumeric displays' text as it changes.
+    pub show_display: bool,
+}
+
+static DEBUG: OnceLock<Debug> = OnceLock::new();
+
+/// Sets the diagnostic variations; call before [`run`].
+pub fn set_debug(d: Debug) {
+    let _ = DEBUG.set(d);
+}
+
+fn debug() -> Debug {
+    DEBUG.get().copied().unwrap_or_default()
+}
 use std::time::{Duration, Instant};
 
 const PINMAME_MAX_PATH: usize = 512;
@@ -44,6 +67,7 @@ struct Config {
     spare: [usize; 32],
 }
 
+const CB_ON_DISPLAY_UPDATED: usize = 2;
 const CB_ON_AUDIO_AVAILABLE: usize = 3;
 const CB_ON_AUDIO_UPDATED: usize = 4;
 const CB_IS_KEY_PRESSED: usize = 9;
@@ -90,6 +114,8 @@ struct Shared {
     /// Frame count when Start went down, or -1.
     start_frame: AtomicI64,
     audio: Mutex<Vec<i16>>,
+    /// Text of each alphanumeric display (diagnostics).
+    displays: Mutex<Vec<String>>,
     /// Wall clock, used only until the first sound arrives.
     since: OnceLock<Instant>,
 }
@@ -101,6 +127,7 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     rate: AtomicU32::new(SAMPLE_RATE as u32),
     start_frame: AtomicI64::new(-1),
     audio: Mutex::new(Vec::new()),
+    displays: Mutex::new(Vec::new()),
     since: OnceLock::new(),
 });
 
@@ -154,12 +181,53 @@ unsafe extern "system" fn on_sound_command(_board: c_int, _cmd: c_int, _user: *m
     SHARED.sound_commands.fetch_add(1, Ordering::Relaxed);
 }
 
+#[repr(C)]
+struct DisplayLayout {
+    kind: i32,
+    top: i32,
+    left: i32,
+    length: i32,
+    width: i32,
+    height: i32,
+    depth: i32,
+}
+
+unsafe extern "system" fn on_display_updated(
+    index: c_int,
+    data: *mut c_void,
+    layout: *mut DisplayLayout,
+    _user: *mut c_void,
+) {
+    let Some(l) = (unsafe { layout.as_ref() }) else {
+        return;
+    };
+    if data.is_null() || !(0..=16).contains(&index) || !(1..=64).contains(&l.length) {
+        return;
+    }
+    let Some(text) = capture::segment_text(l.kind, unsafe {
+        std::slice::from_raw_parts(data as *const u16, l.length as usize)
+    }) else {
+        return;
+    };
+    if let Ok(mut d) = SHARED.displays.lock() {
+        if d.len() <= index as usize {
+            d.resize(index as usize + 1, String::new());
+        }
+        d[index as usize] = text;
+    }
+}
+
 unsafe extern "system" fn is_key_pressed(key: c_int, _user: *mut c_void) -> c_int {
     let t = now();
-    let down = TIMELINE
-        .get()
-        .unwrap_or(&capture::Timeline::NORMAL)
-        .key_down(key, t);
+    let tl = TIMELINE.get().unwrap_or(&capture::Timeline::NORMAL);
+    let d = debug();
+    let down = match key {
+        capture::KEY_NUMBER_7 if d.no_escape => false,
+        capture::KEY_NUMBER_1 if d.start_presses > 1 => {
+            (0..d.start_presses).any(|i| tl.key_down(key, t - 2.0 * i as f64))
+        }
+        _ => tl.key_down(key, t),
+    };
     if down && key == capture::KEY_NUMBER_1 {
         let s = &*SHARED;
         let f = s.frames.load(Ordering::Acquire) as i64;
@@ -375,6 +443,9 @@ pub fn run(
     callbacks[CB_ON_AUDIO_UPDATED] = on_audio_updated as *const () as usize;
     callbacks[CB_IS_KEY_PRESSED] = is_key_pressed as *const () as usize;
     callbacks[CB_ON_SOUND_COMMAND] = on_sound_command as *const () as usize;
+    if debug().show_display {
+        callbacks[CB_ON_DISPLAY_UPDATED] = on_display_updated as *const () as usize;
+    }
     let config = Box::leak(Box::new(Config {
         audio_format: PINMAME_AUDIO_FORMAT_INT16,
         sample_rate: SAMPLE_RATE,
@@ -433,6 +504,7 @@ pub fn run(
     let mut until = max;
     let mut music: Option<f64> = None;
     let mut no_music = false;
+    let (mut shown, mut last_text) = (0, String::new());
     let mut loud: Option<capture::Loudness> = None;
     while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
@@ -444,6 +516,14 @@ pub fn run(
             balls_in = true;
         }
         let s = &*SHARED;
+        if debug().show_display && shown < 120 {
+            let text = s.displays.lock().map(|d| d.join(" | ")).unwrap_or_default();
+            if text != last_text && !text.trim_matches([' ', '|']).is_empty() {
+                println!("[{:5.1} s] {text}", now());
+                shown += 1;
+                last_text = text;
+            }
+        }
         let start = s.start_frame.load(Ordering::Acquire);
         if music.is_none() && start >= 0 {
             let rate = s.rate.load(Ordering::Relaxed).max(1) as f64;

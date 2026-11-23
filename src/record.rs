@@ -276,6 +276,7 @@ pub struct WorkerArgs {
     pub slow: bool,
     /// Also write the whole recording here (diagnostics).
     pub raw: Option<PathBuf>,
+    pub debug: pinmame::Debug,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -287,6 +288,7 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
     } else {
         capture::Timeline::NORMAL
     };
+    pinmame::set_debug(a.debug);
     let run = match pinmame::run(
         &a.dll,
         &a.scratch,

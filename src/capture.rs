@@ -252,6 +252,94 @@ pub fn describe_after_start(
     )
 }
 
+/// The text an alphanumeric display shows (diagnostics). `kind` is the
+/// libpinmame display type; segment bits are a..g = 0..6 (g is the left
+/// middle on 16 segments), then comma 7, and on 16 segments i 8, j 9, k 10,
+/// right middle 11, m 12, n 13, o 14, period 15. None for a DMD or video.
+pub fn segment_text(kind: i32, cells: &[u16]) -> Option<String> {
+    const SEG16: &[(char, &[u8])] = &[
+        ('A', &[0, 1, 2, 4, 5, 6, 11]),
+        ('B', &[0, 1, 2, 3, 9, 11, 13]),
+        ('C', &[0, 3, 4, 5]),
+        ('D', &[0, 1, 2, 3, 9, 13]),
+        ('E', &[0, 3, 4, 5, 6]),
+        ('F', &[0, 4, 5, 6]),
+        ('G', &[0, 2, 3, 4, 5, 11]),
+        ('H', &[1, 2, 4, 5, 6, 11]),
+        ('I', &[0, 3, 9, 13]),
+        ('J', &[1, 2, 3, 4]),
+        ('K', &[4, 5, 6, 10, 12]),
+        ('L', &[3, 4, 5]),
+        ('M', &[1, 2, 4, 5, 8, 10]),
+        ('N', &[1, 2, 4, 5, 8, 12]),
+        ('O', &[0, 1, 2, 3, 4, 5]),
+        ('P', &[0, 1, 4, 5, 6, 11]),
+        ('Q', &[0, 1, 2, 3, 4, 5, 12]),
+        ('R', &[0, 1, 4, 5, 6, 11, 12]),
+        ('S', &[0, 2, 3, 5, 6, 11]),
+        ('T', &[0, 9, 13]),
+        ('U', &[1, 2, 3, 4, 5]),
+        ('V', &[4, 5, 10, 14]),
+        ('W', &[1, 2, 4, 5, 12, 14]),
+        ('X', &[8, 10, 12, 14]),
+        ('Y', &[8, 10, 13]),
+        ('Z', &[0, 3, 10, 14]),
+        ('0', &[0, 1, 2, 3, 4, 5, 10, 14]),
+        ('1', &[1, 2]),
+        ('2', &[0, 1, 3, 4, 6, 11]),
+        ('3', &[0, 1, 2, 3, 11]),
+        ('4', &[1, 2, 5, 6, 11]),
+        ('6', &[0, 2, 3, 4, 5, 6, 11]),
+        ('7', &[0, 1, 2]),
+        ('8', &[0, 1, 2, 3, 4, 5, 6, 11]),
+        ('9', &[0, 1, 2, 3, 5, 6, 11]),
+        ('-', &[6, 11]),
+        ('+', &[6, 9, 11, 13]),
+        ('*', &[6, 8, 9, 10, 11, 12, 13, 14]),
+        ('/', &[10, 14]),
+    ];
+    const SEG7: &[(char, &[u8])] = &[
+        ('0', &[0, 1, 2, 3, 4, 5]),
+        ('1', &[1, 2]),
+        ('2', &[0, 1, 3, 4, 6]),
+        ('3', &[0, 1, 2, 3, 6]),
+        ('4', &[1, 2, 5, 6]),
+        ('5', &[0, 2, 3, 5, 6]),
+        ('6', &[0, 2, 3, 4, 5, 6]),
+        ('7', &[0, 1, 2]),
+        ('8', &[0, 1, 2, 3, 4, 5, 6]),
+        ('9', &[0, 1, 2, 3, 5, 6]),
+        ('-', &[6]),
+    ];
+    let base = kind & 0x3f;
+    if base == 14 || base == 15 || base == 0x20 {
+        return None;
+    }
+    let sixteen = matches!(base, 0 | 1 | 13 | 16 | 17);
+    let (font, used): (&[(char, &[u8])], u16) = if sixteen {
+        (SEG16, 0x7f7f)
+    } else {
+        (SEG7, 0x007f)
+    };
+    let mask = |bits: &[u8]| bits.iter().fold(0u16, |m, &b| m | 1 << b);
+    Some(
+        cells
+            .iter()
+            .map(|&v| {
+                let v = v & used;
+                if v == 0 {
+                    return ' ';
+                }
+                font.iter()
+                    .map(|&(c, bits)| (c, (mask(bits) ^ v).count_ones()))
+                    .min_by_key(|&(_, d)| d)
+                    .filter(|&(_, d)| d <= 1)
+                    .map_or('?', |(c, _)| c)
+            })
+            .collect(),
+    )
+}
+
 /// Zero-crossing rate above which a loud block sounds like static.
 const NOISY_ZCR: f64 = 0.3;
 
@@ -444,6 +532,18 @@ mod tests {
         let d = describe_after_start(&s, 1, rate as u32, Some(0));
         assert!(d.contains("longest stretch 5.0 s"), "{d}");
         assert!(d.contains("0.0 s of it static-like"), "{d}");
+    }
+
+    #[test]
+    fn segments_read_as_text() {
+        let m = |bits: &[u8]| bits.iter().fold(0u16, |m, &b| m | 1 << b);
+        let cells = [m(&[0, 1, 4, 5, 6, 11]), 0, m(&[1, 2]), m(&[1, 2]) | 0x80];
+        assert_eq!(segment_text(0, &cells).as_deref(), Some("P 11"));
+        assert_eq!(
+            segment_text(6, &[m(&[0, 1, 2]), 0x7f]).as_deref(),
+            Some("78")
+        );
+        assert_eq!(segment_text(14, &cells), None);
     }
 
     #[test]
