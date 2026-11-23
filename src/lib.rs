@@ -49,6 +49,9 @@ struct WorkerCli {
     /// Print the alphanumeric displays as they change (diagnostics).
     #[arg(long)]
     show_display: bool,
+    /// PinMAME's built-in mechanics mask (diagnostics; default 1).
+    #[arg(long, allow_hyphen_values = true)]
+    mechanics: Option<i32>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -73,6 +76,7 @@ pub fn run_worker_if_requested() {
             no_escape: w.no_escape,
             start_presses: w.start_presses,
             show_display: w.show_display,
+            mechanics: w.mechanics,
         },
     };
     record::terminate(record::worker_main(&a));

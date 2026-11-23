@@ -30,6 +30,8 @@ pub struct Debug {
     pub start_presses: u32,
     /// Print the alphanumeric displays' text as it changes.
     pub show_display: bool,
+    /// Value for PinmameSetHandleMechanics instead of the default.
+    pub mechanics: Option<i32>,
 }
 
 static DEBUG: OnceLock<Debug> = OnceLock::new();
@@ -490,7 +492,7 @@ pub fn run(
 
     unsafe {
         set_handle_keyboard(1);
-        set_handle_mechanics(1);
+        set_handle_mechanics(debug().mechanics.unwrap_or(1));
     }
     let _ = SHARED.since.set(Instant::now());
     let status = unsafe { run(crom.as_ptr()) };
