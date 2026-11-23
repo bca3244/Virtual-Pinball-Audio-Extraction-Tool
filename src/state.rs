@@ -31,13 +31,13 @@ impl Cache {
         self.dir.join("clips").join(format!("{rom}-{seconds}s"))
     }
 
-    /// A clip of this ROM at this length, preferring `ext`.
+    /// A clip of this ROM at this length in exactly this format. Files
+    /// under 1 KB are leftovers of a failed encode, never a clip.
     pub fn clip(&self, rom: &str, seconds: u32, ext: &str) -> Option<PathBuf> {
-        let stem = self.clip_stem(rom, seconds);
-        std::iter::once(ext)
-            .chain(["mp3", "ogg", "wav"])
-            .map(|e| stem.with_extension(e))
-            .find(|p| p.is_file())
+        let p = self.clip_stem(rom, seconds).with_extension(ext);
+        std::fs::metadata(&p)
+            .is_ok_and(|m| m.is_file() && m.len() >= 1024)
+            .then_some(p)
     }
 
     fn verdict_file(&self, rom: &str) -> PathBuf {
@@ -143,12 +143,21 @@ mod tests {
     }
 
     #[test]
-    fn clip_lookup_prefers_the_wanted_format() {
+    fn clip_lookup_wants_the_format_and_a_real_file() {
         let dir = tempfile::tempdir().unwrap();
         let c = Cache::open(Some(dir.path())).unwrap();
         assert!(c.clip("afm", 30, "mp3").is_none());
-        std::fs::write(c.clip_stem("afm", 30).with_extension("wav"), b"x").unwrap();
+        std::fs::write(c.clip_stem("afm", 30).with_extension("wav"), [0u8; 2048]).unwrap();
+        assert!(
+            c.clip("afm", 30, "mp3").is_none(),
+            "a WAV doesn't stand in for an MP3"
+        );
         std::fs::write(c.clip_stem("afm", 30).with_extension("mp3"), b"x").unwrap();
+        assert!(
+            c.clip("afm", 30, "mp3").is_none(),
+            "an empty leftover isn't a clip"
+        );
+        std::fs::write(c.clip_stem("afm", 30).with_extension("mp3"), [0u8; 2048]).unwrap();
         assert_eq!(
             c.clip("afm", 30, "mp3").unwrap().extension().unwrap(),
             "mp3"

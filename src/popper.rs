@@ -266,7 +266,10 @@ impl Db {
                 display: display.unwrap_or_else(|| name.clone()),
                 name,
                 file_name,
-                rom: rom.map(|r| r.to_ascii_lowercase()),
+                // Only a plain ROM name: it becomes file and folder names.
+                rom: rom
+                    .map(|r| r.to_ascii_lowercase())
+                    .filter(|r| r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')),
             });
         }
         Ok(out)
@@ -323,8 +326,15 @@ pub fn install(clip: &Path, media_dir: &Path, game_name: &str, force: bool) -> R
     }
     let part = dir.join(format!("{game_name}.{ext}.vpae-part"));
     std::fs::copy(clip, &part).with_context(|| format!("writing {}", part.display()))?;
-    if force && dest.exists() {
-        std::fs::remove_file(&dest).with_context(|| format!("replacing {}", dest.display()))?;
+    if force {
+        // The same name in any audio format, so Popper is left with just this one.
+        for e in AUDIO_EXTS {
+            let old = dir.join(format!("{game_name}.{e}"));
+            if old.is_file() {
+                std::fs::remove_file(&old)
+                    .with_context(|| format!("replacing {}", old.display()))?;
+            }
+        }
     }
     std::fs::rename(&part, &dest)
         .with_context(|| format!("renaming {} to {}", part.display(), dest.display()))?;

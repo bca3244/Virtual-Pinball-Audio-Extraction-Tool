@@ -208,7 +208,7 @@ impl std::fmt::Display for NotStarted {
             NotStarted::NoRom => write!(f, "ROM zip not found"),
             NotStarted::Refused(c) => write!(
                 f,
-                "PinMAME didn't start it (status {c}; a missing parent ROM set is the usual cause)"
+                "PinMAME doesn't know this game name (status {c}; an alias missing from alias.txt?)"
             ),
         }
     }
@@ -220,6 +220,52 @@ fn find_zip(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     dirs.iter()
         .map(|d| d.join(format!("{name}.zip")))
         .find(|p| p.is_file())
+}
+
+/// What `alias.txt` (libpinmame's, or VPinMAME's VPMAlias.txt: same format,
+/// `alias,romname` per line) maps `rom` to.
+fn alias_target(alias_file: &str, rom: &str) -> Option<String> {
+    alias_file
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| {
+            let mut parts = l.split([',', ' ', '\t']).filter(|t| !t.is_empty());
+            let from = parts.next()?;
+            let to = parts.next()?.split(['#', ';', '\'']).next()?.trim();
+            (from.eq_ignore_ascii_case(rom) && !to.is_empty()).then(|| to.to_ascii_lowercase())
+        })
+}
+
+/// libpinmame's alias.txt beside the DLL, else VPinMAME's VPMAlias.txt
+/// (beside a `roms` folder).
+fn find_alias_file(dll: &Path, rom_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let beside_dll = dll
+        .parent()
+        .into_iter()
+        .flat_map(|d| [d.join("alias.txt"), d.join("VPMAlias.txt")]);
+    let beside_roms = rom_dirs
+        .iter()
+        .filter_map(|d| d.parent())
+        .flat_map(|d| [d.join("VPMAlias.txt"), d.join("alias.txt")]);
+    beside_dll.chain(beside_roms).find(|p| p.is_file())
+}
+
+#[cfg(windows)]
+fn load(dll: &Path) -> Result<Library> {
+    // LOAD_WITH_ALTERED_SEARCH_PATH: DLLs it depends on are found in its own
+    // folder. Needs an absolute path.
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+    let abs = std::path::absolute(dll)?;
+    let lib = unsafe {
+        libloading::os::windows::Library::load_with_flags(&abs, LOAD_WITH_ALTERED_SEARCH_PATH)
+    }
+    .with_context(|| format!("loading {}", abs.display()))?;
+    Ok(lib.into())
+}
+
+#[cfg(not(windows))]
+fn load(dll: &Path) -> Result<Library> {
+    unsafe { Library::new(dll) }.with_context(|| format!("loading {}", dll.display()))
 }
 
 fn copy_into(zip: &Path, roms: &Path) -> Result<()> {
@@ -248,14 +294,35 @@ pub fn run(
     for sub in ["roms", "nvram", "cfg"] {
         std::fs::create_dir_all(scratch.join(sub))?;
     }
-    let Some(zip) = find_zip(rom, rom_dirs) else {
+    // PinMAME opens vpmPath with ANSI file calls: a non-ASCII path would make
+    // every ROM look missing. Not a verdict on the ROM.
+    let mut path = scratch.to_string_lossy().into_owned();
+    if !path.ends_with(std::path::MAIN_SEPARATOR) {
+        path.push(std::path::MAIN_SEPARATOR);
+    }
+    if !path.is_ascii() || path.len() >= PINMAME_MAX_PATH {
+        bail!("PinMAME can't use the scratch folder {path} (must be ASCII, under {PINMAME_MAX_PATH} bytes)");
+    }
+    let alias = find_alias_file(dll, rom_dirs).and_then(|f| {
+        std::fs::copy(&f, scratch.join("alias.txt")).ok()?;
+        std::fs::read_to_string(f).ok()
+    });
+    // The game PinMAME will actually load (an alias names another set).
+    let game = alias
+        .as_deref()
+        .and_then(|a| alias_target(a, rom))
+        .unwrap_or_else(|| rom.to_string());
+    if game != rom {
+        println!("alias: {rom} -> {game}");
+    }
+    let Some(zip) = find_zip(&game, rom_dirs) else {
         return Err(NotStarted::NoRom.into());
     };
     copy_into(&zip, &roms)?;
 
     // Loaded in place: a copy elsewhere would lose any DLLs it loads from
     // its own folder. Never unloaded (the process ends with it running).
-    let lib = unsafe { Library::new(dll) }.with_context(|| format!("loading {}", dll.display()))?;
+    let lib = load(dll)?;
     let lib: &'static Library = Box::leak(Box::new(lib));
     macro_rules! sym {
         ($name:literal, $ty:ty) => {
@@ -279,13 +346,6 @@ pub fn run(
         .map(|s| *s);
 
     let mut vpm_path = [0u8; PINMAME_MAX_PATH];
-    let mut path = scratch.to_string_lossy().into_owned();
-    if !path.ends_with(std::path::MAIN_SEPARATOR) {
-        path.push(std::path::MAIN_SEPARATOR);
-    }
-    if path.len() >= PINMAME_MAX_PATH {
-        bail!("scratch path too long for PinMAME: {path}");
-    }
     vpm_path[..path.len()].copy_from_slice(path.as_bytes());
     let mut callbacks = [0usize; 12];
     callbacks[CB_ON_AUDIO_AVAILABLE] = on_audio_available as *const () as usize;
@@ -304,13 +364,24 @@ pub fn run(
     }
     unsafe { set_config(config) };
 
-    // A clone needs its parent set beside it. PinmameGetGame only answers
-    // once a config is set.
+    // A clone needs its parent sets beside it, all the way up the chain.
+    // PinmameGetGame only answers once a config is set.
     let crom = std::ffi::CString::new(rom)?;
     if let Some(get_game) = get_game {
-        let mut parent: Option<String> = None;
-        unsafe { get_game(crom.as_ptr(), on_game, &mut parent as *mut _ as *mut c_void) };
-        if let Some(parent) = parent {
+        let mut name = game.clone();
+        for _ in 0..4 {
+            let cname = std::ffi::CString::new(name.as_str())?;
+            let mut parent: Option<String> = None;
+            unsafe {
+                get_game(
+                    cname.as_ptr(),
+                    on_game,
+                    &mut parent as *mut _ as *mut c_void,
+                )
+            };
+            let Some(parent) = parent.filter(|p| *p != name) else {
+                break;
+            };
             match find_zip(&parent, rom_dirs) {
                 Some(p) => {
                     println!("parent ROM set: {parent}");
@@ -318,6 +389,7 @@ pub fn run(
                 }
                 None => println!("warning: parent ROM set {parent}.zip not found"),
             }
+            name = parent;
         }
     }
 
@@ -377,6 +449,24 @@ mod tests {
             8 + PINMAME_MAX_PATH
         );
         assert_eq!(std::mem::size_of::<AudioInfo>(), 32);
+    }
+
+    #[test]
+    fn alias_lines() {
+        let a = "# comment\nsomealias,afm_113b\nother, tz_92 # note\n";
+        assert_eq!(alias_target(a, "SOMEALIAS").as_deref(), Some("afm_113b"));
+        assert_eq!(alias_target(a, "other").as_deref(), Some("tz_92"));
+        assert_eq!(alias_target(a, "afm_113b"), None);
+    }
+
+    #[test]
+    fn non_ascii_scratch_is_refused_not_a_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("Jürgen");
+        let e = run(Path::new("nope.dll"), &scratch, "xyz", &[], &[], 1.0)
+            .err()
+            .unwrap();
+        assert!(e.downcast_ref::<NotStarted>().is_none(), "{e}");
     }
 
     #[test]

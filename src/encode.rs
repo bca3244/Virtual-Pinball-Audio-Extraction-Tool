@@ -61,19 +61,27 @@ pub fn encode(
         std::fs::copy(wav_in, &target)?;
         return Ok(target);
     }
+    // A failed encoder can leave a partial file: always removed, so it can
+    // never pass for a clip.
     if let Some(ff) = ffmpeg {
         match with_ffmpeg(ff, wav_in, &target, format) {
             Ok(()) => return Ok(target),
-            Err(e) => log::warn!("ffmpeg couldn't encode {}: {e:#}", target.display()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&target);
+                log::warn!("ffmpeg couldn't encode {}: {e:#}", target.display())
+            }
         }
     }
     if format == Format::Mp3 {
         match media_foundation_mp3(wav_in, &target) {
             Ok(()) => return Ok(target),
-            Err(e) => log::warn!(
-                "Media Foundation couldn't encode {}: {e:#}",
-                target.display()
-            ),
+            Err(e) => {
+                let _ = std::fs::remove_file(&target);
+                log::warn!(
+                    "Media Foundation couldn't encode {}: {e:#}",
+                    target.display()
+                )
+            }
         }
     }
     let fallback = out_stem.with_extension("wav");
@@ -145,62 +153,110 @@ fn media_foundation_mp3(wav_in: &Path, out: &Path) -> Result<()> {
 
     unsafe {
         let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
-        let result = (|| -> Result<()> {
-            let writer = MFCreateSinkWriterFromURL(&HSTRING::from(out.as_os_str()), None, None)
-                .context("creating the MP3 writer")?;
+        let started = MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup");
+        let result = started.and_then(|()| {
+            let r = (|| -> Result<()> {
+                let writer = MFCreateSinkWriterFromURL(&HSTRING::from(out.as_os_str()), None, None)
+                    .context("creating the MP3 writer")?;
 
-            let out_type = MFCreateMediaType()?;
-            out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            out_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_MP3)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, pcm.rate)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)?;
-            out_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192_000 / 8)?;
-            let stream = writer.AddStream(&out_type).context("MP3 output type")?;
+                let out_type = mp3_output_type(pcm.rate, channels)?;
+                let stream = writer.AddStream(&out_type).context("MP3 output type")?;
 
-            let in_type = MFCreateMediaType()?;
-            in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            in_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-            in_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
-            in_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, pcm.rate)?;
-            in_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)?;
-            in_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block)?;
-            in_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, pcm.rate * block)?;
-            in_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-            writer
-                .SetInputMediaType(stream, &in_type, None)
-                .context("PCM input type")?;
-            writer.BeginWriting()?;
+                let in_type = MFCreateMediaType()?;
+                in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                in_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                in_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                in_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, pcm.rate)?;
+                in_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)?;
+                in_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block)?;
+                in_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, pcm.rate * block)?;
+                in_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+                writer
+                    .SetInputMediaType(stream, &in_type, None)
+                    .context("PCM input type")?;
+                writer.BeginWriting()?;
 
-            // Half-second samples; times in 100 ns units.
-            let frames_per_chunk = (pcm.rate / 2) as usize;
-            let mut written_frames: u64 = 0;
-            for chunk in pcm.samples.chunks(frames_per_chunk * channels as usize) {
-                let bytes = chunk.len() * 2;
-                let buffer = MFCreateMemoryBuffer(bytes as u32)?;
-                let mut data = std::ptr::null_mut();
-                buffer.Lock(&mut data, None, None)?;
-                std::ptr::copy_nonoverlapping(chunk.as_ptr() as *const u8, data, bytes);
-                buffer.Unlock()?;
-                buffer.SetCurrentLength(bytes as u32)?;
-                let sample = MFCreateSample()?;
-                sample.AddBuffer(&buffer)?;
-                let frames = (chunk.len() / channels as usize) as u64;
-                sample.SetSampleTime((written_frames * 10_000_000 / pcm.rate as u64) as i64)?;
-                sample.SetSampleDuration((frames * 10_000_000 / pcm.rate as u64) as i64)?;
-                writer.WriteSample(stream, &sample)?;
-                written_frames += frames;
-            }
-            writer.Finalize().context("finishing the MP3")?;
-            Ok(())
-        })();
-        let _ = MFShutdown();
+                // Half-second samples; times in 100 ns units.
+                let frames_per_chunk = (pcm.rate / 2) as usize;
+                let mut written_frames: u64 = 0;
+                for chunk in pcm.samples.chunks(frames_per_chunk * channels as usize) {
+                    let bytes = chunk.len() * 2;
+                    let buffer = MFCreateMemoryBuffer(bytes as u32)?;
+                    let mut data = std::ptr::null_mut();
+                    buffer.Lock(&mut data, None, None)?;
+                    std::ptr::copy_nonoverlapping(chunk.as_ptr() as *const u8, data, bytes);
+                    buffer.Unlock()?;
+                    buffer.SetCurrentLength(bytes as u32)?;
+                    let sample = MFCreateSample()?;
+                    sample.AddBuffer(&buffer)?;
+                    let frames = (chunk.len() / channels as usize) as u64;
+                    sample.SetSampleTime((written_frames * 10_000_000 / pcm.rate as u64) as i64)?;
+                    sample.SetSampleDuration((frames * 10_000_000 / pcm.rate as u64) as i64)?;
+                    writer.WriteSample(stream, &sample)?;
+                    written_frames += frames;
+                }
+                writer.Finalize().context("finishing the MP3")?;
+                Ok(())
+            })();
+            let _ = MFShutdown();
+            r
+        });
         if com {
             CoUninitialize();
         }
         result?;
     }
     check_written(out)
+}
+
+/// The encoder's own output type for this rate and channel count, at the
+/// bitrate nearest 192 kbps (mono tops out lower). A hand-built type is the
+/// fallback when the encoder can't be asked.
+#[cfg(windows)]
+unsafe fn mp3_output_type(
+    rate: u32,
+    channels: u32,
+) -> Result<windows::Win32::Media::MediaFoundation::IMFMediaType> {
+    use windows::core::Interface;
+    use windows::Win32::Media::MediaFoundation::*;
+    const WANT: u32 = 192_000 / 8;
+    let flags = (MFT_ENUM_FLAG_ALL.0 & !MFT_ENUM_FLAG_FIELDOFUSE.0) as u32;
+    let mut best: Option<(u32, IMFMediaType)> = None;
+    if let Ok(types) =
+        unsafe { MFTranscodeGetAudioOutputAvailableTypes(&MFAudioFormat_MP3, flags, None) }
+    {
+        for i in 0..unsafe { types.GetElementCount() }.unwrap_or(0) {
+            let Ok(t) = unsafe { types.GetElement(i) }.and_then(|u| u.cast::<IMFMediaType>())
+            else {
+                continue;
+            };
+            let get = |k| unsafe { t.GetUINT32(k) }.unwrap_or(0);
+            if get(&MF_MT_AUDIO_SAMPLES_PER_SECOND) != rate
+                || get(&MF_MT_AUDIO_NUM_CHANNELS) != channels
+            {
+                continue;
+            }
+            let diff = get(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND).abs_diff(WANT);
+            if best.as_ref().is_none_or(|(d, _)| diff < *d) {
+                best = Some((diff, t));
+            }
+        }
+    }
+    if let Some((_, t)) = best {
+        return Ok(t);
+    }
+    let t = unsafe { MFCreateMediaType() }?;
+    unsafe {
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_MP3)?;
+        t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate)?;
+        t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels)?;
+        t.SetUINT32(
+            &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            if channels == 1 { 128_000 / 8 } else { WANT },
+        )?;
+    }
+    Ok(t)
 }
 
 #[cfg(test)]

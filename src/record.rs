@@ -357,6 +357,55 @@ pub fn terminate(code: i32) -> ! {
 
 // ---- orchestration --------------------------------------------------------
 
+/// Where workers get their scratch folders. PinMAME needs an ASCII path, and
+/// %TEMP% holds the user name, so fall back to %ProgramData% when it isn't.
+fn work_dir() -> PathBuf {
+    let tmp = std::env::temp_dir();
+    if tmp.to_str().is_some_and(|s| s.is_ascii()) {
+        return tmp;
+    }
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|p| p.to_str().is_some_and(|s| s.is_ascii()))
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("vp-audio-extract")
+}
+
+/// Puts a worker in a job that's killed when this process ends (Ctrl-C, a
+/// closed console), so no emulator is left running.
+#[cfg(windows)]
+fn kill_with_us(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::*;
+    static JOB: OnceLock<Option<isize>> = OnceLock::new();
+    let job = JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(None, None).ok()?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .ok()?;
+        // Kept open for the life of the process: closing it kills the workers.
+        Some(job.0 as isize)
+    });
+    if let Some(job) = *job {
+        let h = HANDLE(child.as_raw_handle());
+        if let Err(e) = unsafe { AssignProcessToJobObject(HANDLE(job as *mut std::ffi::c_void), h) }
+        {
+            log::debug!("couldn't tie the worker to this process: {e}");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_with_us(_child: &std::process::Child) {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Recorded,
@@ -466,7 +515,7 @@ impl Runner<'_> {
 
     fn record_one(&self, job: &Job, summary: &Mutex<Summary>) -> Outcome {
         let fp = state::fingerprint(&job.zip);
-        let tmp = std::env::temp_dir().join(format!(
+        let tmp = work_dir().join(format!(
             "vp-audio-extract-{}-{}",
             job.rom,
             std::process::id()
@@ -568,6 +617,7 @@ impl Runner<'_> {
         }
         log::debug!("{}: trough switches {trough:?}", job.rom);
         let mut child = cmd.spawn().context("starting the recording process")?;
+        kill_with_us(&child);
         let rom = job.rom.clone();
         let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
             Box::new(child.stdout.take().context("no stdout")?),
@@ -578,8 +628,15 @@ impl Runner<'_> {
             .map(|p| {
                 let rom = rom.clone();
                 std::thread::spawn(move || {
-                    for line in std::io::BufReader::new(p).lines().map_while(Result::ok) {
-                        log::info!("  {rom} | {line}");
+                    // Raw bytes to EOF: PinMAME's own output needn't be
+                    // UTF-8, and a reader that stops would let the pipe fill
+                    // and stall the worker.
+                    let mut r = std::io::BufReader::new(p);
+                    let mut buf = Vec::new();
+                    while matches!(r.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
+                        let line = String::from_utf8_lossy(&buf);
+                        log::info!("  {rom} | {}", line.trim_end());
+                        buf.clear();
                     }
                 })
             })
@@ -704,7 +761,7 @@ mod tests {
         // A clip recorded earlier for the ROM is reused.
         std::fs::write(
             cache.clip_stem("afm_113b", 30).with_extension("mp3"),
-            b"clip",
+            [7u8; 2048],
         )
         .unwrap();
         let plan2 = super::plan(&db, &cache, &opts(&roms)).unwrap();
