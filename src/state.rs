@@ -45,7 +45,8 @@ fn portable_dir() -> Option<PathBuf> {
 }
 
 /// Moves what an earlier version kept in `old` into `new`, once: clips,
-/// verdicts, removed batches (so Restore still finds them) and the log.
+/// verdicts, removed batches (so Restore still finds them), the log and
+/// the GUI's settings.
 /// Anything that can't be moved stays where it was.
 pub(crate) fn migrate(old: &Path, new: &Path) {
     if old == new || !old.is_dir() {
@@ -68,11 +69,11 @@ pub(crate) fn migrate(old: &Path, new: &Path) {
         }
         let _ = std::fs::remove_dir(&from);
     }
-    let log = old.join("vp-audio-extract.log");
-    if log.is_file() {
-        let target = new.join("vp-audio-extract.log");
-        if !target.exists() {
-            let _ = move_tree(&log, &target);
+    for file in ["vp-audio-extract.log", "gui.txt"] {
+        let from = old.join(file);
+        let target = new.join(file);
+        if from.is_file() && !target.exists() {
+            let _ = move_tree(&from, &target);
         }
     }
     let _ = std::fs::remove_dir(old);
@@ -293,6 +294,7 @@ mod tests {
         std::fs::create_dir_all(old.join("clips")).unwrap();
         std::fs::write(old.join("clips").join("a-30s-v3.ogg"), "c").unwrap();
         std::fs::write(old.join("vp-audio-extract.log"), "log").unwrap();
+        std::fs::write(old.join("gui.txt"), "format=ogg").unwrap();
         std::fs::create_dir_all(&new).unwrap();
         migrate(&old, &new);
         assert!(new
@@ -302,6 +304,7 @@ mod tests {
             .is_file());
         assert!(new.join("clips").join("a-30s-v3.ogg").is_file());
         assert!(new.join("vp-audio-extract.log").is_file());
+        assert!(new.join("gui.txt").is_file(), "GUI settings move too");
         assert!(!old.exists());
     }
 
