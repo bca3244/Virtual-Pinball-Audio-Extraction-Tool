@@ -2,6 +2,12 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.12
+
+- Music stored in a table as MP3 sounds is found when the script lists it as music (Game Logic Framework's `AddMusic`), or when it's named `mus_...`. Voice lines and callouts (`voc_...`) no longer count as music. Dark Chaos now gets its music.
+- Tables whose search found nothing before are looked at again.
+- `--game` also matches part of a table's name ("No Fear" for "No Fear - Dangerous Sports").
+
 ## 0.1.0-beta.11
 
 - The play and stop buttons are drawn as a triangle and a square instead of font symbols, which showed up as empty boxes on some PCs.

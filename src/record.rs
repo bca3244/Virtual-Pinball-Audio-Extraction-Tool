@@ -184,10 +184,15 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
     let base = |n: &str| n.split(" (").next().unwrap_or(n).trim().to_string();
     let by_name = |g: &Game| {
         opts.games.iter().any(|w| {
-            [g.name.as_str(), g.display.as_str()]
-                .iter()
-                .any(|n| w.eq_ignore_ascii_case(n) || w.trim().eq_ignore_ascii_case(&base(n)))
-                || g.rom.as_deref().is_some_and(|r| w.eq_ignore_ascii_case(r))
+            [g.name.as_str(), g.display.as_str()].iter().any(|n| {
+                let w = w.trim();
+                w.eq_ignore_ascii_case(n)
+                        || w.eq_ignore_ascii_case(&base(n))
+                        // Part of the name ("No Fear" for "No Fear -
+                        // Dangerous Sports (Williams 1995)").
+                        || (w.chars().count() >= 3
+                            && n.to_lowercase().contains(&w.to_lowercase()))
+            }) || g.rom.as_deref().is_some_and(|r| w.eq_ignore_ascii_case(r))
         })
     };
     let mut out = Vec::new();
@@ -1350,6 +1355,9 @@ mod tests {
             assert_eq!(p.len(), 1, "{w}");
             assert!(matches!(p[0].status, Status::NoMediaDir));
         }
+        let mut o = opts(dir.path());
+        o.games = vec!["madness".into()];
+        assert_eq!(plan(&db, &cache, &o).unwrap().len(), 1, "part of the name");
         let mut o = opts(dir.path());
         o.games = vec!["diner".into()];
         let p = plan(&db, &cache, &o).unwrap();
