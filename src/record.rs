@@ -304,6 +304,13 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
             };
         }
     };
+    println!(
+        "{}: {} sound command(s); loudest before Start {:.0}, after {:.0} (RMS)",
+        a.rom,
+        run.sound_commands,
+        capture::loudest(&run.samples, run.channels, run.rate, None, run.start_sample),
+        capture::loudest(&run.samples, run.channels, run.rate, run.start_sample, None),
+    );
     let recorded = run.samples.len() as f64 / run.channels.max(1) as f64 / run.rate.max(1) as f64;
     if run.end == pinmame::RunEnd::Stopped && run.samples.is_empty() {
         // PinmameRun accepts the name, then the emulation ends while loading
@@ -670,7 +677,14 @@ impl Runner<'_> {
             const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
             cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
         }
-        log::debug!("{}: trough switches {trough:?}", job.rom);
+        if trough.is_empty() {
+            log::info!(
+                "{}: no trough switches found in the table script; the game may not start",
+                job.rom
+            );
+        } else {
+            log::debug!("{}: trough switches {trough:?}", job.rom);
+        }
         let mut child = cmd.spawn().context("starting the recording process")?;
         kill_with_us(&child);
         let rom = job.rom.clone();

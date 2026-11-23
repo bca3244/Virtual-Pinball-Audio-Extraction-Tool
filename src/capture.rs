@@ -105,6 +105,9 @@ pub struct Loudness {
     rate: usize,
     channels: usize,
     pub rms: Vec<f64>,
+    /// Zero crossings per sample of the first channel, per block: about 0.5
+    /// for white noise (static), far lower for music and speech.
+    pub zcr: Vec<f64>,
 }
 
 impl Loudness {
@@ -125,6 +128,7 @@ impl Loudness {
             rate,
             channels,
             rms: Vec::new(),
+            zcr: Vec::new(),
         }
     }
 
@@ -138,12 +142,24 @@ impl Loudness {
         let Some(new) = samples.get(from.min(samples.len())..) else {
             return;
         };
-        let block = self.block;
-        self.rms.extend(
-            new.chunks_exact(block).map(|b| {
-                (b.iter().map(|&s| s as f64 * s as f64).sum::<f64>() / block as f64).sqrt()
-            }),
-        );
+        let (block, channels) = (self.block, self.channels);
+        for b in new.chunks_exact(block) {
+            // Around the block's own mean, so a DC offset isn't loudness.
+            let mean = b.iter().map(|&s| s as f64).sum::<f64>() / block as f64;
+            let rms =
+                (b.iter().map(|&s| (s as f64 - mean).powi(2)).sum::<f64>() / block as f64).sqrt();
+            let first: Vec<f64> = b
+                .iter()
+                .step_by(channels)
+                .map(|&s| s as f64 - mean)
+                .collect();
+            let crossings = first
+                .windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count();
+            self.rms.push(rms);
+            self.zcr.push(crossings as f64 / first.len().max(1) as f64);
+        }
     }
 
     /// Emulated seconds at the start of block `i`.
@@ -160,9 +176,11 @@ impl Loudness {
 /// Where the music is in `rms` (100 ms blocks): the first stretch of sound,
 /// with no 3 s silence in it, that lasts at least 2 s. A shorter sound
 /// followed by silence (the Start sound, a ball-launch effect) is passed
-/// over. Returns its first and last loud block; None while there's no such
-/// stretch.
-pub fn music_span(rms: &[f64]) -> Option<(usize, usize)> {
+/// over, and so is static (noise: most blocks crossing zero about every
+/// other sample). Returns its first and last loud block; None while there's
+/// no such stretch.
+pub fn music_span(loud: &Loudness) -> Option<(usize, usize)> {
+    let rms = &loud.rms;
     let mut b = 0;
     while let Some(off) = rms[b..].iter().position(|&r| r > QUIET) {
         let first = b + off;
@@ -176,7 +194,7 @@ pub fn music_span(rms: &[f64]) -> Option<(usize, usize)> {
                 break;
             }
         }
-        if last - first + 1 >= 20 {
+        if last - first + 1 >= 20 && !noisy(loud, first, last) {
             return Some((first, last));
         }
         if !closed {
@@ -185,6 +203,37 @@ pub fn music_span(rms: &[f64]) -> Option<(usize, usize)> {
         b = last + 1;
     }
     None
+}
+
+/// The loudest 100 ms block (RMS around its mean) between two sample
+/// indexes (all channels counted), for the log.
+pub fn loudest(
+    samples: &[i16],
+    channels: u32,
+    rate: u32,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> f64 {
+    let n = samples.len();
+    let from = (from.unwrap_or(0) as usize).min(n);
+    let to = (to.map_or(n, |t| t as usize)).clamp(from, n);
+    let mut l = Loudness::new(channels, rate, None);
+    l.begin = from - from % channels.max(1) as usize;
+    l.update(&samples[..to]);
+    l.rms.iter().copied().fold(0.0, f64::max)
+}
+
+/// Zero-crossing rate above which a loud block sounds like static.
+const NOISY_ZCR: f64 = 0.3;
+
+/// Whether most loud blocks in `first..=last` are static.
+fn noisy(loud: &Loudness, first: usize, last: usize) -> bool {
+    let loud_blocks: Vec<f64> = (first..=last)
+        .filter(|&i| loud.rms[i] > QUIET)
+        .map(|i| loud.zcr[i])
+        .collect();
+    let noisy = loud_blocks.iter().filter(|&&z| z > NOISY_ZCR).count();
+    noisy * 2 > loud_blocks.len()
 }
 
 /// From the music after Start (the coin chimes before it, and a short Start
@@ -201,7 +250,7 @@ pub fn clip(
 ) -> Option<Vec<i16>> {
     let mut loud = Loudness::new(channels, rate, start_sample);
     loud.update(samples);
-    let (first, last) = music_span(&loud.rms)?;
+    let (first, last) = music_span(&loud)?;
     let (rate, channels) = (loud.rate, loud.channels);
     let start = loud.sample_of(first);
     let end = samples
@@ -284,7 +333,7 @@ mod tests {
         assert!((11.5..12.5).contains(&secs), "{secs}");
         let mut l = Loudness::new(1, rate as u32, Some(0));
         l.update(&s);
-        let (first, _) = music_span(&l.rms).unwrap();
+        let (first, _) = music_span(&l).unwrap();
         let t = l.time_of(first);
         let want = music_at as f64 / rate as f64;
         assert!((t - want).abs() < 0.15, "{t} vs {want}");
@@ -297,11 +346,36 @@ mod tests {
         s.extend(tone(1.0, rate, 2, 1000.0).iter().step_by(2));
         let mut l = Loudness::new(1, rate as u32, Some(0));
         l.update(&s);
-        assert!(music_span(&l.rms).is_none(), "only 1 s so far");
+        assert!(music_span(&l).is_none(), "only 1 s so far");
         s.extend(tone(2.0, rate, 2, 1000.0).iter().step_by(2));
         l.update(&s);
-        let (first, _) = music_span(&l.rms).unwrap();
+        let (first, _) = music_span(&l).unwrap();
         assert!((l.time_of(first) - 3.0).abs() < 0.15);
+    }
+
+    #[test]
+    fn static_is_not_music() {
+        let rate = 22050;
+        let mut x: u32 = 12345;
+        let noise: Vec<i16> = (0..rate * 20)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                ((x >> 16) as i16 as i32 / 40) as i16
+            })
+            .collect();
+        assert!(clip(&noise, 1, rate as u32, Some(0), 30).is_none());
+        // Static first, then music: the music is kept.
+        let mut s = noise.clone();
+        s.extend(vec![0i16; rate * 4]);
+        s.extend(tone(10.0, rate, 1, 2000.0));
+        let c = clip(&s, 1, rate as u32, Some(0), 30).unwrap();
+        assert!((9.5..10.5).contains(&(c.len() as f64 / rate as f64)));
+    }
+
+    #[test]
+    fn dc_offset_is_not_loudness() {
+        let s = vec![400i16; 22050 * 20];
+        assert!(clip(&s, 1, 22050, Some(0), 30).is_none());
     }
 
     #[test]

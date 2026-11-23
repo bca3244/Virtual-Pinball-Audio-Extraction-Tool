@@ -47,6 +47,7 @@ struct Config {
 const CB_ON_AUDIO_AVAILABLE: usize = 3;
 const CB_ON_AUDIO_UPDATED: usize = 4;
 const CB_IS_KEY_PRESSED: usize = 9;
+const CB_ON_SOUND_COMMAND: usize = 11;
 
 #[repr(C)]
 struct AudioInfo {
@@ -82,6 +83,8 @@ type GetGameFn = unsafe extern "C" fn(*const c_char, GameCallback, *mut c_void) 
 struct Shared {
     /// Sound frames received: the emulated clock.
     frames: AtomicU64,
+    /// Sound commands the game CPU sent its sound board(s).
+    sound_commands: AtomicU64,
     channels: AtomicU32,
     rate: AtomicU32,
     /// Frame count when Start went down, or -1.
@@ -93,6 +96,7 @@ struct Shared {
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     frames: AtomicU64::new(0),
+    sound_commands: AtomicU64::new(0),
     channels: AtomicU32::new(1),
     rate: AtomicU32::new(SAMPLE_RATE as u32),
     start_frame: AtomicI64::new(-1),
@@ -146,6 +150,10 @@ unsafe extern "system" fn on_audio_updated(
     samples
 }
 
+unsafe extern "system" fn on_sound_command(_board: c_int, _cmd: c_int, _user: *mut c_void) {
+    SHARED.sound_commands.fetch_add(1, Ordering::Relaxed);
+}
+
 unsafe extern "system" fn is_key_pressed(key: c_int, _user: *mut c_void) -> c_int {
     let t = now();
     let down = TIMELINE
@@ -197,6 +205,9 @@ pub struct RunResult {
     /// Sample index (all channels counted) where Start went down.
     pub start_sample: Option<u64>,
     pub end: RunEnd,
+    /// Sound commands sent to the sound board(s): none means the game
+    /// never asked for a sound.
+    pub sound_commands: u64,
 }
 
 /// Why a run never got going.
@@ -363,6 +374,7 @@ pub fn run(
     callbacks[CB_ON_AUDIO_AVAILABLE] = on_audio_available as *const () as usize;
     callbacks[CB_ON_AUDIO_UPDATED] = on_audio_updated as *const () as usize;
     callbacks[CB_IS_KEY_PRESSED] = is_key_pressed as *const () as usize;
+    callbacks[CB_ON_SOUND_COMMAND] = on_sound_command as *const () as usize;
     let config = Box::leak(Box::new(Config {
         audio_format: PINMAME_AUDIO_FORMAT_INT16,
         sample_rate: SAMPLE_RATE,
@@ -445,7 +457,7 @@ pub fn run(
                 )
             });
             l.update(&s.audio.lock().unwrap_or_else(|e| e.into_inner()));
-            if let Some((first, _)) = capture::music_span(&l.rms) {
+            if let Some((first, _)) = capture::music_span(l) {
                 let at = l.time_of(first);
                 music = Some(at);
                 until = capture::end_after_music(at, seconds);
@@ -475,6 +487,7 @@ pub fn run(
         rate: s.rate.load(Ordering::Relaxed),
         start_sample: (start >= 0).then(|| start as u64 * channels as u64),
         end,
+        sound_commands: s.sound_commands.load(Ordering::Relaxed),
     })
 }
 
