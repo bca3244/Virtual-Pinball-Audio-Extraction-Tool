@@ -193,9 +193,58 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
     out
 }
 
+/// Switches of mechanisms the script simulates with `cvpmMech` (The Addams
+/// Family's Thing hand, Bride of Pin-bot's head...) that are closed at the
+/// starting position: `.AddSw 84, 0, 1` (closed from step 0). Nobody closes
+/// them without the script, so the ROM thinks the mechanism is stuck and
+/// won't start a game.
+pub fn mech_rest_switches(script: &str) -> Vec<i32> {
+    let mut out = Vec::new();
+    for raw in script.lines() {
+        let line = raw.trim();
+        if is_comment(line) {
+            continue;
+        }
+        let Some(rest) = after_ci(line, ".addsw") else {
+            continue;
+        };
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+            continue;
+        }
+        let n = int_list(rest.trim_start().trim_start_matches('('));
+        if let [sw, 0, _, ..] = n[..] {
+            if sw > 0 && !out.contains(&sw) {
+                out.push(sw);
+            }
+        }
+    }
+    out.truncate(8);
+    out
+}
+
+/// The switches closed when a recording starts: balls in the trough and
+/// mechanisms at rest.
+pub fn start_switches(script: &str) -> Vec<i32> {
+    let mut out = trough_switches(script);
+    for sw in mech_rest_switches(script) {
+        if !out.contains(&sw) {
+            out.push(sw);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mech_switches_closed_at_rest() {
+        let s = "Set mHand = New cvpmMech\nWith mHand\n .Sol1 = 27\n .AddSw 84, 0, 1\n .AddSw 83, 40, 41\nEnd With\n' .AddSw 99, 0, 1\nmBook.AddSw(82, 0, 3)\nmX.AddSwitch 5, 0, 1\n";
+        assert_eq!(mech_rest_switches(s), vec![84, 82]);
+        let t = "bsTrough.InitSw 0, 15, 16, 0, 0, 0, 0, 0\n";
+        assert_eq!(start_switches(&format!("{t}{s}")), vec![15, 16, 84, 82]);
+    }
 
     #[test]
     fn finds_rom_name() {

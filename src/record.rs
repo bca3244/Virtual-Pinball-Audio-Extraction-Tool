@@ -635,7 +635,7 @@ impl Runner<'_> {
             .find_map(|t| {
                 vpx::read_script(t)
                     .ok()
-                    .map(|s| vpx::trough_switches(&s))
+                    .map(|s| vpx::start_switches(&s))
                     .filter(|v| !v.is_empty())
             })
             .unwrap_or_default();
@@ -679,11 +679,11 @@ impl Runner<'_> {
         }
         if trough.is_empty() {
             log::info!(
-                "{}: no trough switches found in the table script; the game may not start",
+                "{}: no trough or mechanism switches found in the table script; the game may not start",
                 job.rom
             );
         } else {
-            log::debug!("{}: trough switches {trough:?}", job.rom);
+            log::debug!("{}: start switches {trough:?}", job.rom);
         }
         let mut child = cmd.spawn().context("starting the recording process")?;
         kill_with_us(&child);

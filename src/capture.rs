@@ -258,6 +258,26 @@ pub fn clip(
         .min(loud.sample_of(last + 3))
         .min(start + clamp_seconds(seconds) as usize * rate * channels);
     let mut cut = samples[start..end].to_vec();
+    // Without the sound board's constant offset (older WPC boards sit at a
+    // level well off zero even when quiet), which would eat the headroom.
+    for ch in 0..channels {
+        let n = cut.len() / channels;
+        if n == 0 {
+            break;
+        }
+        let mean = cut
+            .iter()
+            .skip(ch)
+            .step_by(channels)
+            .map(|&s| s as f64)
+            .sum::<f64>()
+            / n as f64;
+        for s in cut.iter_mut().skip(ch).step_by(channels) {
+            *s = (*s as f64 - mean)
+                .round()
+                .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        }
+    }
 
     let peak = cut.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
     let gain = if peak > 0 {
@@ -370,6 +390,20 @@ mod tests {
         s.extend(tone(10.0, rate, 1, 2000.0));
         let c = clip(&s, 1, rate as u32, Some(0), 30).unwrap();
         assert!((9.5..10.5).contains(&(c.len() as f64 / rate as f64)));
+    }
+
+    #[test]
+    fn offset_is_taken_out_of_the_clip() {
+        let rate = 22050;
+        let s: Vec<i16> = tone(10.0, rate, 1, 2000.0)
+            .iter()
+            .map(|&v| v + 3200)
+            .collect();
+        let c = clip(&s, 1, rate as u32, Some(0), 30).unwrap();
+        let mean = c.iter().map(|&v| v as f64).sum::<f64>() / c.len() as f64;
+        assert!(mean.abs() < 300.0, "{mean}");
+        let peak = c.iter().map(|&v| (v as i32).abs()).max().unwrap();
+        assert!(peak > 25000, "full headroom: {peak}");
     }
 
     #[test]
