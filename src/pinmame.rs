@@ -372,6 +372,7 @@ fn copy_into(zip: &Path, roms: &Path) -> Result<()> {
 /// after Start. The emulator is
 /// left running: the caller writes its result and ends the process, because
 /// `PinmameStop` joins the game thread and can hang forever on a stuck ROM.
+#[allow(clippy::too_many_arguments)] // one call site, each argument distinct
 pub fn run(
     dll: &Path,
     scratch: &Path,
@@ -380,6 +381,7 @@ pub fn run(
     trough: &[i32],
     timeline: capture::Timeline,
     seconds: u32,
+    nvram: Option<&Path>,
 ) -> Result<RunResult> {
     let _ = TIMELINE.set(timeline);
     let max = timeline.max_seconds(seconds);
@@ -412,6 +414,14 @@ pub fn run(
         return Err(NotStarted::NoRom.into());
     };
     copy_into(&zip, &roms)?;
+    if let Some(nv) = nvram {
+        // A copy of the cabinet's own nvram, so the machine skips its
+        // factory reset. The original is only read.
+        let dest = scratch.join("nvram").join(format!("{game}.nv"));
+        std::fs::copy(nv, &dest)
+            .with_context(|| format!("copying {} to {}", nv.display(), dest.display()))?;
+        println!("starting from a copy of {}", nv.display());
+    }
 
     // Loaded in place: a copy elsewhere would lose any DLLs it loads from
     // its own folder. Never unloaded (the process ends with it running).
@@ -608,6 +618,7 @@ mod tests {
             &[],
             capture::Timeline::NORMAL,
             5,
+            None,
         )
         .err()
         .unwrap();
@@ -625,6 +636,7 @@ mod tests {
             &[],
             capture::Timeline::NORMAL,
             5,
+            None,
         )
         .err()
         .unwrap();

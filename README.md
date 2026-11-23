@@ -6,7 +6,7 @@ For every Visual Pinball table that has no Audio media yet, it:
 
 1. boots the table's ROM in **libpinmame**, headless and silent. The sound is captured straight from the emulator and never plays through your speakers. It runs on a scratch copy of the ROM with empty nvram, so your scores, credits and settings are never touched.
 2. presses the service button to clear "factory settings restored", drops four coins and presses **Start**. It also closes the switches the table script reads as balls in the trough and mechanisms at rest (such as Thing's hand on The Addams Family), so the game actually starts.
-3. **waits for the music** after Start (up to 30 seconds), skipping a short Start sound, then records a full clip from the moment the music begins. A constant level from an idle sound board, or static, never counts as music. A ROM that stays quiet gets one more try with a slower boot sequence before it's marked as "no music".
+3. **waits for the music** after Start (up to 30 seconds), skipping a short Start sound, then records a full clip from the moment the music begins. A constant level from an idle sound board, or static, never counts as music. A ROM that stays quiet is tried again from a copy of the cabinet's own nvram (`VPinMAME\nvram\<rom>.nv`, only read, never changed), which gets machines like Earthshaker and Bride of Pin-bot past their factory reset, and then with a slower boot sequence, before it's marked as "no music".
 4. keeps about **30 seconds** of that music. The clip is trimmed at the first long silence, normalised and faded out.
 5. saves it as `<emulator media folder>\Audio\<GameName>.mp3` (usually `PinUPSystem\POPMedia\Visual Pinball X\Audio`), which is where Popper (and VPin Studio, and Rusty Popper) look for it.
 

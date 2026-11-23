@@ -52,6 +52,9 @@ struct WorkerCli {
     /// PinMAME's built-in mechanics mask (diagnostics; default 1).
     #[arg(long, allow_hyphen_values = true)]
     mechanics: Option<i32>,
+    /// Start from a copy of this nvram file.
+    #[arg(long)]
+    nvram: Option<PathBuf>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -78,6 +81,7 @@ pub fn run_worker_if_requested() {
             show_display: w.show_display,
             mechanics: w.mechanics,
         },
+        nvram: w.nvram,
     };
     record::terminate(record::worker_main(&a));
 }

@@ -262,6 +262,16 @@ pub fn describe(s: &Status) -> String {
     }
 }
 
+/// The cabinet's own nvram for `rom`: VPinMAME keeps `nvram\<rom>.nv` beside
+/// its `roms` folder.
+pub fn find_nvram(rom: &str, rom_dirs: &[PathBuf]) -> Option<PathBuf> {
+    rom_dirs
+        .iter()
+        .filter_map(|d| d.parent())
+        .map(|d| d.join("nvram").join(format!("{rom}.nv")))
+        .find(|p| p.is_file())
+}
+
 // ---- worker ---------------------------------------------------------------
 
 pub struct WorkerArgs {
@@ -277,6 +287,8 @@ pub struct WorkerArgs {
     /// Also write the whole recording here (diagnostics).
     pub raw: Option<PathBuf>,
     pub debug: pinmame::Debug,
+    /// Start from a copy of this nvram file instead of a blank one.
+    pub nvram: Option<PathBuf>,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -297,6 +309,7 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
         &a.trough,
         timeline,
         a.seconds,
+        a.nvram.as_deref(),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -592,20 +605,37 @@ impl Runner<'_> {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
-        let attempt = |slow| match self.spawn_worker(job, &tmp, slow) {
-            Ok(o) => o,
-            Err(e) => {
-                log::warn!("{}: {e:#}", job.rom);
-                Outcome::Failed
+        let attempt = |slow: bool, nvram: Option<&Path>| {
+            let _ = std::fs::remove_dir_all(&tmp);
+            match self.spawn_worker(job, &tmp, slow, nvram) {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!("{}: {e:#}", job.rom);
+                    Outcome::Failed
+                }
             }
         };
-        let mut outcome = attempt(false);
+        let mut outcome = attempt(false, None);
+        // From a blank nvram some machines never get past their factory
+        // reset (Earthshaker) or won't start until a mechanism is
+        // calibrated (Bride of Pin-bot): the cabinet's own nvram, copied,
+        // gets them going.
+        let nvram = find_nvram(&job.rom, &job.entries[0].rom_dirs);
+        if outcome == Outcome::Nothing && !self.cancelled() {
+            if let Some(nv) = &nvram {
+                log::info!(
+                    "{}: no music; trying again from a copy of {}",
+                    job.rom,
+                    nv.display()
+                );
+                outcome = attempt(false, Some(nv));
+            }
+        }
         if outcome == Outcome::Nothing && !self.cancelled() {
             // Some machines boot slowly or ignore inputs for a while after
             // their self-test: once more, with everything later.
             log::info!("{}: no music; trying again with a slower start", job.rom);
-            let _ = std::fs::remove_dir_all(&tmp);
-            outcome = attempt(true);
+            outcome = attempt(true, None);
         }
         let mut s = summary.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
@@ -645,7 +675,13 @@ impl Runner<'_> {
         outcome
     }
 
-    fn spawn_worker(&self, job: &Job, tmp: &Path, slow: bool) -> Result<Outcome> {
+    fn spawn_worker(
+        &self,
+        job: &Job,
+        tmp: &Path,
+        slow: bool,
+        nvram: Option<&Path>,
+    ) -> Result<Outcome> {
         std::fs::create_dir_all(tmp)?;
         let trough = job
             .entries
@@ -674,6 +710,9 @@ impl Runner<'_> {
             .arg(&self.dll);
         if slow {
             cmd.arg("--slow");
+        }
+        if let Some(nv) = nvram {
+            cmd.arg("--nvram").arg(nv);
         }
         for d in &job.entries[0].rom_dirs {
             cmd.arg("--rom-dir").arg(d);
@@ -789,6 +828,21 @@ impl Runner<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvram_beside_the_roms_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let roms = dir.path().join("VPinMAME").join("roms");
+        let nv = dir.path().join("VPinMAME").join("nvram");
+        std::fs::create_dir_all(&roms).unwrap();
+        std::fs::create_dir_all(&nv).unwrap();
+        assert_eq!(find_nvram("esha_la3", std::slice::from_ref(&roms)), None);
+        std::fs::write(nv.join("esha_la3.nv"), [0u8; 16]).unwrap();
+        assert_eq!(
+            find_nvram("esha_la3", &[dir.path().join("x"), roms]),
+            Some(nv.join("esha_la3.nv"))
+        );
+    }
+
     use super::*;
     use rusqlite::Connection;
 
