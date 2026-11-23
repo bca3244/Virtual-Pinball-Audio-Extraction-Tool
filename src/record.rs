@@ -636,9 +636,9 @@ impl Runner<'_> {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
-        let attempt = |slow: bool, nvram: Option<&Path>| {
+        let attempt = |slow: bool, nvram: Option<&Path>, no_escape: bool| {
             let _ = std::fs::remove_dir_all(&tmp);
-            match self.spawn_worker(job, &tmp, slow, nvram) {
+            match self.spawn_worker(job, &tmp, slow, nvram, no_escape) {
                 Ok(o) => o,
                 Err(e) => {
                     log::warn!("{}: {e:#}", job.rom);
@@ -646,7 +646,7 @@ impl Runner<'_> {
                 }
             }
         };
-        let mut outcome = attempt(false, None);
+        let mut outcome = attempt(false, None, false);
         // From a blank nvram some machines never get past their factory
         // reset (Earthshaker) or won't start until a mechanism is
         // calibrated (Bride of Pin-bot): the cabinet's own nvram, copied,
@@ -660,16 +660,28 @@ impl Runner<'_> {
                 );
                 // Only a recording counts: anything else from this try
                 // leaves the blank run's "no music" and goes on.
-                if attempt(false, Some(nv)) == Outcome::Recorded {
+                if attempt(false, Some(nv), false) == Outcome::Recorded {
                     outcome = Outcome::Recorded;
                 }
+            }
+        }
+        if outcome == Outcome::Nothing && !self.cancelled() {
+            // The service key that skips WPC's factory-reset messages puts
+            // some machines (Bally 6803: Special Force) into a test mode
+            // where coins and Start do nothing: once without it.
+            log::info!(
+                "{}: no music; trying again without the service key",
+                job.rom
+            );
+            if attempt(false, nvram.as_deref(), true) == Outcome::Recorded {
+                outcome = Outcome::Recorded;
             }
         }
         if outcome == Outcome::Nothing && !self.cancelled() {
             // Some machines boot slowly or ignore inputs for a while after
             // their self-test: once more, with everything later.
             log::info!("{}: no music; trying again with a slower start", job.rom);
-            outcome = attempt(true, None);
+            outcome = attempt(true, None, false);
         }
         let mut s = summary.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
@@ -749,6 +761,7 @@ impl Runner<'_> {
         tmp: &Path,
         slow: bool,
         nvram: Option<&Path>,
+        no_escape: bool,
     ) -> Result<Outcome> {
         std::fs::create_dir_all(tmp)?;
         let script = job
@@ -782,6 +795,9 @@ impl Runner<'_> {
             .arg(&self.dll);
         if slow {
             cmd.arg("--slow");
+        }
+        if no_escape {
+            cmd.arg("--no-escape");
         }
         if let Some(nv) = nvram {
             cmd.arg("--nvram").arg(nv);

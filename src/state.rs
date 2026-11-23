@@ -119,7 +119,7 @@ fn describe(p: &Path) -> String {
 /// when the zip is replaced or a parent set is added.
 /// Bumped when the recorder learns new ways to get a ROM playing, so old
 /// "no music" verdicts are tried again.
-const RECORDER_VERSION: u32 = 2;
+const RECORDER_VERSION: u32 = 3;
 
 /// Bumped when clips recorded before it can't be trusted (v2: static
 /// from an idle sound board is no longer taken for music).
