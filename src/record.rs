@@ -1,0 +1,756 @@
+//! Deciding what to record, running one worker process per ROM, and putting
+//! the results in place as Popper Audio media. One process per recording
+//! (VRTableManager's `RomAudioBatch` does the same) because libpinmame is a
+//! single instance per process, and a ROM that hangs or crashes the emulator
+//! then takes down only its own process.
+
+use crate::encode::{self, Format};
+use crate::popper::{self, Db, Emulator, Game};
+use crate::state::{self, Cache};
+use crate::{capture, pinmame, vpx, wav};
+use anyhow::{Context, Result};
+use std::collections::BTreeMap;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Worker exit codes; anything else (a crash, a kill) counts as failed.
+pub const EXIT_RECORDED: i32 = 0;
+/// Ran its whole time (or stopped by itself) and gave no music: a verdict.
+pub const EXIT_NOTHING: i32 = 10;
+/// Nothing this time (too slow, an error): tried again next run.
+pub const EXIT_FAILED: i32 = 11;
+/// PinMAME wouldn't start it (missing ROM or parent set): a verdict until
+/// the ROM files change.
+pub const EXIT_NOT_STARTED: i32 = 12;
+
+#[derive(Debug, Clone)]
+pub enum Status {
+    HasAudio(PathBuf),
+    NoMediaDir,
+    /// No ROM in Popper's ROM field nor the script: an original or EM table.
+    NoRom,
+    RomZipMissing(String),
+    Verdict(String),
+    /// A clip of its ROM is already recorded: only needs copying in.
+    Cached(PathBuf),
+    Todo,
+}
+
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub game: Game,
+    pub emu: Emulator,
+    pub table: Option<PathBuf>,
+    pub rom: Option<String>,
+    pub rom_zip: Option<PathBuf>,
+    pub rom_dirs: Vec<PathBuf>,
+    pub status: Status,
+}
+
+pub struct Options {
+    pub seconds: u32,
+    pub format: Format,
+    pub force: bool,
+    pub retry: bool,
+    pub include_hidden: bool,
+    pub games: Vec<String>,
+    pub extra_rom_dirs: Vec<PathBuf>,
+    pub vpx_dir: Option<PathBuf>,
+}
+
+pub const DEFAULT_VPX_DIR: &str = r"C:\vPinball\VisualPinball";
+
+/// Where Visual Pinball itself is: `--vpx`, Popper's launch folder for the
+/// emulator, the parent of its Tables folder, or the default.
+pub fn vpx_dirs(emu: &Emulator, explicit: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    out.extend(explicit.map(Path::to_path_buf));
+    out.extend(emu.launch_dir.clone());
+    out.extend(
+        emu.games_dir
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+    );
+    out.push(PathBuf::from(DEFAULT_VPX_DIR));
+    dedupe(out)
+}
+
+fn dedupe(v: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in v {
+        if !out
+            .iter()
+            .any(|q| q.as_os_str().eq_ignore_ascii_case(p.as_os_str()))
+        {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The folders searched for `<rom>.zip`: `--rom-dir`, the table's own
+/// `pinmame\roms` (VPX 10.8.1+ layout), Popper's DirRoms, and VPinMAME's
+/// roms folder beside Visual Pinball.
+pub fn rom_dirs(emu: &Emulator, table: Option<&Path>, opts: &Options) -> Vec<PathBuf> {
+    let mut out = opts.extra_rom_dirs.clone();
+    out.extend(
+        table
+            .and_then(Path::parent)
+            .map(|d| d.join("pinmame").join("roms")),
+    );
+    out.extend(emu.roms_dir.clone());
+    for vp in vpx_dirs(emu, opts.vpx_dir.as_deref()) {
+        out.push(vp.join("VPinMAME").join("roms"));
+    }
+    dedupe(out)
+}
+
+/// libpinmame: `--pinmame-dll`, else VPX's own plugin (10.8.1+), else one
+/// beside this exe. (VPinMAME64.dll, the COM server, is not libpinmame.)
+pub fn find_pinmame(
+    explicit: Option<&Path>,
+    emus: &[Emulator],
+    vpx_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    const NAMES: &[&str] = &[
+        "pinmame64.dll",
+        "libpinmame64.dll",
+        "libpinmame.dll",
+        "pinmame.dll",
+    ];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for emu in emus.iter().filter(|e| e.is_visual_pinball()) {
+        for vp in vpx_dirs(emu, vpx_dir) {
+            dirs.push(vp.join("plugins").join("pinmame"));
+        }
+    }
+    dirs.push(
+        PathBuf::from(DEFAULT_VPX_DIR)
+            .join("plugins")
+            .join("pinmame"),
+    );
+    if let Some(d) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf))
+    {
+        dirs.push(d);
+    }
+    dedupe(dirs)
+        .into_iter()
+        .flat_map(|d| NAMES.iter().map(move |n| d.join(n)))
+        .find(|p| p.is_file())
+}
+
+fn table_path(emu: &Emulator, game: &Game) -> Option<PathBuf> {
+    let file = Path::new(&game.file_name);
+    let mut p = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        emu.games_dir.as_ref()?.join(file)
+    };
+    if p.extension().is_none() {
+        p.set_extension(emu.default_ext());
+    }
+    Some(p)
+}
+
+/// Every Visual Pinball table and what would happen to it.
+pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
+    let emus = db.emulators()?;
+    let wanted = |g: &Game| {
+        opts.games.is_empty()
+            || opts.games.iter().any(|w| {
+                w.eq_ignore_ascii_case(&g.name)
+                    || w.eq_ignore_ascii_case(&g.display)
+                    || g.rom.as_deref().is_some_and(|r| w.eq_ignore_ascii_case(r))
+            })
+    };
+    let mut out = Vec::new();
+    for game in db.games(opts.include_hidden)?.into_iter().filter(wanted) {
+        let Some(emu) = emus
+            .iter()
+            .find(|e| e.id == game.emu_id && e.is_visual_pinball())
+        else {
+            continue;
+        };
+        let table = table_path(emu, &game);
+        let mut entry = Entry {
+            game: game.clone(),
+            emu: emu.clone(),
+            table: table.clone(),
+            rom: None,
+            rom_zip: None,
+            rom_dirs: Vec::new(),
+            status: Status::Todo,
+        };
+        let Some(media) = emu.media_dir.as_deref() else {
+            entry.status = Status::NoMediaDir;
+            out.push(entry);
+            continue;
+        };
+        if !opts.force {
+            if let Some(found) = popper::existing_audio(media, &game.name) {
+                entry.status = Status::HasAudio(found);
+                out.push(entry);
+                continue;
+            }
+        }
+        let script = table.as_deref().filter(|t| t.is_file()).and_then(|t| {
+            vpx::read_script(t)
+                .map_err(|e| log::debug!("{}: {e:#}", t.display()))
+                .ok()
+        });
+        entry.rom = game
+            .rom
+            .clone()
+            .or_else(|| script.as_deref().and_then(vpx::rom_name));
+        let Some(rom) = entry.rom.clone() else {
+            entry.status = Status::NoRom;
+            out.push(entry);
+            continue;
+        };
+        entry.rom_dirs = rom_dirs(emu, table.as_deref(), opts);
+        entry.rom_zip = entry
+            .rom_dirs
+            .iter()
+            .map(|d| d.join(format!("{rom}.zip")))
+            .find(|p| p.is_file());
+        let Some(zip) = entry.rom_zip.clone() else {
+            entry.status = Status::RomZipMissing(rom);
+            out.push(entry);
+            continue;
+        };
+        if let Some(clip) = cache
+            .clip(&rom, opts.seconds, opts.format.ext())
+            .filter(|_| !opts.retry)
+        {
+            entry.status = Status::Cached(clip);
+        } else if let Some(why) = cache
+            .verdict(&rom, opts.seconds, &state::fingerprint(&zip))
+            .filter(|_| !opts.retry)
+        {
+            entry.status = Status::Verdict(why);
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+pub fn describe(s: &Status) -> String {
+    match s {
+        Status::HasAudio(p) => format!(
+            "has audio ({})",
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        ),
+        Status::NoMediaDir => "emulator has no media folder in Popper".into(),
+        Status::NoRom => "no ROM (original or EM table)".into(),
+        Status::RomZipMissing(r) => format!("{r}.zip not found"),
+        Status::Verdict(why) => format!("skipped: {why} last time (--retry to try again)"),
+        Status::Cached(_) => "will copy the clip already recorded for its ROM".into(),
+        Status::Todo => "will record".into(),
+    }
+}
+
+// ---- worker ---------------------------------------------------------------
+
+pub struct WorkerArgs {
+    pub rom: String,
+    pub scratch: PathBuf,
+    pub out: PathBuf,
+    pub seconds: u32,
+    pub dll: PathBuf,
+    pub rom_dirs: Vec<PathBuf>,
+    pub trough: Vec<i32>,
+}
+
+/// The worker process: records one ROM into `out` as a WAV clip and
+/// returns the exit code. The caller must end the process straight after
+/// (see [`terminate`]): the emulator is still running.
+pub fn worker_main(a: &WorkerArgs) -> i32 {
+    let total = capture::run_seconds(a.seconds);
+    let run = match pinmame::run(&a.dll, &a.scratch, &a.rom, &a.rom_dirs, &a.trough, total) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{}: {e:#}", a.rom);
+            return if e.downcast_ref::<pinmame::NotStarted>().is_some() {
+                EXIT_NOT_STARTED
+            } else {
+                EXIT_FAILED
+            };
+        }
+    };
+    let recorded = run.samples.len() as f64 / run.channels.max(1) as f64 / run.rate.max(1) as f64;
+    if run.end == pinmame::RunEnd::Stopped && run.samples.is_empty() {
+        // PinmameRun accepts the name, then the emulation ends while loading
+        // the ROM files: a bad or incomplete ROM set.
+        println!(
+            "{}: PinMAME stopped before making any sound (bad or incomplete ROM set?)",
+            a.rom
+        );
+        return EXIT_NOT_STARTED;
+    }
+    match capture::clip(
+        &run.samples,
+        run.channels,
+        run.rate,
+        run.start_sample,
+        a.seconds,
+    ) {
+        Some(clip) => {
+            let pcm = wav::Pcm {
+                samples: clip,
+                channels: run.channels as u16,
+                rate: run.rate,
+            };
+            match wav::write(&a.out, &pcm) {
+                Ok(()) => {
+                    let secs = pcm.samples.len() as f64
+                        / run.channels.max(1) as f64
+                        / run.rate.max(1) as f64;
+                    println!("{}: kept {secs:.1} s of {recorded:.1} s recorded", a.rom);
+                    EXIT_RECORDED
+                }
+                Err(e) => {
+                    println!("{}: {e:#}", a.rom);
+                    EXIT_FAILED
+                }
+            }
+        }
+        None if run.end == pinmame::RunEnd::Cut => {
+            println!(
+                "{}: ran too slowly to finish ({recorded:.1} s recorded); not remembered",
+                a.rom
+            );
+            EXIT_FAILED
+        }
+        None => {
+            println!(
+                "{}: no music ({recorded:.1} s recorded, {:?})",
+                a.rom, run.end
+            );
+            EXIT_NOTHING
+        }
+    }
+}
+
+/// Ends this process at once with `code`, without unloading libpinmame
+/// (whose game thread may still be running, or hung).
+pub fn terminate(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    std::process::exit(code)
+}
+
+// ---- orchestration --------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Recorded,
+    Nothing,
+    NotStarted,
+    Failed,
+}
+
+struct Job {
+    rom: String,
+    zip: PathBuf,
+    entries: Vec<Entry>,
+}
+
+#[derive(Default, Debug)]
+pub struct Summary {
+    pub installed: usize,
+    pub recorded: usize,
+    pub nothing: usize,
+    pub failed: usize,
+}
+
+pub struct Runner<'a> {
+    pub cache: &'a Cache,
+    pub opts: &'a Options,
+    pub dll: PathBuf,
+    pub ffmpeg: Option<PathBuf>,
+    pub parallel: usize,
+}
+
+/// Recordings at once: each keeps an emulator busy in real time (about one
+/// core) and must keep up, or its music comes out wrong. Half the cores less
+/// one, 1 to 6.
+pub fn default_parallel() -> usize {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    (n / 2).saturating_sub(1).clamp(1, 6)
+}
+
+impl Runner<'_> {
+    pub fn run(&self, entries: Vec<Entry>) -> Summary {
+        let summary = Mutex::new(Summary::default());
+        // Cached clips go straight in.
+        let mut jobs: BTreeMap<String, Job> = BTreeMap::new();
+        for e in entries {
+            match &e.status {
+                Status::Cached(clip) => {
+                    let clip = clip.clone();
+                    self.install_all(&clip, std::slice::from_ref(&e), &summary);
+                }
+                Status::Todo => {
+                    let (Some(rom), Some(zip)) = (e.rom.clone(), e.rom_zip.clone()) else {
+                        continue;
+                    };
+                    jobs.entry(rom.clone())
+                        .or_insert_with(|| Job {
+                            rom,
+                            zip,
+                            entries: Vec::new(),
+                        })
+                        .entries
+                        .push(e);
+                }
+                _ => {}
+            }
+        }
+        let jobs: Vec<Job> = jobs.into_values().collect();
+        if jobs.is_empty() {
+            return summary.into_inner().unwrap_or_default();
+        }
+        let per = capture::run_seconds(self.opts.seconds) + 5.0;
+        let eta = (jobs.len() as f64 / self.parallel as f64).ceil() * per / 60.0;
+        log::info!(
+            "Recording {} ROM(s), {} at a time, in real time: about {eta:.0} min",
+            jobs.len(),
+            self.parallel
+        );
+
+        let next = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..self.parallel.min(jobs.len()) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(job) = jobs.get(i) else { break };
+                    let started = Instant::now();
+                    let outcome = self.record_one(job, &summary);
+                    let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                    let titles: Vec<&str> = job
+                        .entries
+                        .iter()
+                        .map(|e| e.game.display.as_str())
+                        .collect();
+                    log::info!(
+                        "[{n}/{}] {} ({}): {outcome:?} in {:.0} s",
+                        jobs.len(),
+                        job.rom,
+                        titles.join(", "),
+                        started.elapsed().as_secs_f64()
+                    );
+                });
+            }
+        });
+        summary.into_inner().unwrap_or_default()
+    }
+
+    fn record_one(&self, job: &Job, summary: &Mutex<Summary>) -> Outcome {
+        let fp = state::fingerprint(&job.zip);
+        let tmp = std::env::temp_dir().join(format!(
+            "vp-audio-extract-{}-{}",
+            job.rom,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let outcome = match self.spawn_worker(job, &tmp) {
+            Ok(o) => o,
+            Err(e) => {
+                log::warn!("{}: {e:#}", job.rom);
+                Outcome::Failed
+            }
+        };
+        let mut s = summary.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Outcome::Recorded => {
+                drop(s);
+                let wav_out = tmp.join("clip.wav");
+                let stem = self.cache.clip_stem(&job.rom, self.opts.seconds);
+                match encode::encode(&wav_out, &stem, self.opts.format, self.ffmpeg.as_deref()) {
+                    Ok(clip) => {
+                        self.cache.clear_verdict(&job.rom);
+                        summary.lock().unwrap_or_else(|e| e.into_inner()).recorded += 1;
+                        self.install_all(&clip, &job.entries, summary);
+                    }
+                    Err(e) => {
+                        log::warn!("{}: encoding failed: {e:#}", job.rom);
+                        summary.lock().unwrap_or_else(|e| e.into_inner()).failed += 1;
+                    }
+                }
+            }
+            Outcome::Nothing | Outcome::NotStarted => {
+                s.nothing += 1;
+                let reason = if outcome == Outcome::Nothing {
+                    "the ROM gave no music"
+                } else {
+                    "PinMAME couldn't start the ROM"
+                };
+                if let Err(e) = self
+                    .cache
+                    .set_verdict(&job.rom, self.opts.seconds, &fp, reason)
+                {
+                    log::warn!("{}: couldn't remember the result: {e:#}", job.rom);
+                }
+            }
+            Outcome::Failed => s.failed += 1,
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        outcome
+    }
+
+    fn spawn_worker(&self, job: &Job, tmp: &Path) -> Result<Outcome> {
+        std::fs::create_dir_all(tmp)?;
+        let trough = job
+            .entries
+            .iter()
+            .filter_map(|e| e.table.as_deref())
+            .filter(|t| t.is_file())
+            .find_map(|t| {
+                vpx::read_script(t)
+                    .ok()
+                    .map(|s| vpx::trough_switches(&s))
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or_default();
+        let exe = std::env::current_exe().context("finding this exe")?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("worker")
+            .arg("--rom")
+            .arg(&job.rom)
+            .arg("--scratch")
+            .arg(tmp.join("pinmame"))
+            .arg("--out")
+            .arg(tmp.join("clip.wav"))
+            .arg("--seconds")
+            .arg(self.opts.seconds.to_string())
+            .arg("--dll")
+            .arg(&self.dll);
+        for d in &job.entries[0].rom_dirs {
+            cmd.arg("--rom-dir").arg(d);
+        }
+        if !trough.is_empty() {
+            cmd.arg("--trough").arg(
+                trough
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+            cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+        }
+        log::debug!("{}: trough switches {trough:?}", job.rom);
+        let mut child = cmd.spawn().context("starting the recording process")?;
+        let rom = job.rom.clone();
+        let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
+            Box::new(child.stdout.take().context("no stdout")?),
+            Box::new(child.stderr.take().context("no stderr")?),
+        ];
+        let readers: Vec<_> = pipes
+            .into_iter()
+            .map(|p| {
+                let rom = rom.clone();
+                std::thread::spawn(move || {
+                    for line in std::io::BufReader::new(p).lines().map_while(Result::ok) {
+                        log::info!("  {rom} | {line}");
+                    }
+                })
+            })
+            .collect();
+        let limit = Duration::from_secs_f64(capture::run_seconds(self.opts.seconds) * 1.5 + 60.0);
+        let started = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                break Some(st);
+            }
+            if started.elapsed() > limit {
+                log::warn!(
+                    "{}: still running after {} s; stopped",
+                    job.rom,
+                    limit.as_secs()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        for r in readers {
+            let _ = r.join();
+        }
+        let wav_ok = tmp.join("clip.wav").is_file();
+        Ok(match status.and_then(|s| s.code()) {
+            Some(EXIT_RECORDED) if wav_ok => Outcome::Recorded,
+            Some(EXIT_NOTHING) => Outcome::Nothing,
+            Some(EXIT_NOT_STARTED) => Outcome::NotStarted,
+            _ => Outcome::Failed,
+        })
+    }
+
+    fn install_all(&self, clip: &Path, entries: &[Entry], summary: &Mutex<Summary>) {
+        for e in entries {
+            let Some(media) = e.emu.media_dir.as_deref() else {
+                continue;
+            };
+            match popper::install(clip, media, &e.game.name, self.opts.force) {
+                Ok(dest) => {
+                    log::info!("{}: wrote {}", e.game.display, dest.display());
+                    summary.lock().unwrap_or_else(|e| e.into_inner()).installed += 1;
+                }
+                Err(err) => log::warn!("{}: {err:#}", e.game.display),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn opts(roms: &Path) -> Options {
+        Options {
+            seconds: 30,
+            format: Format::Mp3,
+            force: false,
+            retry: false,
+            include_hidden: false,
+            games: Vec::new(),
+            extra_rom_dirs: vec![roms.to_path_buf()],
+            vpx_dir: None,
+        }
+    }
+
+    #[test]
+    fn plan_sorts_tables_into_what_happens_to_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (media, tables, roms) = (
+            dir.path().join("media"),
+            dir.path().join("tables"),
+            dir.path().join("roms"),
+        );
+        for d in [&media, &tables, &roms] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(media.join("Audio")).unwrap();
+        std::fs::write(media.join("Audio").join("Has Audio.mp3"), b"x").unwrap();
+        std::fs::write(roms.join("afm_113b.zip"), b"zip").unwrap();
+        std::fs::write(roms.join("tz_94h.zip"), b"zip").unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(&format!(
+            "CREATE TABLE Emulators (EMUID INTEGER, EmuName TEXT, DirMedia TEXT, DirGames TEXT, DirRoms TEXT, EmuLaunchDir TEXT, GamesExt TEXT);
+             INSERT INTO Emulators VALUES (1, 'Visual Pinball X', '{m}', '{t}', NULL, NULL, 'vpx');
+             CREATE TABLE Games (GameID INTEGER, EMUID INTEGER, GameName TEXT, GameDisplay TEXT, GameFileName TEXT, ROM TEXT, Visible INTEGER);
+             INSERT INTO Games VALUES (1, 1, 'Has Audio', NULL, 'a.vpx', 'afm_113b', 1);
+             INSERT INTO Games VALUES (2, 1, 'AFM', NULL, 'b.vpx', 'AFM_113b', 1);
+             INSERT INTO Games VALUES (3, 1, 'AFM Mod', NULL, 'c', 'afm_113b', 1);
+             INSERT INTO Games VALUES (4, 1, 'Original', NULL, 'd.vpx', NULL, 1);
+             INSERT INTO Games VALUES (5, 1, 'No Zip', NULL, 'e.vpx', 'nope', 1);
+             INSERT INTO Games VALUES (6, 1, 'Twilight', NULL, 'f.vpx', 'tz_94h', 1);",
+            m = media.display(),
+            t = tables.display()
+        ))
+        .unwrap();
+        let db = Db::from_conn(c);
+        let cache = Cache::open(Some(&dir.path().join("cache"))).unwrap();
+        cache
+            .set_verdict(
+                "tz_94h",
+                30,
+                &state::fingerprint(&roms.join("tz_94h.zip")),
+                "the ROM gave no music",
+            )
+            .unwrap();
+        let plan = plan(&db, &cache, &opts(&roms)).unwrap();
+        let by = |n: &str| plan.iter().find(|e| e.game.name == n).unwrap();
+        assert!(matches!(by("Has Audio").status, Status::HasAudio(_)));
+        assert!(matches!(by("AFM").status, Status::Todo));
+        assert_eq!(
+            by("AFM Mod").table.as_deref(),
+            Some(tables.join("c.vpx").as_path())
+        );
+        assert!(matches!(by("AFM Mod").status, Status::Todo));
+        assert!(matches!(by("Original").status, Status::NoRom));
+        assert!(matches!(by("No Zip").status, Status::RomZipMissing(_)));
+        assert!(matches!(by("Twilight").status, Status::Verdict(_)));
+
+        // A clip recorded earlier for the ROM is reused.
+        std::fs::write(
+            cache.clip_stem("afm_113b", 30).with_extension("mp3"),
+            b"clip",
+        )
+        .unwrap();
+        let plan2 = super::plan(&db, &cache, &opts(&roms)).unwrap();
+        assert!(matches!(
+            plan2.iter().find(|e| e.game.name == "AFM").unwrap().status,
+            Status::Cached(_)
+        ));
+
+        // Installing it gives both tables on that ROM their audio.
+        let runner = Runner {
+            cache: &cache,
+            opts: &opts(&roms),
+            dll: PathBuf::new(),
+            ffmpeg: None,
+            parallel: 1,
+        };
+        let s = runner.run(plan2);
+        assert_eq!(s.installed, 2);
+        assert!(media.join("Audio").join("AFM.mp3").is_file());
+        assert!(media.join("Audio").join("AFM Mod.mp3").is_file());
+    }
+
+    #[test]
+    fn game_filter_matches_name_display_or_rom() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE Emulators (EMUID INTEGER, EmuName TEXT, DirMedia TEXT, DirGames TEXT, DirRoms TEXT, EmuLaunchDir TEXT);
+             INSERT INTO Emulators VALUES (1, 'Visual Pinball X', NULL, NULL, NULL, NULL);
+             CREATE TABLE Games (GameID INTEGER, EMUID INTEGER, GameName TEXT, GameDisplay TEXT, GameFileName TEXT, ROM TEXT, Visible INTEGER);
+             INSERT INTO Games VALUES (1, 1, 'Medieval Madness (Williams 1997)', 'Medieval Madness', 'mm.vpx', 'mm_109c', 1);
+             INSERT INTO Games VALUES (2, 1, 'Other', NULL, 'o.vpx', 'other', 1);",
+        )
+        .unwrap();
+        let db = Db::from_conn(c);
+        let cache = Cache::open(Some(dir.path())).unwrap();
+        for w in [
+            "medieval madness",
+            "MM_109C",
+            "Medieval Madness (Williams 1997)",
+        ] {
+            let mut o = opts(dir.path());
+            o.games = vec![w.into()];
+            let p = plan(&db, &cache, &o).unwrap();
+            assert_eq!(p.len(), 1, "{w}");
+            assert!(matches!(p[0].status, Status::NoMediaDir));
+        }
+    }
+}
