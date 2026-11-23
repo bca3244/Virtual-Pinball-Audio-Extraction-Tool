@@ -13,18 +13,7 @@ pub struct Cache {
     pub dir: PathBuf,
 }
 
-/// In the old folder: where the data went, so an exe unpacked to another
-/// folder later takes it along.
-const MOVED_TO: &str = "moved-to.txt";
-
-/// Whether `dir` already holds anything worth keeping.
-fn has_data(dir: &Path) -> bool {
-    ["removed", "clips", "verdicts"]
-        .iter()
-        .any(|sub| std::fs::read_dir(dir.join(sub)).is_ok_and(|mut r| r.next().is_some()))
-}
-
-/// Where earlier versions kept everything.
+/// The fallback when the exe's folder can't be written.
 fn legacy_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -44,85 +33,11 @@ fn portable_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Moves what an earlier version kept in `old` into `new`, once: clips,
-/// verdicts, removed batches (so Restore still finds them), the log and
-/// the GUI's settings.
-/// Anything that can't be moved stays where it was.
-pub(crate) fn migrate(old: &Path, new: &Path) {
-    if old == new || !old.is_dir() {
-        return;
-    }
-    for sub in ["removed", "clips", "verdicts"] {
-        let from = old.join(sub);
-        let Ok(entries) = std::fs::read_dir(&from) else {
-            continue;
-        };
-        let to = new.join(sub);
-        if std::fs::create_dir_all(&to).is_err() {
-            continue;
-        }
-        for e in entries.flatten() {
-            let target = to.join(e.file_name());
-            if !target.exists() {
-                let _ = move_tree(&e.path(), &target);
-            }
-        }
-        let _ = std::fs::remove_dir(&from);
-    }
-    for file in ["vp-audio-extract.log", "gui.txt"] {
-        let from = old.join(file);
-        let target = new.join(file);
-        if from.is_file() && !target.exists() {
-            let _ = move_tree(&from, &target);
-        }
-    }
-    let _ = std::fs::remove_dir(old);
-}
-
-/// Rename, or copy and delete when that crosses drives.
-fn move_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    if from.is_dir() {
-        std::fs::create_dir_all(to)?;
-        for e in std::fs::read_dir(from)?.flatten() {
-            move_tree(&e.path(), &to.join(e.file_name()))?;
-        }
-        std::fs::remove_dir(from)
-    } else {
-        std::fs::copy(from, to)?;
-        std::fs::remove_file(from)
-    }
-}
-
 impl Cache {
     pub fn open(explicit: Option<&Path>) -> Result<Cache> {
         let dir = match explicit {
             Some(d) => d.to_path_buf(),
-            None => {
-                let legacy = legacy_dir();
-                match portable_dir() {
-                    Some(new) => {
-                        // The data follows the exe: from %LOCALAPPDATA%, or
-                        // from wherever an exe in another folder took it.
-                        let pointer = legacy.join(MOVED_TO);
-                        let from = std::fs::read_to_string(&pointer)
-                            .ok()
-                            .map(|p| PathBuf::from(p.trim()))
-                            .unwrap_or_else(|| legacy.clone());
-                        if from != new && !has_data(&new) {
-                            migrate(&from, &new);
-                        }
-                        if has_data(&new) {
-                            let _ = std::fs::create_dir_all(&legacy);
-                            let _ = std::fs::write(&pointer, new.to_string_lossy().as_bytes());
-                        }
-                        new
-                    }
-                    None => legacy,
-                }
-            }
+            None => portable_dir().unwrap_or_else(legacy_dir),
         };
         std::fs::create_dir_all(dir.join("clips"))?;
         std::fs::create_dir_all(dir.join("verdicts"))?;
@@ -306,29 +221,6 @@ mod tests {
         );
         std::fs::write(dir.path().join("parent.zip"), b"1").unwrap();
         assert_ne!(one, fingerprint(&zip, None));
-    }
-
-    #[test]
-    fn migrates_the_old_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let (old, new) = (dir.path().join("old"), dir.path().join("new"));
-        std::fs::create_dir_all(old.join("removed").join("123")).unwrap();
-        std::fs::write(old.join("removed").join("123").join("restore.txt"), "x").unwrap();
-        std::fs::create_dir_all(old.join("clips")).unwrap();
-        std::fs::write(old.join("clips").join("a-30s-v3.ogg"), "c").unwrap();
-        std::fs::write(old.join("vp-audio-extract.log"), "log").unwrap();
-        std::fs::write(old.join("gui.txt"), "format=ogg").unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        migrate(&old, &new);
-        assert!(new
-            .join("removed")
-            .join("123")
-            .join("restore.txt")
-            .is_file());
-        assert!(new.join("clips").join("a-30s-v3.ogg").is_file());
-        assert!(new.join("vp-audio-extract.log").is_file());
-        assert!(new.join("gui.txt").is_file(), "GUI settings move too");
-        assert!(!old.exists());
     }
 
     #[test]

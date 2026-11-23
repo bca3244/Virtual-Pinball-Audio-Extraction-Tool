@@ -68,7 +68,7 @@ Close VPX while it records, because each recording keeps one CPU core busy in re
 | `--include-hidden` | also tables hidden in Popper |
 | `-v` | more detail |
 
-Results are remembered in a `data` folder beside the exe (or `%LOCALAPPDATA%\vp-audio-extract` if that folder can't be written, e.g. under Program Files; data an older version left there is moved over on first run):
+Results are remembered in a `data` folder beside the exe (or `%LOCALAPPDATA%\vp-audio-extract` if that folder can't be written, e.g. under Program Files):
 
 - **`clips\`** holds every recorded clip, so a table added later on a ROM already recorded gets its audio at once.
 - **`verdicts\`** lists the ROMs that gave no music. They aren't tried again until their zip files change (a parent set added, a newer version) or you pass `--retry`.
