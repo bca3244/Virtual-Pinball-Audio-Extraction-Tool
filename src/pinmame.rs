@@ -630,7 +630,9 @@ pub fn run(
                     println!("parent ROM set: {parent}");
                     copy_into(&p, &roms)?;
                 }
-                None => println!("warning: parent ROM set {parent}.zip not found"),
+                None => println!(
+                    "note: parent ROM set {parent}.zip not found (only needed if {name}.zip is not a full set)"
+                ),
             }
             name = parent;
         }
