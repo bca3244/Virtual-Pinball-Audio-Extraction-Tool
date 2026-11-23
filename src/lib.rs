@@ -10,6 +10,7 @@ pub mod encode;
 pub mod pinmame;
 pub mod popper;
 pub mod record;
+pub mod sources;
 pub mod state;
 pub mod vpx;
 pub mod wav;

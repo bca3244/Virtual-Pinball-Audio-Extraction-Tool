@@ -53,7 +53,7 @@ pub fn script_from_game_data(bytes: &[u8]) -> String {
 /// A script line without its comment (`'` outside a string, to the end),
 /// trimmed: `Controller.Switch(74) = 1 'Controller.Switch(55) = 1` is
 /// switch 74 only.
-fn code(raw: &str) -> &str {
+pub(crate) fn code(raw: &str) -> &str {
     if is_rem(raw.trim_start()) {
         return "";
     }
@@ -354,6 +354,15 @@ pub fn mech_rest_switches(script: &str) -> Vec<i32> {
 
 /// The core script a table loads: `LoadVPM "01500000", "6803.VBS", 3.2`
 /// gives `6803.VBS`. Only a bare file name is returned.
+/// Whether the table runs a PinMAME ROM (loads VPinMAME's core scripts or
+/// controller): then sounds in it are effects, not its music.
+pub fn uses_pinmame(script: &str) -> bool {
+    script
+        .lines()
+        .map(code)
+        .any(|l| contains_ci(l, "loadvpm") || contains_ci(l, "vpinmame.controller"))
+}
+
 pub fn core_script_name(script: &str) -> Option<String> {
     for raw in script.lines() {
         let line = raw.split('\'').next().unwrap_or("").trim();
@@ -539,7 +548,7 @@ fn ends_sub(line: &str) -> bool {
 }
 
 /// Statements of a script line (split at `:` outside strings).
-fn statements(line: &str) -> Vec<&str> {
+pub(crate) fn statements(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let (mut from, mut in_str) = (0, false);
     for (i, c) in line.char_indices() {

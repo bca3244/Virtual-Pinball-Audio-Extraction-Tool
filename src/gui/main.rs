@@ -287,6 +287,7 @@ impl App {
             games: Vec::new(),
             extra_rom_dirs: Vec::new(),
             vpx_dir: None,
+            popper_dir: self.popper_dir.clone(),
         }
     }
 
@@ -368,7 +369,13 @@ impl App {
                 let roms: HashSet<&str> = entries
                     .iter()
                     .filter(|e| matches!(e.status, Status::Todo))
-                    .filter_map(|e| e.rom.as_deref())
+                    .filter_map(|e| {
+                        if e.from_table() {
+                            e.source_key.as_deref()
+                        } else {
+                            e.rom.as_deref()
+                        }
+                    })
                     .collect();
                 t.store(roms.len(), Ordering::SeqCst);
                 let progress = |p: record::Progress| {
@@ -783,7 +790,11 @@ impl App {
                             ),
                             Status::Todo => (
                                 egui::Color32::from_rgb(220, 170, 60),
-                                "missing: can record".to_string(),
+                                if r.entry.from_table() {
+                                    "missing: can look in the table's files".to_string()
+                                } else {
+                                    "missing: can record".to_string()
+                                },
                             ),
                             Status::Cached(_) => (
                                 egui::Color32::from_rgb(220, 170, 60),

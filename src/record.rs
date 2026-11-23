@@ -7,7 +7,7 @@
 use crate::encode::{self, Format};
 use crate::popper::{self, Db, Emulator, Game};
 use crate::state::{self, Cache};
-use crate::{capture, pinmame, vpx, wav};
+use crate::{capture, pinmame, sources, vpx, wav};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -48,7 +48,17 @@ pub struct Entry {
     pub rom: Option<String>,
     pub rom_zip: Option<PathBuf>,
     pub rom_dirs: Vec<PathBuf>,
+    /// Set when the music is to come from the table's own files (no ROM,
+    /// or no ROM zip): the cache name for it.
+    pub source_key: Option<String>,
     pub status: Status,
+}
+
+impl Entry {
+    /// Whether this table's music comes from its files, not its ROM.
+    pub fn from_table(&self) -> bool {
+        self.rom_zip.is_none() && self.source_key.is_some()
+    }
 }
 
 pub struct Options {
@@ -60,6 +70,8 @@ pub struct Options {
     pub games: Vec<String>,
     pub extra_rom_dirs: Vec<PathBuf>,
     pub vpx_dir: Option<PathBuf>,
+    /// Popper's folder (for PuP packs in its PUPVideos).
+    pub popper_dir: Option<PathBuf>,
 }
 
 pub const DEFAULT_VPX_DIR: &str = r"C:\vPinball\VisualPinball";
@@ -203,6 +215,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             rom: None,
             rom_zip: None,
             rom_dirs: Vec::new(),
+            source_key: None,
             status: Status::Todo,
         };
         let Some(media) = emu.media_dir.as_deref() else {
@@ -229,6 +242,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             .or_else(|| script.as_deref().and_then(vpx::rom_name));
         let Some(rom) = entry.rom.clone() else {
             entry.status = Status::NoRom;
+            from_table(&mut entry, cache, opts);
             out.push(entry);
             continue;
         };
@@ -240,6 +254,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             .find(|p| p.is_file());
         let Some(zip) = entry.rom_zip.clone() else {
             entry.status = Status::RomZipMissing(rom);
+            from_table(&mut entry, cache, opts);
             out.push(entry);
             continue;
         };
@@ -261,6 +276,37 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         out.push(entry);
     }
     Ok(out)
+}
+
+/// A table without a usable ROM gets its music from its own files, if it
+/// has a table file to look in.
+fn from_table(entry: &mut Entry, cache: &Cache, opts: &Options) {
+    let Some(t) = entry.table.as_deref().filter(|t| t.is_file()) else {
+        return;
+    };
+    let key = state::table_key(t);
+    entry.status = if let Some(clip) = cache
+        .clip(&key, opts.seconds, opts.format.ext())
+        .filter(|_| !opts.retry)
+    {
+        Status::Cached(clip)
+    } else if let Some(why) = cache
+        .verdict(&key, opts.seconds, &key)
+        .filter(|_| !opts.retry)
+    {
+        Status::Verdict(why)
+    } else {
+        Status::Todo
+    };
+    entry.source_key = Some(key);
+}
+
+/// What will happen to a table, in words.
+pub fn describe_entry(e: &Entry) -> String {
+    match &e.status {
+        Status::Todo if e.from_table() => "will look for music in the table's files".into(),
+        s => describe(s),
+    }
 }
 
 pub fn describe(s: &Status) -> String {
@@ -508,8 +554,10 @@ pub enum Outcome {
 }
 
 struct Job {
+    /// The ROM, or for music from table files the cache name.
     rom: String,
-    zip: PathBuf,
+    /// None: the music comes from the table's files.
+    zip: Option<PathBuf>,
     entries: Vec<Entry>,
 }
 
@@ -564,12 +612,14 @@ impl Runner<'_> {
                     self.install_all(&clip, std::slice::from_ref(&e), &summary);
                 }
                 Status::Todo => {
-                    let (Some(rom), Some(zip)) = (e.rom.clone(), e.rom_zip.clone()) else {
-                        continue;
+                    let (key, zip) = match (e.rom.clone(), e.rom_zip.clone(), &e.source_key) {
+                        (Some(rom), Some(zip), _) => (rom, Some(zip)),
+                        (_, None, Some(k)) => (k.clone(), None),
+                        _ => continue,
                     };
-                    jobs.entry(rom.clone())
+                    jobs.entry(key.clone())
                         .or_insert_with(|| Job {
-                            rom,
+                            rom: key,
                             zip,
                             entries: Vec::new(),
                         })
@@ -636,14 +686,30 @@ impl Runner<'_> {
     }
 
     fn record_one(&self, job: &Job, summary: &Mutex<Summary>) -> Outcome {
-        let nvram = find_nvram(&job.rom, &job.entries[0].rom_dirs);
-        let fp = state::fingerprint(&job.zip, nvram.as_deref());
         let tmp = work_dir().join(format!(
             "vp-audio-extract-{}-{}",
             job.rom,
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
+        let Some(zip) = &job.zip else {
+            let outcome = if self.music_from_table(job, &tmp, false) {
+                Outcome::Recorded
+            } else {
+                Outcome::Nothing
+            };
+            let fp = job.rom.clone();
+            return self.finish(
+                job,
+                outcome,
+                &tmp,
+                &fp,
+                "no music found in the table's files",
+                summary,
+            );
+        };
+        let nvram = find_nvram(&job.rom, &job.entries[0].rom_dirs);
+        let fp = state::fingerprint(zip, nvram.as_deref());
         // A recording much shorter than the clip is a start jingle, not the
         // music (a blank nvram leaves Attack from Mars' volume near zero
         // after it): kept as a fallback while the other ways are tried.
@@ -728,6 +794,14 @@ impl Runner<'_> {
                 outcome = Outcome::Recorded;
             }
         }
+        if outcome != Outcome::Recorded && !self.cancelled() {
+            // The table's own files may have its music (altsound, a PuP
+            // pack): better than a jingle.
+            let _ = std::fs::remove_dir_all(&tmp);
+            if self.music_from_table(job, &tmp, true) {
+                outcome = Outcome::Recorded;
+            }
+        }
         if outcome != Outcome::Recorded && !self.cancelled() && best_len.get() > 0.0 {
             // Nothing longer anywhere: the jingle is better than no audio.
             let _ = std::fs::create_dir_all(&tmp);
@@ -741,6 +815,66 @@ impl Runner<'_> {
             }
         }
         let _ = std::fs::remove_file(&best);
+        let reason = if outcome == Outcome::Nothing {
+            "the ROM gave no music"
+        } else {
+            "PinMAME couldn't start the ROM"
+        };
+        self.finish(job, outcome, &tmp, &fp, reason, summary)
+    }
+
+    /// Looks for the music in the tables' own files; on success it's in
+    /// `tmp\clip.wav`. `rom_table`: only sources trusted over a ROM.
+    fn music_from_table(&self, job: &Job, tmp: &Path, rom_table: bool) -> bool {
+        for e in &job.entries {
+            if self.cancelled() {
+                return false;
+            }
+            let Some(t) = e.table.as_deref().filter(|t| t.is_file()) else {
+                continue;
+            };
+            let script = vpx::read_script(t).ok();
+            let dirs = vpx_dirs(&e.emu, self.opts.vpx_dir.as_deref());
+            let table = sources::Table {
+                table: t,
+                script: script.as_deref(),
+                rom: e.rom.as_deref(),
+                has_rom: rom_table || script.as_deref().is_some_and(vpx::uses_pinmame),
+                vpx_dirs: &dirs,
+                popper_dir: self.opts.popper_dir.as_deref(),
+            };
+            log::info!("{}: looking for music in the table's files", e.game.display);
+            let Some(found) = sources::find(
+                &table,
+                self.ffmpeg.as_deref(),
+                self.opts.seconds,
+                &tmp.join("sources"),
+                &|| self.cancelled(),
+            ) else {
+                continue;
+            };
+            let _ = std::fs::remove_dir_all(tmp.join("sources"));
+            if let Err(err) = wav::write(&tmp.join("clip.wav"), &found.pcm) {
+                log::warn!("{}: {err:#}", e.game.display);
+                continue;
+            }
+            log::info!("{}: using the {}", e.game.display, found.what);
+            return true;
+        }
+        let _ = std::fs::remove_dir_all(tmp.join("sources"));
+        false
+    }
+
+    /// Encodes and installs a recording, or remembers that there was none.
+    fn finish(
+        &self,
+        job: &Job,
+        outcome: Outcome,
+        tmp: &Path,
+        fp: &str,
+        reason: &str,
+        summary: &Mutex<Summary>,
+    ) -> Outcome {
         let mut s = summary.lock().unwrap_or_else(|e| e.into_inner());
         match outcome {
             Outcome::Recorded => {
@@ -770,21 +904,16 @@ impl Runner<'_> {
                 if outcome == Outcome::Nothing {
                     self.cache.remove_clips(&job.rom, self.opts.seconds);
                 }
-                let reason = if outcome == Outcome::Nothing {
-                    "the ROM gave no music"
-                } else {
-                    "PinMAME couldn't start the ROM"
-                };
                 if let Err(e) = self
                     .cache
-                    .set_verdict(&job.rom, self.opts.seconds, &fp, reason)
+                    .set_verdict(&job.rom, self.opts.seconds, fp, reason)
                 {
                     log::warn!("{}: couldn't remember the result: {e:#}", job.rom);
                 }
             }
             Outcome::Failed => s.failed += 1,
         }
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(tmp);
         outcome
     }
 
@@ -1007,7 +1136,7 @@ impl Runner<'_> {
 
 /// The shortest recording that counts as the table's music for a clip of
 /// `seconds`: anything shorter is taken for a start jingle.
-fn full_enough(seconds: u32) -> f64 {
+pub(crate) fn full_enough(seconds: u32) -> f64 {
     (seconds as f64 * 0.5).min(10.0)
 }
 
@@ -1047,6 +1176,7 @@ mod tests {
             games: Vec::new(),
             extra_rom_dirs: vec![roms.to_path_buf()],
             vpx_dir: None,
+            popper_dir: None,
         }
     }
 

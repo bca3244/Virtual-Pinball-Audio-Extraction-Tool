@@ -222,12 +222,35 @@ fn describe(p: &Path) -> String {
 /// when the zip is replaced or a parent set is added.
 /// Bumped when the recorder learns new ways to get a ROM playing, so old
 /// "no music" verdicts are tried again.
-const RECORDER_VERSION: u32 = 4;
+const RECORDER_VERSION: u32 = 5;
 
 /// Bumped when clips recorded before it can't be trusted (v2: static
 /// from an idle sound board is no longer taken for music; v3: a short
 /// start jingle is no longer taken for the music).
 const CLIP_VERSION: u32 = 3;
+
+/// The cache name for music taken from a table's own files (no ROM, or a
+/// ROM that gave none): `vpx-<file stem>-<hash>`, the hash over the
+/// table's path, size and date, so an updated table is looked at again.
+pub fn table_key(table: &Path) -> String {
+    let stem: String = table
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    let h = Sha1::digest(format!("{};v{RECORDER_VERSION}", describe(table)).as_bytes());
+    let hex: String = h.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("vpx-{stem}-{hex}")
+}
 
 pub fn fingerprint(zip: &Path, nvram: Option<&Path>) -> String {
     let siblings = zip

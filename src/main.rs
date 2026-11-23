@@ -91,6 +91,7 @@ impl Common {
             games: self.games.clone(),
             extra_rom_dirs: self.rom_dirs.clone(),
             vpx_dir: self.vpx.clone(),
+            popper_dir: None,
         }
     }
 }
@@ -179,7 +180,8 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Cmd::Restore { .. } => unreachable!("handled above"),
         Cmd::Scan(common) => {
-            let opts = common.options();
+            let mut opts = common.options();
+            opts.popper_dir = Some(popper_dir.clone());
             let entries = record::plan(&db, &cache, &opts)?;
             print_plan(&entries);
             Ok(())
@@ -192,7 +194,8 @@ fn run(cli: Cli) -> Result<()> {
             dry_run,
         } => {
             let format = common.format;
-            let opts = common.options();
+            let mut opts = common.options();
+            opts.popper_dir = Some(popper_dir.clone());
             let entries = record::plan(&db, &cache, &opts)?;
             let todo = entries
                 .iter()
@@ -256,10 +259,7 @@ fn print_plan(entries: &[record::Entry]) {
     for e in entries {
         let title: String = e.game.display.chars().take(width).collect();
         let rom = e.rom.as_deref().unwrap_or("-");
-        println!(
-            "{title:<width$}  {rom:<12}  {}",
-            record::describe(&e.status)
-        );
+        println!("{title:<width$}  {rom:<12}  {}", record::describe_entry(e));
     }
     let count = |f: fn(&record::Status) -> bool| entries.iter().filter(|e| f(&e.status)).count();
     println!(
