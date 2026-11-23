@@ -95,7 +95,11 @@ fn describe(p: &Path) -> String {
 
 /// The ROM zip (size and date) and how many zips sit beside it: changes
 /// when the zip is replaced or a parent set is added.
-pub fn fingerprint(zip: &Path) -> String {
+/// Bumped when the recorder learns new ways to get a ROM playing, so old
+/// "no music" verdicts are tried again.
+const RECORDER_VERSION: u32 = 2;
+
+pub fn fingerprint(zip: &Path, nvram: Option<&Path>) -> String {
     let siblings = zip
         .parent()
         .and_then(|d| std::fs::read_dir(d).ok())
@@ -109,7 +113,9 @@ pub fn fingerprint(zip: &Path) -> String {
                 .count()
         })
         .unwrap_or(0);
-    let hash = Sha1::digest(format!("{};{siblings}", describe(zip)).as_bytes());
+    let nv = nvram.map(describe).unwrap_or_default();
+    let hash =
+        Sha1::digest(format!("{};{siblings};{nv};v{RECORDER_VERSION}", describe(zip)).as_bytes());
     hash.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -136,10 +142,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let zip = dir.path().join("a.zip");
         std::fs::write(&zip, b"1").unwrap();
-        let one = fingerprint(&zip);
-        assert_eq!(one, fingerprint(&zip));
+        let one = fingerprint(&zip, None);
+        assert_eq!(one, fingerprint(&zip, None));
+        let nv = dir.path().join("a.nv");
+        std::fs::write(&nv, b"1").unwrap();
+        assert_ne!(
+            one,
+            fingerprint(&zip, Some(&nv)),
+            "an nvram appearing counts"
+        );
         std::fs::write(dir.path().join("parent.zip"), b"1").unwrap();
-        assert_ne!(one, fingerprint(&zip));
+        assert_ne!(one, fingerprint(&zip, None));
     }
 
     #[test]

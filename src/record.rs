@@ -235,7 +235,11 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         {
             entry.status = Status::Cached(clip);
         } else if let Some(why) = cache
-            .verdict(&rom, opts.seconds, &state::fingerprint(&zip))
+            .verdict(
+                &rom,
+                opts.seconds,
+                &state::fingerprint(&zip, find_nvram(&rom, &entry.rom_dirs).as_deref()),
+            )
             .filter(|_| !opts.retry)
         {
             entry.status = Status::Verdict(why);
@@ -598,7 +602,8 @@ impl Runner<'_> {
     }
 
     fn record_one(&self, job: &Job, summary: &Mutex<Summary>) -> Outcome {
-        let fp = state::fingerprint(&job.zip);
+        let nvram = find_nvram(&job.rom, &job.entries[0].rom_dirs);
+        let fp = state::fingerprint(&job.zip, nvram.as_deref());
         let tmp = work_dir().join(format!(
             "vp-audio-extract-{}-{}",
             job.rom,
@@ -620,7 +625,6 @@ impl Runner<'_> {
         // reset (Earthshaker) or won't start until a mechanism is
         // calibrated (Bride of Pin-bot): the cabinet's own nvram, copied,
         // gets them going.
-        let nvram = find_nvram(&job.rom, &job.entries[0].rom_dirs);
         if outcome == Outcome::Nothing && !self.cancelled() {
             if let Some(nv) = &nvram {
                 log::info!(
@@ -628,7 +632,11 @@ impl Runner<'_> {
                     job.rom,
                     nv.display()
                 );
-                outcome = attempt(false, Some(nv));
+                // Only a recording counts: anything else from this try
+                // leaves the blank run's "no music" and goes on.
+                if attempt(false, Some(nv)) == Outcome::Recorded {
+                    outcome = Outcome::Recorded;
+                }
             }
         }
         if outcome == Outcome::Nothing && !self.cancelled() {
@@ -654,6 +662,10 @@ impl Runner<'_> {
                         summary.lock().unwrap_or_else(|e| e.into_inner()).failed += 1;
                     }
                 }
+            }
+            Outcome::Nothing | Outcome::NotStarted if self.cancelled() => {
+                // Cut short: not a verdict on the ROM.
+                s.failed += 1;
             }
             Outcome::Nothing | Outcome::NotStarted => {
                 s.nothing += 1;
@@ -895,7 +907,7 @@ mod tests {
             .set_verdict(
                 "tz_94h",
                 30,
-                &state::fingerprint(&roms.join("tz_94h.zip")),
+                &state::fingerprint(&roms.join("tz_94h.zip"), None),
                 "the ROM gave no music",
             )
             .unwrap();

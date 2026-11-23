@@ -144,14 +144,30 @@ impl Loudness {
         };
         let (block, channels) = (self.block, self.channels);
         for b in new.chunks_exact(block) {
-            // Around the block's own mean, so a DC offset isn't loudness.
-            let mean = b.iter().map(|&s| s as f64).sum::<f64>() / block as f64;
-            let rms =
-                (b.iter().map(|&s| (s as f64 - mean).powi(2)).sum::<f64>() / block as f64).sqrt();
+            // Around each channel's own mean in the block, so a DC offset
+            // isn't loudness.
+            let frames = (block / channels).max(1) as f64;
+            let means: Vec<f64> = (0..channels)
+                .map(|c| {
+                    b.iter()
+                        .skip(c)
+                        .step_by(channels)
+                        .map(|&s| s as f64)
+                        .sum::<f64>()
+                        / frames
+                })
+                .collect();
+            let rms = (b
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| (s as f64 - means[i % channels]).powi(2))
+                .sum::<f64>()
+                / block as f64)
+                .sqrt();
             let first: Vec<f64> = b
                 .iter()
                 .step_by(channels)
-                .map(|&s| s as f64 - mean)
+                .map(|&s| s as f64 - means[0])
                 .collect();
             let crossings = first
                 .windows(2)
@@ -544,6 +560,12 @@ mod tests {
             Some("78")
         );
         assert_eq!(segment_text(14, &cells), None);
+    }
+
+    #[test]
+    fn different_offsets_per_channel_are_not_loudness() {
+        let s: Vec<i16> = (0..22050 * 20).flat_map(|_| [300i16, -900]).collect();
+        assert!(clip(&s, 2, 22050, Some(0), 30).is_none());
     }
 
     #[test]

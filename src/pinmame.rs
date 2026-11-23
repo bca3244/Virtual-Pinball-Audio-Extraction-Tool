@@ -418,7 +418,10 @@ pub fn run(
         // A copy of the cabinet's own nvram, so the machine skips its
         // factory reset. The original is only read.
         let dest = scratch.join("nvram").join(format!("{game}.nv"));
-        std::fs::copy(nv, &dest)
+        // Bytes only, not the attributes: a read-only copy could outlive
+        // the scratch folder's cleanup.
+        std::fs::read(nv)
+            .and_then(|b| std::fs::write(&dest, b))
             .with_context(|| format!("copying {} to {}", nv.display(), dest.display()))?;
         println!("starting from a copy of {}", nv.display());
     }
