@@ -685,8 +685,8 @@ pub fn init_switches(script: &str) -> (Vec<i32>, Vec<i32>) {
 }
 
 /// The switches closed when a recording starts: balls in the trough, what
-/// the table's init closes, and mechanisms at rest (when PinMAME doesn't
-/// simulate them). Switches the init opens are left open.
+/// the table's init closes, and mechanisms at rest. Switches the init opens
+/// are left open.
 pub fn start_switches(script: &str) -> Vec<i32> {
     let mut out = trough_switches(script);
     let (on, off) = init_switches(script);
@@ -695,16 +695,15 @@ pub fn start_switches(script: &str) -> Vec<i32> {
             out.push(sw);
         }
     }
-    let simulated: Vec<i32> = mechs(script)
-        .iter()
-        .flat_map(|m| m.switches.iter().map(|s| s.0))
-        .collect();
     for sw in mech_rest_switches(script) {
         if !out.contains(&sw) {
             out.push(sw);
         }
     }
-    out.retain(|sw| *sw > 0 && !off.contains(sw) && !simulated.contains(sw));
+    // Rest switches stay closed even for mechanisms PinMAME simulates: it
+    // doesn't close them until the mechanism first moves (The Addams
+    // Family won't start without 82 and 84).
+    out.retain(|sw| *sw > 0 && !off.contains(sw));
     out.truncate(16);
     out
 }
@@ -727,7 +726,7 @@ mod tests {
         assert_eq!(handle_mechanics(t), Some(4));
         let both = format!("{s}{t}");
         let sw = start_switches(&both);
-        assert!(sw.contains(&14) && sw.contains(&36) && !sw.contains(&31) && !sw.contains(&34));
+        assert!(sw.contains(&14) && sw.contains(&36) && !sw.contains(&31) && sw.contains(&34));
     }
 
     #[test]
