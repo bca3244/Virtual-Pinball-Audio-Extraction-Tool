@@ -68,6 +68,12 @@ struct WorkerCli {
     /// (diagnostics; repeatable).
     #[arg(long = "press", allow_hyphen_values = true)]
     presses: Vec<String>,
+    /// A mechanism for PinMAME to simulate (from the table script; repeatable).
+    #[arg(long = "mech", allow_hyphen_values = true)]
+    mechs: Vec<String>,
+    /// The script's `.HandleMechanics` value.
+    #[arg(long)]
+    script_mechanics: Option<i32>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -99,6 +105,12 @@ pub fn run_worker_if_requested() {
             coin: w.coin_switch,
             start: w.start_switch,
         },
+        mechs: w
+            .mechs
+            .iter()
+            .filter_map(|m| crate::vpx::ScriptMech::parse_arg(m))
+            .collect(),
+        handle_mechanics: w.script_mechanics,
         presses: w
             .presses
             .iter()

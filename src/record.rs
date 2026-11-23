@@ -313,6 +313,10 @@ pub struct WorkerArgs {
     pub cabinet: pinmame::CabinetSwitches,
     /// Extra switch presses (diagnostics).
     pub presses: Vec<pinmame::Press>,
+    /// Mechanisms the table script hands to PinMAME.
+    pub mechs: Vec<crate::vpx::ScriptMech>,
+    /// The script's `.HandleMechanics` value.
+    pub handle_mechanics: Option<i32>,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -327,6 +331,10 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
     pinmame::set_debug(a.debug);
     pinmame::set_dips(a.dips.clone());
     pinmame::set_cabinet_switches(a.cabinet);
+    pinmame::set_mechs(a.mechs.clone());
+    if let Some(n) = a.handle_mechanics {
+        pinmame::set_script_mechanics(n);
+    }
     if a.cabinet.coin.is_some() || a.cabinet.start.is_some() {
         println!("cabinet switches: {:?}", a.cabinet);
     }
@@ -858,6 +866,14 @@ impl Runner<'_> {
         }
         if let Some(sw) = cabinet.coin {
             cmd.arg("--coin-switch").arg(sw.to_string());
+        }
+        if let Some(s) = script.as_deref() {
+            for m in vpx::mechs(s) {
+                cmd.arg("--mech").arg(m.to_arg());
+            }
+            if let Some(n) = vpx::handle_mechanics(s).filter(|&n| n > 0) {
+                cmd.arg("--script-mechanics").arg(n.to_string());
+            }
         }
         if let Some(sw) = cabinet.start {
             cmd.arg("--start-switch").arg(sw.to_string());

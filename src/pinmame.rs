@@ -86,6 +86,49 @@ impl Press {
 
 static PRESSES: OnceLock<Vec<Press>> = OnceLock::new();
 
+/// Mechanisms the table script hands to PinMAME, in its mech order.
+static MECHS: OnceLock<Vec<crate::vpx::ScriptMech>> = OnceLock::new();
+
+/// Sets the script's mechanisms; call before [`run`].
+pub fn set_mechs(m: Vec<crate::vpx::ScriptMech>) {
+    let _ = MECHS.set(m);
+}
+
+/// The machine's own mechanics mask from the script
+/// (`.HandleMechanics = 4`), when it sets one above 0.
+static SCRIPT_MECHANICS: OnceLock<i32> = OnceLock::new();
+
+pub fn set_script_mechanics(n: i32) {
+    let _ = SCRIPT_MECHANICS.set(n);
+}
+
+const PINMAME_MAX_MECHSW: usize = 20;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MechSwitchConfig {
+    sw_no: c_int,
+    start_pos: c_int,
+    end_pos: c_int,
+    pulse: c_int,
+}
+
+/// libpinmame's `PinmameMechConfig`.
+#[repr(C)]
+struct MechConfig {
+    mtype: c_int,
+    sol1: c_int,
+    sol2: c_int,
+    length: c_int,
+    steps: c_int,
+    initial_pos: c_int,
+    acc: c_int,
+    ret: c_int,
+    sw: [MechSwitchConfig; PINMAME_MAX_MECHSW],
+}
+
+type SetMechFn = unsafe extern "C" fn(c_int, *const MechConfig) -> c_int;
+
 #[derive(Clone, Copy, PartialEq)]
 enum PulseState {
     Pending,
@@ -533,6 +576,10 @@ pub fn run(
     let set_dip = unsafe { lib.get::<SetSwitchFn>(b"PinmameSetDIP\0") }
         .ok()
         .map(|s| *s);
+    let set_mech = unsafe { lib.get::<SetMechFn>(b"PinmameSetMech\0") }
+        .ok()
+        .map(|s| *s);
+    let mechs = MECHS.get().cloned().unwrap_or_default();
     let get_game = unsafe { lib.get::<GetGameFn>(b"PinmameGetGame\0") }
         .ok()
         .map(|s| *s);
@@ -591,7 +638,13 @@ pub fn run(
 
     unsafe {
         set_handle_keyboard(1);
-        set_handle_mechanics(debug().mechanics.unwrap_or(1));
+        // PinMAME takes the script's mechanisms only with its own off.
+        let default = match SCRIPT_MECHANICS.get() {
+            Some(&n) if n > 0 => n,
+            _ if !mechs.is_empty() && set_mech.is_some() => 0,
+            _ => 1,
+        };
+        set_handle_mechanics(debug().mechanics.unwrap_or(default));
     }
     let _ = SHARED.since.set(Instant::now());
     let status = unsafe { run(crom.as_ptr()) };
@@ -642,6 +695,31 @@ pub fn run(
                 }
                 if !dips.is_empty() {
                     println!("DIP switches: {dips:?}");
+                }
+            }
+            if let Some(set_mech) = set_mech {
+                for (i, m) in mechs.iter().enumerate() {
+                    let mut c = MechConfig {
+                        mtype: m.mtype,
+                        sol1: m.sol1,
+                        sol2: m.sol2,
+                        length: m.length,
+                        steps: m.steps,
+                        initial_pos: 0,
+                        acc: m.acc,
+                        ret: m.ret,
+                        sw: [MechSwitchConfig::default(); PINMAME_MAX_MECHSW],
+                    };
+                    for (slot, &(sw, a, b, p)) in c.sw.iter_mut().zip(&m.switches) {
+                        *slot = MechSwitchConfig {
+                            sw_no: sw,
+                            start_pos: a,
+                            end_pos: b,
+                            pulse: p,
+                        };
+                    }
+                    let status = unsafe { set_mech(i as c_int + 1, &c) };
+                    println!("mech {}: {} (status {status})", i + 1, m.to_arg());
                 }
             }
             dips_set = true;
