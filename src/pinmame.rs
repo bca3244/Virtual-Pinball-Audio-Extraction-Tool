@@ -86,6 +86,34 @@ impl Press {
 
 static PRESSES: OnceLock<Vec<Press>> = OnceLock::new();
 
+#[derive(Clone, Copy, PartialEq)]
+enum PulseState {
+    Pending,
+    Down,
+    Done,
+}
+
+/// One timed switch press in the run loop.
+struct Pulse {
+    switch: i32,
+    at: f64,
+    held: f64,
+    what: &'static str,
+    state: PulseState,
+}
+
+impl Pulse {
+    fn new(switch: i32, at: f64, held: f64, what: &'static str) -> Pulse {
+        Pulse {
+            switch,
+            at,
+            held,
+            what,
+            state: PulseState::Pending,
+        }
+    }
+}
+
 /// Sets extra switch presses; call before [`run`].
 pub fn set_presses(p: Vec<Press>) {
     let _ = PRESSES.set(p);
@@ -580,10 +608,28 @@ pub fn run(
     let mut dips_set = false;
     let (mut shown, mut last_text) = (0, String::new());
     let mut loud: Option<capture::Loudness> = None;
+    // Switch presses, each one closed at the first look at or after its
+    // time and opened at least one look later: a loop that steps past a
+    // whole press window still makes the press, and coins on one switch
+    // never merge.
     let cabinet = CABINET.get().copied().unwrap_or_default();
-    let (mut coin_down, mut start_down) = (false, false);
-    let presses = PRESSES.get().cloned().unwrap_or_default();
-    let mut press_down = vec![false; presses.len()];
+    let mut pulses: Vec<Pulse> = Vec::new();
+    if let Some(sw) = cabinet.coin {
+        for i in 0..4 {
+            pulses.push(Pulse::new(
+                sw,
+                timeline.coin_at + 0.6 * i as f64,
+                capture::PRESS,
+                "coin",
+            ));
+        }
+    }
+    if let Some(sw) = cabinet.start {
+        pulses.push(Pulse::new(sw, timeline.start_at, capture::PRESS, "Start"));
+    }
+    for p in PRESSES.get().cloned().unwrap_or_default() {
+        pulses.push(Pulse::new(p.switch, p.at, p.held, "switch"));
+    }
     while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
         // machine is up: setting switches right after PinmameRun crashes it.
@@ -609,46 +655,36 @@ pub fn run(
         let s = &*SHARED;
         if balls_in {
             let t = now();
-            if let Some(sw) = cabinet.coin {
-                let down = timeline.key_down(capture::KEY_NUMBER_5, t);
-                if down != coin_down {
-                    unsafe { set_switch(sw, down as c_int) };
-                    if debug().show_display {
-                        println!("[{t:5.1} s] coin switch {sw} {}", down as u8);
-                    }
-                    coin_down = down;
+            let mut busy: Vec<i32> = Vec::new();
+            for p in pulses.iter_mut() {
+                if busy.contains(&p.switch) {
+                    continue;
                 }
-            }
-            if let Some(sw) = cabinet.start {
-                let down = timeline.key_down(capture::KEY_NUMBER_1, t);
-                if down != start_down {
-                    unsafe { set_switch(sw, down as c_int) };
-                    println!("[{t:5.1} s] Start switch {sw} {}", down as u8);
-                    start_down = down;
-                    if down {
-                        // As the Start key does, in case the keys aren't read.
-                        let f = s.frames.load(Ordering::Acquire) as i64;
-                        let _ = s.start_frame.compare_exchange(
-                            -1,
-                            f,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
+                match p.state {
+                    PulseState::Pending if t >= p.at => {
+                        unsafe { set_switch(p.switch, 1) };
+                        println!("[{t:5.1} s] {} switch {} on", p.what, p.switch);
+                        p.state = PulseState::Down;
+                        busy.push(p.switch);
+                        if p.what == "Start" {
+                            // As the Start key does, in case the keys aren't read.
+                            let f = s.frames.load(Ordering::Acquire) as i64;
+                            let _ = s.start_frame.compare_exchange(
+                                -1,
+                                f,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
+                    PulseState::Down if t >= p.at + p.held => {
+                        unsafe { set_switch(p.switch, 0) };
+                        p.state = PulseState::Done;
+                        busy.push(p.switch);
+                    }
+                    PulseState::Down => busy.push(p.switch),
+                    _ => {}
                 }
-            }
-        }
-        for (p, was) in presses.iter().zip(press_down.iter_mut()) {
-            let t = now();
-            let down = t >= p.at && t < p.at + p.held;
-            if down != *was {
-                unsafe { set_switch(p.switch, down as c_int) };
-                println!(
-                    "[{t:5.1} s] switch {} {}",
-                    p.switch,
-                    if down { "on" } else { "off" }
-                );
-                *was = down;
             }
         }
         if debug().show_display && shown < 120 {

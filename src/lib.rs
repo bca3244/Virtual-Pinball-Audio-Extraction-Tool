@@ -102,7 +102,13 @@ pub fn run_worker_if_requested() {
         presses: w
             .presses
             .iter()
-            .filter_map(|p| pinmame::Press::parse(p))
+            .filter_map(|p| {
+                let r = pinmame::Press::parse(p);
+                if r.is_none() {
+                    eprintln!("ignoring --press {p}: expected switch@seconds[+held]");
+                }
+                r
+            })
             .collect(),
         dips: w
             .dips

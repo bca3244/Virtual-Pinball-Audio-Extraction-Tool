@@ -640,7 +640,11 @@ impl Runner<'_> {
         // music (a blank nvram leaves Attack from Mars' volume near zero
         // after it): kept as a fallback while the other ways are tried.
         let enough = full_enough(self.opts.seconds);
-        let best = tmp.with_extension("best.wav");
+        let best = work_dir().join(format!(
+            "vp-audio-extract-{}-{}-best.wav",
+            job.rom,
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&best);
         let best_len = std::cell::Cell::new(0.0f64);
         let attempt = |slow: bool, nvram: Option<&Path>, no_escape: bool| {
@@ -656,7 +660,10 @@ impl Runner<'_> {
                 return o;
             }
             let clip = tmp.join("clip.wav");
-            let len = wav_seconds(&clip).unwrap_or(0.0);
+            // Unreadable (antivirus holding it?): trust the worker.
+            let Some(len) = wav_seconds(&clip) else {
+                return o;
+            };
             if len >= enough {
                 return o;
             }
@@ -704,9 +711,11 @@ impl Runner<'_> {
             // Some machines boot slowly or ignore inputs for a while after
             // their self-test: once more, with everything later.
             log::info!("{}: no music; trying again with a slower start", job.rom);
-            outcome = attempt(true, None, false);
+            if attempt(true, None, false) == Outcome::Recorded {
+                outcome = Outcome::Recorded;
+            }
         }
-        if outcome == Outcome::Nothing && !self.cancelled() && best_len.get() > 0.0 {
+        if outcome != Outcome::Recorded && !self.cancelled() && best_len.get() > 0.0 {
             // Nothing longer anywhere: the jingle is better than no audio.
             let _ = std::fs::create_dir_all(&tmp);
             if std::fs::copy(&best, tmp.join("clip.wav")).is_ok() {
@@ -743,8 +752,11 @@ impl Runner<'_> {
             }
             Outcome::Nothing | Outcome::NotStarted => {
                 s.nothing += 1;
-                // A clip from an earlier run is no longer this ROM's music.
-                self.cache.remove_clips(&job.rom, self.opts.seconds);
+                // A clip from an earlier run is no longer this ROM's music
+                // (not for a ROM that didn't start: that says nothing of it).
+                if outcome == Outcome::Nothing {
+                    self.cache.remove_clips(&job.rom, self.opts.seconds);
+                }
                 let reason = if outcome == Outcome::Nothing {
                     "the ROM gave no music"
                 } else {

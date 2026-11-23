@@ -54,11 +54,15 @@ pub fn script_from_game_data(bytes: &[u8]) -> String {
 /// trimmed: `Controller.Switch(74) = 1 'Controller.Switch(55) = 1` is
 /// switch 74 only.
 fn code(raw: &str) -> &str {
+    if is_rem(raw.trim_start()) {
+        return "";
+    }
     let mut in_str = false;
     for (i, c) in raw.char_indices() {
         match c {
             '"' => in_str = !in_str,
             '\'' if !in_str => return raw[..i].trim(),
+            ':' if !in_str && is_rem(raw[i + 1..].trim_start()) => return raw[..i].trim(),
             _ => {}
         }
     }
@@ -66,7 +70,26 @@ fn code(raw: &str) -> &str {
 }
 
 fn is_comment(line: &str) -> bool {
-    line.starts_with('\'') || starts_ci(line, "rem ")
+    line.starts_with('\'') || is_rem(line)
+}
+
+/// `Rem` followed by whitespace or the end of the line.
+fn is_rem(stmt: &str) -> bool {
+    starts_ci(stmt, "rem") && stmt[3..].chars().next().is_none_or(char::is_whitespace)
+}
+
+/// The sub a `_Hit` line belongs to is the drain or outhole
+/// (`Sub Drain_Hit`, `Sub sw55_Hit(): ... RandomSoundDrain`): a ball there
+/// at the start is a drained ball, not one in the trough. Only the sub's
+/// name and a drain sound call on a single-switch line count.
+fn is_drain_sub(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let name = lower.split("_hit").next().unwrap_or("");
+    if name.contains("drain") || name.contains("outhole") {
+        return true;
+    }
+    // `RandomSoundDrain swNN` names the drain kicker itself.
+    lower.contains("sounddrain")
 }
 
 fn starts_ci(line: &str, prefix: &str) -> bool {
@@ -243,6 +266,7 @@ fn switches_on(line: &str) -> Vec<i32> {
 pub fn trough_switches(script: &str) -> Vec<i32> {
     let consts = consts(script);
     let mut found = Vec::new();
+    let mut drains = Vec::new();
     let mut in_trough_with = false;
     for raw in script.lines() {
         let line = code(raw);
@@ -276,10 +300,17 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
         // Not the drain/outhole: a ball there at the start is a drained
         // ball (Genesis: `Sub sw55_Hit(): Controller.Switch(55) = 1 :
         // RandomSoundDrain sw55 : UpdateTrough`), and the game won't start.
-        if contains_ci(line, "_hit") && !contains_ci(line, "drain") && !contains_ci(line, "outhole")
-        {
-            found.extend(switches_on(line));
+        if contains_ci(line, "_hit") {
+            if is_drain_sub(line) {
+                drains.extend(switches_on(line));
+            } else {
+                found.extend(switches_on(line));
+            }
         }
+    }
+    if found.is_empty() {
+        // A single-ball machine whose ball rests in the outhole.
+        found = drains;
     }
     let mut out = Vec::new();
     for n in found.into_iter().filter(|&n| n > 0) {
@@ -382,6 +413,18 @@ mod tests {
         let g = "Sub sw74_Hit():Controller.Switch(74) = 1 : UpdateTrough : End Sub\n\
                  Sub sw55_Hit():Controller.Switch(55) = 1 : RandomSoundDrain sw55 : UpdateTrough : End Sub\n";
         assert_eq!(trough_switches(g), vec![74]);
+        let one = "Sub sw55_Hit():Controller.Switch(55) = 1 : RandomSoundDrain sw55 : UpdateTrough : End Sub\n";
+        assert_eq!(
+            trough_switches(one),
+            vec![55],
+            "the outhole when it's all there is"
+        );
+        assert_eq!(
+            code("Controller.Switch(74) = 1 : Rem Controller.Switch(55) = 1"),
+            "Controller.Switch(74) = 1"
+        );
+        assert_eq!(code("REM it's off"), "");
+        assert_eq!(code("Remove = 1"), "Remove = 1");
     }
 
     #[test]
