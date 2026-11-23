@@ -1,9 +1,13 @@
 name: Release
 
-# Push a tag like v0.1.0 (or v0.1.0-beta.1 for a pre-release) to build the
-# Windows exes and publish them as a GitHub release.
+# Publishes the Windows exes as a GitHub release, either:
+# - automatically, when a push to the main or feature branch carries a
+#   Cargo.toml version that has no release yet (v<version>, a pre-release
+#   when it has a "-", notes from CHANGELOG.md), or
+# - when a tag like v0.1.0 is pushed (or a release is made on GitHub).
 on:
   push:
+    branches: [main, feat/rom-audio-extractor]
     tags: ["v*"]
 
 permissions:
@@ -14,16 +18,40 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build --release --locked
-      - name: Test
-        run: cargo test --locked
-      - name: Package
+      - name: Version
+        id: version
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            "tag=${{ github.ref_name }}" | Out-File -Append $env:GITHUB_OUTPUT
+            "go=true" | Out-File -Append $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $tag = "v$v"
+          gh release view $tag *> $null
+          $go = if ($LASTEXITCODE -eq 0) { "false" } else { "true" }
+          if ($go -eq "false") { Write-Host "$tag is already released" }
+          "tag=$tag" | Out-File -Append $env:GITHUB_OUTPUT
+          "go=$go" | Out-File -Append $env:GITHUB_OUTPUT
+          $global:LASTEXITCODE = 0
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.version.outputs.go == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.version.outputs.go == 'true'
+      - name: Build
+        if: steps.version.outputs.go == 'true'
+        run: cargo build --release --locked
+      - name: Test
+        if: steps.version.outputs.go == 'true'
+        run: cargo test --locked
+      - name: Package
+        if: steps.version.outputs.go == 'true'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           $name = "vp-audio-extract-$env:TAG-windows-x64"
           New-Item -ItemType Directory $name | Out-Null
@@ -32,10 +60,11 @@ jobs:
           Compress-Archive -Path "$name/*" -DestinationPath "$name.zip"
           "ZIP=$name.zip" | Out-File -Append $env:GITHUB_ENV
       - name: Publish
+        if: steps.version.outputs.go == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           $tag = $env:TAG
           $files = @($env:ZIP, "target/release/vp-audio-extract-gui.exe", "target/release/vp-audio-extract.exe")
@@ -43,7 +72,23 @@ jobs:
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag @files --clobber
+            exit 0
+          }
+          $pre = if ($tag.Contains("-")) { "--prerelease" } else { $null }
+          # Notes: this version's section of CHANGELOG.md, if it has one.
+          $v = $tag.TrimStart("v")
+          $notes = ""
+          if (Test-Path CHANGELOG.md) {
+            $in = $false
+            foreach ($line in Get-Content CHANGELOG.md) {
+              if ($line -match '^## ') { $in = ($line -match "^## \[?$([regex]::Escape($v))\]?(\s|$)"); continue }
+              if ($in) { $notes += "$line`n" }
+            }
+          }
+          if (-not $notes.Trim()) { $notes = "Release $tag." }
+          $notes | Out-File -Encoding utf8 notes.md
+          if ("${{ github.ref_type }}" -eq "tag") {
+            gh release create $tag @files --title $tag --notes-file notes.md --verify-tag $pre
           } else {
-            $pre = if ($tag.Contains("-")) { "--prerelease" } else { $null }
-            gh release create $tag @files --title $tag --generate-notes --verify-tag $pre
+            gh release create $tag @files --title $tag --notes-file notes.md --target $env:GITHUB_SHA $pre
           }
