@@ -273,7 +273,11 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
                 continue;
             }
         }
-        if contains_ci(line, "_hit") {
+        // Not the drain/outhole: a ball there at the start is a drained
+        // ball (Genesis: `Sub sw55_Hit(): Controller.Switch(55) = 1 :
+        // RandomSoundDrain sw55 : UpdateTrough`), and the game won't start.
+        if contains_ci(line, "_hit") && !contains_ci(line, "drain") && !contains_ci(line, "outhole")
+        {
             found.extend(switches_on(line));
         }
     }
@@ -375,6 +379,9 @@ mod tests {
                  bsTrough.InitSw 0, 74, 0, 0, 0, 0, 0, 0 'bsTrough.InitSw 0, 55\n";
         assert_eq!(trough_switches(s), vec![74]);
         assert_eq!(code("x = \"it's\" ' note"), "x = \"it's\"");
+        let g = "Sub sw74_Hit():Controller.Switch(74) = 1 : UpdateTrough : End Sub\n\
+                 Sub sw55_Hit():Controller.Switch(55) = 1 : RandomSoundDrain sw55 : UpdateTrough : End Sub\n";
+        assert_eq!(trough_switches(g), vec![74]);
     }
 
     #[test]
