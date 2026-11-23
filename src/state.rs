@@ -122,8 +122,9 @@ fn describe(p: &Path) -> String {
 const RECORDER_VERSION: u32 = 4;
 
 /// Bumped when clips recorded before it can't be trusted (v2: static
-/// from an idle sound board is no longer taken for music).
-const CLIP_VERSION: u32 = 2;
+/// from an idle sound board is no longer taken for music; v3: a short
+/// start jingle is no longer taken for the music).
+const CLIP_VERSION: u32 = 3;
 
 pub fn fingerprint(zip: &Path, nvram: Option<&Path>) -> String {
     let siblings = zip
