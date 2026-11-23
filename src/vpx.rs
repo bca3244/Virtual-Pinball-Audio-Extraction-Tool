@@ -464,27 +464,78 @@ fn mech_const(name: &str) -> Option<i64> {
     })
 }
 
-/// `a + b + &H10 + NAME` with names from the script's consts or core.vbs.
+/// `a + b - 1 + 2*NAME + &H10` with names from the script's consts or
+/// core.vbs. None for anything else.
 fn eval_terms(expr: &str, consts: &HashMap<String, i32>) -> Option<i64> {
     let e: String = expr.chars().filter(|c| !matches!(c, '(' | ')')).collect();
+    let atom = |t: &str| -> Option<i64> {
+        let t = t.trim();
+        if t.get(..2).is_some_and(|h| h.eq_ignore_ascii_case("&h")) {
+            return i64::from_str_radix(t[2..].trim_end_matches('&'), 16).ok();
+        }
+        if let Ok(v) = t.parse::<i64>() {
+            return Some(v);
+        }
+        let lower = t.to_ascii_lowercase();
+        mech_const(&lower).or_else(|| consts.get(&lower).map(|&v| v as i64))
+    };
+    // Split into signed terms at + and - (a leading - negates).
     let mut total = 0i64;
-    for term in e.split('+') {
-        let t = term.trim();
-        let (neg, t) = match t.strip_prefix('-') {
-            Some(r) => (true, r.trim()),
-            None => (false, t),
-        };
-        let v = if t.get(..2).is_some_and(|h| h.eq_ignore_ascii_case("&h")) {
-            i64::from_str_radix(t[2..].trim_end_matches('&'), 16).ok()?
-        } else if let Ok(v) = t.parse::<i64>() {
-            v
-        } else {
-            let lower = t.to_ascii_lowercase();
-            mech_const(&lower).or_else(|| consts.get(&lower).map(|&v| v as i64))?
-        };
-        total += if neg { -v } else { v };
+    let (mut term, mut sign) = (String::new(), 1i64);
+    let flush = |term: &str, sign: i64| -> Option<i64> {
+        if term.trim().is_empty() {
+            return Some(0);
+        }
+        let product = term
+            .split('*')
+            .map(atom)
+            .try_fold(1i64, |acc, v| v.map(|v| acc * v))?;
+        Some(sign * product)
+    };
+    for c in e.chars() {
+        match c {
+            '+' | '-' => {
+                if term.trim().is_empty() {
+                    if c == '-' {
+                        sign = -sign;
+                    }
+                    continue;
+                }
+                total += flush(&term, sign)?;
+                term.clear();
+                sign = if c == '-' { -1 } else { 1 };
+            }
+            _ => term.push(c),
+        }
     }
+    if term.trim().is_empty() {
+        // Nothing, or a dangling operator.
+        return None;
+    }
+    total += flush(&term, sign)?;
     Some(total)
+}
+
+/// A sub that runs when the table starts: `Table1_Init`, `AFM_Init`,
+/// `Init_Trex` (not `EnterInitials`, `ReInitGame`).
+fn is_init_sub(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with("_init") || n.starts_with("init")
+}
+
+/// The sub a line opens, if it opens one.
+fn sub_opened(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let head = lower
+        .trim_start_matches("private ")
+        .trim_start_matches("public ");
+    let name = head.strip_prefix("sub ")?;
+    Some(name.split(['(', ':', ' ']).next().unwrap_or("").to_string())
+}
+
+fn ends_sub(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("end sub") || lower.ends_with("end sub")
 }
 
 /// Statements of a script line (split at `:` outside strings).
@@ -510,10 +561,25 @@ pub fn mechs(script: &str) -> Vec<ScriptMech> {
     let consts = consts(script);
     let mut names: Vec<String> = Vec::new();
     let mut found: Vec<(ScriptMech, bool)> = Vec::new();
-    let mut with: Option<usize> = None;
+    let mut with: Vec<Option<usize>> = Vec::new();
+    // Only code that runs at startup: top level or an init sub. A mech
+    // set up in some other sub (an option menu, a test) may never run.
+    let mut sub: Option<String> = None;
     for raw in script.lines() {
-        for st in statements(code(raw)) {
+        let line = code(raw);
+        if let Some(name) = sub_opened(line) {
+            sub = Some(name);
+        }
+        let live = sub.as_deref().is_none_or(is_init_sub);
+        let closes = ends_sub(line);
+        for st in statements(line) {
+            if !live {
+                break;
+            }
             let lower = st.to_ascii_lowercase();
+            if lower.starts_with("if ") || lower.starts_with("sub ") {
+                continue;
+            }
             if let Some(rest) = lower.strip_prefix("set ") {
                 if let Some((var, rhs)) = rest.split_once('=') {
                     let rhs = rhs.trim();
@@ -528,21 +594,21 @@ pub fn mechs(script: &str) -> Vec<ScriptMech> {
                 continue;
             }
             if let Some(var) = lower.strip_prefix("with ") {
-                with = names.iter().position(|n| n == var.trim());
+                with.push(names.iter().rposition(|n| n == var.trim()));
                 continue;
             }
             if lower.starts_with("end with") {
-                with = None;
+                with.pop();
                 continue;
             }
             // `.Prop = v` inside With, or `name.Prop = v`.
             let (idx, member) = if let Some(m) = lower.strip_prefix('.') {
-                match with {
+                match with.last().copied().flatten() {
                     Some(i) => (i, m),
                     None => continue,
                 }
             } else if let Some((var, m)) = lower.split_once('.') {
-                match names.iter().position(|n| n == var.trim()) {
+                match names.iter().rposition(|n| n == var.trim()) {
                     Some(i) => (i, m),
                     None => continue,
                 }
@@ -560,25 +626,39 @@ pub fn mechs(script: &str) -> Vec<ScriptMech> {
                 if !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
                     return None;
                 }
-                Some(
-                    rest.trim_start()
-                        .trim_start_matches('(')
-                        .split(',')
-                        .map(|x| {
-                            eval_terms(x.trim().trim_end_matches(')'), &consts).unwrap_or(0) as i32
-                        })
-                        .collect(),
-                )
+                // Every argument must evaluate, or the switch is left out.
+                rest.trim_start()
+                    .trim_start_matches('(')
+                    .split(',')
+                    .map(|x| eval_terms(x.trim().trim_end_matches(')'), &consts).map(|v| v as i32))
+                    .collect::<Option<Vec<i32>>>()
             };
-            if let Some(v) = call("addsw") {
-                if let [sw, a, b, ..] = v[..] {
-                    m.0.switches.push((sw, a, b, 0));
+            let is_call = |name: &str| {
+                member
+                    .strip_prefix(name)
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_whitespace() || c == '('))
+            };
+            if is_call("addpulseswnew") {
+                if let Some([sw, interval, a, b, ..]) = call("addpulseswnew").as_deref() {
+                    if *sw != 0 {
+                        m.0.switches.push((*sw, *a, *b, *interval));
+                    }
                 }
                 continue;
             }
-            if let Some(v) = call("addpulseswnew") {
-                if let [sw, interval, a, b, ..] = v[..] {
-                    m.0.switches.push((sw, a, b, interval));
+            if is_call("addpulsesw") {
+                if let Some([sw, interval, length, ..]) = call("addpulsesw").as_deref() {
+                    if *sw != 0 && *length > 0 {
+                        m.0.switches.push((*sw, 0, *length - 1, *interval));
+                    }
+                }
+                continue;
+            }
+            if is_call("addsw") {
+                if let Some([sw, a, b, ..]) = call("addsw").as_deref() {
+                    if *sw != 0 {
+                        m.0.switches.push((*sw, *a, *b, 0));
+                    }
                 }
                 continue;
             }
@@ -600,10 +680,13 @@ pub fn mechs(script: &str) -> Vec<ScriptMech> {
                 _ => {}
             }
         }
+        if closes {
+            sub = None;
+        }
     }
     found
         .into_iter()
-        .filter(|(m, started)| *started && m.sol1 > 0 && m.steps > 0)
+        .filter(|(m, started)| *started && m.sol1 != 0 && m.steps > 0)
         .map(|(m, _)| m)
         .collect()
 }
@@ -631,43 +714,70 @@ pub fn handle_mechanics(script: &str) -> Option<i32> {
 /// the switch states the table starts a game from under VPX: balls in the
 /// trough, a T-rex at rest, a coin door closed, a switch wired backwards.
 pub fn init_switches(script: &str) -> (Vec<i32>, Vec<i32>) {
+    let consts = consts(script);
     let (mut on, mut off) = (Vec::new(), Vec::new());
     let mut in_init = false;
+    // Inside If blocks (`If CabinetMode Then`) and With blocks that aren't
+    // Controller, assignments may not run or aren't switches.
+    let (mut if_depth, mut with_stack): (usize, Vec<bool>) = (0, Vec::new());
     for raw in script.lines() {
         let line = code(raw);
-        let lower = line.to_ascii_lowercase();
-        let head = lower
-            .trim_start_matches("private ")
-            .trim_start_matches("public ");
-        if let Some(name) = head.strip_prefix("sub ") {
-            let name = name.split(['(', ':', ' ']).next().unwrap_or("");
-            in_init = name.contains("init");
+        if let Some(name) = sub_opened(line) {
+            in_init = is_init_sub(&name);
+            if_depth = 0;
+            with_stack.clear();
         }
         if !in_init {
             continue;
         }
         for st in statements(line) {
             let l = st.to_ascii_lowercase();
-            let Some(at) = l.find(".switch(") else {
+            if l.starts_with("if ") {
+                // A one-line If runs only sometimes; a block If opens a level.
+                if l.ends_with(" then") {
+                    if_depth += 1;
+                }
+                continue;
+            }
+            if l.starts_with("end if") {
+                if_depth = if_depth.saturating_sub(1);
+                continue;
+            }
+            if let Some(obj) = l.strip_prefix("with ") {
+                with_stack.push(obj.trim() == "controller");
+                continue;
+            }
+            if l.starts_with("end with") {
+                with_stack.pop();
+                continue;
+            }
+            if if_depth > 0 {
+                continue;
+            }
+            let target = if let Some(r) = l.strip_prefix("controller.switch(") {
+                r
+            } else if let Some(r) = l.strip_prefix(".switch(") {
+                if with_stack.last() != Some(&true) {
+                    continue;
+                }
+                r
+            } else {
                 continue;
             };
-            let rest = &l[at + ".switch(".len()..];
-            let Some((n, rest)) = rest.split_once(')') else {
+            let Some((n, rest)) = target.split_once(')') else {
                 continue;
             };
-            let Ok(n) = n.trim().parse::<i32>() else {
+            let n = n.trim();
+            let Some(n) = n.parse::<i32>().ok().or_else(|| consts.get(n).copied()) else {
                 continue;
             };
             let Some(v) = rest.trim_start().strip_prefix('=') else {
                 continue;
             };
-            let v = v.trim();
-            let state = if v == "1" || v == "true" {
-                true
-            } else if v == "0" || v == "false" {
-                false
-            } else {
-                continue;
+            let state = match v.trim() {
+                "1" | "true" | "-1" => true,
+                "0" | "false" => false,
+                _ => continue,
             };
             on.retain(|&x| x != n);
             off.retain(|&x| x != n);
@@ -677,7 +787,7 @@ pub fn init_switches(script: &str) -> (Vec<i32>, Vec<i32>) {
                 off.push(n);
             }
         }
-        if lower.starts_with("end sub") || lower.ends_with("end sub") {
+        if ends_sub(line) {
             in_init = false;
         }
     }
@@ -690,12 +800,7 @@ pub fn init_switches(script: &str) -> (Vec<i32>, Vec<i32>) {
 pub fn start_switches(script: &str) -> Vec<i32> {
     let mut out = trough_switches(script);
     let (on, off) = init_switches(script);
-    for sw in on {
-        if !out.contains(&sw) {
-            out.push(sw);
-        }
-    }
-    for sw in mech_rest_switches(script) {
+    for sw in mech_rest_switches(script).into_iter().chain(on) {
         if !out.contains(&sw) {
             out.push(sw);
         }
@@ -711,6 +816,23 @@ pub fn start_switches(script: &str) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mech_scope_expressions_and_init_conditions() {
+        let c = HashMap::from([("csteps".to_string(), 100)]);
+        assert_eq!(eval_terms("cSteps-1", &c), Some(99));
+        assert_eq!(eval_terms("2*111 + &H10", &c), Some(238));
+        assert_eq!(eval_terms("-5", &c), Some(-5));
+        assert_eq!(eval_terms("foo", &c), None);
+        let s = "Sub Options_Menu\n Set mX = New cvpmMech\n mX.Sol1 = 3 : mX.Steps = 9 : mX.Start\nEnd Sub\n\
+                 Set mY = New cvpmMech\nWith mY\n .Sol1 = -4\n With Controller\n End With\n .Steps = 2*5\n .AddSw 7, 0, 1\n .AddSw 8, bogus, 3\n .AddPulseSw 9, 50, 3\n .Start\nEnd With\n";
+        let m = mechs(s);
+        assert_eq!(m.len(), 1, "a mech in a non-startup sub doesn't count");
+        assert_eq!((m[0].sol1, m[0].steps), (-4, 10));
+        assert_eq!(m[0].switches, vec![(7, 0, 1, 0), (9, 0, 2, 50)]);
+        let t = "Sub Table1_Init\n If CabinetMode Then Controller.Switch(22)=1\n If x Then\n  Controller.Switch(23) = 1\n End If\n Controller.Switch(24) = 1\n bsT.Switch(25) = 1\nEnd Sub\nSub EnterInitials\n Controller.Switch(24) = 0\nEnd Sub\n";
+        assert_eq!(init_switches(t), (vec![24], vec![]));
+    }
 
     #[test]
     fn warrior_bug_mech() {

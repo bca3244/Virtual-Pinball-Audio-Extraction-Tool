@@ -659,6 +659,7 @@ pub fn run(
     let mut music: Option<f64> = None;
     let mut no_music = false;
     let mut dips_set = false;
+    let mut mechs_set = false;
     let (mut shown, mut last_text) = (0, String::new());
     let mut loud: Option<capture::Loudness> = None;
     // Switch presses, each one closed at the first look at or after its
@@ -697,7 +698,13 @@ pub fn run(
                     println!("DIP switches: {dips:?}");
                 }
             }
+            dips_set = true;
+        }
+        // Once the machine runs: PinMAME only starts a mech's timer then.
+        if !mechs_set && !mechs.is_empty() && unsafe { is_running() } == 1 {
+            mechs_set = true;
             if let Some(set_mech) = set_mech {
+                let mut any = false;
                 for (i, m) in mechs.iter().enumerate() {
                     let mut c = MechConfig {
                         mtype: m.mtype,
@@ -710,7 +717,12 @@ pub fn run(
                         ret: m.ret,
                         sw: [MechSwitchConfig::default(); PINMAME_MAX_MECHSW],
                     };
-                    for (slot, &(sw, a, b, p)) in c.sw.iter_mut().zip(&m.switches) {
+                    // PinMAME's list ends at the first switch 0: room for 19.
+                    for (slot, &(sw, a, b, p)) in
+                        c.sw.iter_mut()
+                            .take(PINMAME_MAX_MECHSW - 1)
+                            .zip(m.switches.iter().filter(|s| s.0 != 0))
+                    {
                         *slot = MechSwitchConfig {
                             sw_no: sw,
                             start_pos: a,
@@ -720,9 +732,13 @@ pub fn run(
                     }
                     let status = unsafe { set_mech(i as c_int + 1, &c) };
                     println!("mech {}: {} (status {status})", i + 1, m.to_arg());
+                    any |= status == 0;
+                }
+                if !any && debug().mechanics.is_none() {
+                    // None taken: PinMAME's own mechanics, as before.
+                    unsafe { set_handle_mechanics(1) };
                 }
             }
-            dips_set = true;
         }
         if !balls_in && clock.elapsed().as_secs_f64() > 2.0 && now() > 2.0 {
             for &sw in trough {
