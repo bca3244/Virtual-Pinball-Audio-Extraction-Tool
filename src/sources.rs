@@ -504,7 +504,20 @@ fn candidates(t: &Table) -> Vec<Candidate> {
     }
 
     // 4. PuP pack music.
-    if let Some(pup) = t.popper_dir.and_then(|p| child_ci(p, "PUPVideos")) {
+    // Popper's own PUPVideos, and the usual one beside Visual Pinball.
+    let mut pups: Vec<PathBuf> = t
+        .popper_dir
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(
+            t.vpx_dirs
+                .iter()
+                .filter_map(|d| d.parent().map(|p| p.join("PinUPSystem"))),
+        )
+        .filter_map(|p| child_ci(&p, "PUPVideos"))
+        .collect();
+    pups.dedup();
+    for pup in pups {
         let mut packs: Vec<String> = refs.pup_names.clone();
         packs.extend(t.rom.map(str::to_string));
         if let Some(stem) = t.table.file_stem() {
@@ -584,6 +597,7 @@ fn literals(s: &str) -> Vec<(usize, String)> {
 
 fn script_refs(script: &str) -> ScriptRefs {
     let mut r = ScriptRefs::default();
+    let mut later: Vec<String> = Vec::new();
     for raw in script.lines() {
         for stmt in vpx::statements(vpx::code(raw)) {
             let lower = stmt.to_ascii_lowercase();
@@ -592,6 +606,20 @@ fn script_refs(script: &str) -> ScriptRefs {
                     let lit = lit.trim().to_string();
                     if !lit.is_empty() && !r.music.contains(&lit) {
                         r.music.push(lit);
+                    }
+                }
+            } else if lower.contains("music") || lower.contains("song") {
+                // A music folder or song list built up first
+                // (`MusicDirectory = GetMusicFolder & "\Blood Machines OST\"`).
+                for (_, lit) in literals(stmt) {
+                    let lit = lit.trim();
+                    let named = lit.split(['\\', '/']).any(|p| !p.is_empty());
+                    let folder = lit.ends_with(['\\', '/']);
+                    let file = Path::new(lit)
+                        .extension()
+                        .is_some_and(|e| AUDIO_EXT.iter().any(|a| e.eq_ignore_ascii_case(a)));
+                    if named && (folder || file) && !later.iter().any(|l| l == lit) {
+                        later.push(lit.to_string());
                     }
                 }
             }
@@ -622,6 +650,11 @@ fn script_refs(script: &str) -> ScriptRefs {
             }
         }
     }
+    for l in later {
+        if !r.music.contains(&l) {
+            r.music.push(l);
+        }
+    }
     r
 }
 
@@ -633,9 +666,40 @@ fn altsound_dirs(t: &Table, rom: &str) -> Vec<PathBuf> {
         .iter()
         .map(|d| d.join("VPinMAME"))
         .chain(std::iter::once(table_dir.join("pinmame")));
+    // The package may be named after another revision of the ROM (its
+    // parent set: lah_112 for lah_113).
+    let family = rom
+        .split_once('_')
+        .map(|(f, _)| format!("{}_", f.to_ascii_lowercase()))
+        .filter(|f| f.len() >= 3);
     for b in bases {
-        if let Some(d) = child_ci(&b, "altsound").and_then(|a| child_ci(&a, rom)) {
-            if d.is_dir() && !out.contains(&d) {
+        let Some(alt) = child_ci(&b, "altsound") else {
+            continue;
+        };
+        if let Some(d) = child_ci(&alt, rom).filter(|d| d.is_dir()) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+            continue;
+        }
+        let Some(family) = &family else { continue };
+        let Ok(rd) = std::fs::read_dir(&alt) else {
+            continue;
+        };
+        let mut kin: Vec<PathBuf> = rd
+            .flatten()
+            .filter(|e| {
+                e.path().is_dir()
+                    && e.file_name()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with(family.as_str())
+            })
+            .map(|e| e.path())
+            .collect();
+        kin.sort();
+        for d in kin.into_iter().rev() {
+            if !out.contains(&d) {
                 out.push(d);
             }
         }
@@ -704,11 +768,21 @@ fn altsound_music(dir: &Path) -> Vec<PathBuf> {
 /// song), up to two levels down.
 fn pup_music(pack: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    // audiobg/audioattract: the background and attract playlists of
+    // many packs (audiocallouts and the like are speech).
     let is_music = |n: &str| {
         let n = n.to_ascii_lowercase();
-        ["music", "bgm", "song", "soundtrack"]
-            .iter()
-            .any(|w| n.contains(w))
+        [
+            "music",
+            "bgm",
+            "song",
+            "soundtrack",
+            "audiobg",
+            "attract",
+            "background",
+        ]
+        .iter()
+        .any(|w| n.contains(w))
     };
     let Ok(rd) = std::fs::read_dir(pack) else {
         return out;
@@ -1023,6 +1097,16 @@ End Sub
         assert_eq!(r.music, vec!["MyTable\\attract.mp3", "MyTable\\", ".mp3"]);
         assert_eq!(r.looped, vec!["bgloop", "song2"]);
         assert_eq!(r.pup_names, vec!["mytable"]);
+
+        let bm =
+            "Dim MusicDirectory : MusicDirectory = GetMusicFolder & \"\\Blood Machines OST\\\"\n\
+                  Songs(1) = \"Carpenter Brut - 01 Intro.mp3\"\n\
+                  x = \"\\\" & MusicDirectory";
+        let r = script_refs(bm);
+        assert_eq!(
+            r.music,
+            vec!["\\Blood Machines OST\\", "Carpenter Brut - 01 Intro.mp3"]
+        );
     }
 
     #[test]
@@ -1040,6 +1124,46 @@ End Sub
         assert_eq!(music_bonus("Main_Theme"), 10);
         assert_eq!(music_bonus("track1"), 5);
         assert_eq!(music_bonus("knocker"), 0);
+    }
+
+    #[test]
+    fn altsound_of_another_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let vpx = dir.path().join("VisualPinball");
+        let alt = vpx.join("VPinMAME").join("altsound");
+        std::fs::create_dir_all(alt.join("lah_112")).unwrap();
+        std::fs::create_dir_all(alt.join("lahx")).unwrap();
+        let table = vpx.join("Tables").join("lah.vpx");
+        let dirs = vec![vpx.clone()];
+        let t = Table {
+            table: &table,
+            script: None,
+            rom: Some("lah_113"),
+            has_rom: true,
+            rom_only: true,
+            vpx_dirs: &dirs,
+            popper_dir: None,
+        };
+        assert_eq!(altsound_dirs(&t, "lah_113"), vec![alt.join("lah_112")]);
+        std::fs::create_dir_all(alt.join("lah_113")).unwrap();
+        assert_eq!(altsound_dirs(&t, "lah_113"), vec![alt.join("lah_113")]);
+    }
+
+    #[test]
+    fn pup_music_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        for (f, n) in [
+            ("audiobg", "a.mp3"),
+            ("audioattract", "b.mp3"),
+            ("audiocallouts", "c.mp3"),
+            ("Music", "d.mp3"),
+        ] {
+            std::fs::create_dir_all(dir.path().join(f)).unwrap();
+            std::fs::write(dir.path().join(f).join(n), b"x").unwrap();
+        }
+        let mut m: Vec<String> = pup_music(dir.path()).iter().map(|p| file_name(p)).collect();
+        m.sort();
+        assert_eq!(m, ["a.mp3", "b.mp3", "d.mp3"]);
     }
 
     #[test]
