@@ -311,6 +311,8 @@ pub struct WorkerArgs {
     pub dips: Vec<(i32, i64)>,
     /// The machine's coin and Start switches, from its core script.
     pub cabinet: pinmame::CabinetSwitches,
+    /// Extra switch presses (diagnostics).
+    pub presses: Vec<pinmame::Press>,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -325,6 +327,10 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
     pinmame::set_debug(a.debug);
     pinmame::set_dips(a.dips.clone());
     pinmame::set_cabinet_switches(a.cabinet);
+    if a.cabinet.coin.is_some() || a.cabinet.start.is_some() {
+        println!("cabinet switches: {:?}", a.cabinet);
+    }
+    pinmame::set_presses(a.presses.clone());
     let run = match pinmame::run(
         &a.dll,
         &a.scratch,
@@ -818,6 +824,19 @@ impl Runner<'_> {
             );
         } else {
             log::debug!("{}: start switches {trough:?}", job.rom);
+        }
+        if cabinet.coin.is_some() || cabinet.start.is_some() {
+            log::debug!(
+                "{}: coin switch {:?}, Start switch {:?} (from the core script)",
+                job.rom,
+                cabinet.coin,
+                cabinet.start
+            );
+        } else if script.as_deref().and_then(vpx::core_script_name).is_some() {
+            log::debug!(
+                "{}: core script not found or names no coin/Start switch",
+                job.rom
+            );
         }
         let mut child = cmd.spawn().context("starting the recording process")?;
         kill_with_us(&child);

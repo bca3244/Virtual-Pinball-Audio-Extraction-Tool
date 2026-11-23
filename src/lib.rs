@@ -64,6 +64,10 @@ struct WorkerCli {
     /// The machine's Start switch, pressed with the Start key.
     #[arg(long, allow_hyphen_values = true)]
     start_switch: Option<i32>,
+    /// Close a switch at a time: sw@seconds[+held seconds, default 0.25]
+    /// (diagnostics; repeatable).
+    #[arg(long = "press", allow_hyphen_values = true)]
+    presses: Vec<String>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -95,6 +99,11 @@ pub fn run_worker_if_requested() {
             coin: w.coin_switch,
             start: w.start_switch,
         },
+        presses: w
+            .presses
+            .iter()
+            .filter_map(|p| pinmame::Press::parse(p))
+            .collect(),
         dips: w
             .dips
             .iter()

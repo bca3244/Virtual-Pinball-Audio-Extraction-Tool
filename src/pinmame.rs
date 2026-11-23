@@ -60,6 +60,37 @@ pub fn set_cabinet_switches(c: CabinetSwitches) {
     let _ = CABINET.set(c);
 }
 
+/// A switch closed at `at` seconds for `held` seconds (diagnostics).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Press {
+    pub switch: i32,
+    pub at: f64,
+    pub held: f64,
+}
+
+impl Press {
+    /// `sw@seconds` or `sw@seconds+held`.
+    pub fn parse(s: &str) -> Option<Press> {
+        let (sw, time) = s.split_once('@')?;
+        let (at, held) = match time.split_once('+') {
+            Some((a, h)) => (a.trim().parse().ok()?, h.trim().parse().ok()?),
+            None => (time.trim().parse().ok()?, capture::PRESS),
+        };
+        Some(Press {
+            switch: sw.trim().parse().ok()?,
+            at,
+            held,
+        })
+    }
+}
+
+static PRESSES: OnceLock<Vec<Press>> = OnceLock::new();
+
+/// Sets extra switch presses; call before [`run`].
+pub fn set_presses(p: Vec<Press>) {
+    let _ = PRESSES.set(p);
+}
+
 /// Sets the diagnostic variations; call before [`run`].
 pub fn set_debug(d: Debug) {
     let _ = DEBUG.set(d);
@@ -551,6 +582,8 @@ pub fn run(
     let mut loud: Option<capture::Loudness> = None;
     let cabinet = CABINET.get().copied().unwrap_or_default();
     let (mut coin_down, mut start_down) = (false, false);
+    let presses = PRESSES.get().cloned().unwrap_or_default();
+    let mut press_down = vec![false; presses.len()];
     while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
         // machine is up: setting switches right after PinmameRun crashes it.
@@ -580,6 +613,9 @@ pub fn run(
                 let down = timeline.key_down(capture::KEY_NUMBER_5, t);
                 if down != coin_down {
                     unsafe { set_switch(sw, down as c_int) };
+                    if debug().show_display {
+                        println!("[{t:5.1} s] coin switch {sw} {}", down as u8);
+                    }
                     coin_down = down;
                 }
             }
@@ -587,6 +623,7 @@ pub fn run(
                 let down = timeline.key_down(capture::KEY_NUMBER_1, t);
                 if down != start_down {
                     unsafe { set_switch(sw, down as c_int) };
+                    println!("[{t:5.1} s] Start switch {sw} {}", down as u8);
                     start_down = down;
                     if down {
                         // As the Start key does, in case the keys aren't read.
@@ -599,6 +636,19 @@ pub fn run(
                         );
                     }
                 }
+            }
+        }
+        for (p, was) in presses.iter().zip(press_down.iter_mut()) {
+            let t = now();
+            let down = t >= p.at && t < p.at + p.held;
+            if down != *was {
+                unsafe { set_switch(p.switch, down as c_int) };
+                println!(
+                    "[{t:5.1} s] switch {} {}",
+                    p.switch,
+                    if down { "on" } else { "off" }
+                );
+                *was = down;
             }
         }
         if debug().show_display && shown < 120 {
