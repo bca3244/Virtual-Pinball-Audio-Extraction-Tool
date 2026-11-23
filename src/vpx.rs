@@ -50,6 +50,21 @@ pub fn script_from_game_data(bytes: &[u8]) -> String {
     String::new()
 }
 
+/// A script line without its comment (`'` outside a string, to the end),
+/// trimmed: `Controller.Switch(74) = 1 'Controller.Switch(55) = 1` is
+/// switch 74 only.
+fn code(raw: &str) -> &str {
+    let mut in_str = false;
+    for (i, c) in raw.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '\'' if !in_str => return raw[..i].trim(),
+            _ => {}
+        }
+    }
+    raw.trim()
+}
+
 fn is_comment(line: &str) -> bool {
     line.starts_with('\'') || starts_ci(line, "rem ")
 }
@@ -68,7 +83,7 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
 /// convention nearly every ROM table follows).
 pub fn rom_name(script: &str) -> Option<String> {
     for raw in script.lines() {
-        let line = raw.trim();
+        let line = code(raw);
         if is_comment(line) {
             continue;
         }
@@ -98,7 +113,7 @@ pub fn rom_name(script: &str) -> Option<String> {
 fn consts(script: &str) -> HashMap<String, i32> {
     let mut out = HashMap::new();
     for raw in script.lines() {
-        let line = raw.trim();
+        let line = code(raw);
         let Some(rest) = after_ci(line, "const ").filter(|_| starts_ci(line, "const ")) else {
             continue;
         };
@@ -152,7 +167,7 @@ fn eval_sum(expr: &str) -> Option<i64> {
 pub fn dip_switches(script: &str) -> Vec<(i32, i64)> {
     let mut out: Vec<(i32, i64)> = Vec::new();
     for raw in script.lines() {
-        let line = raw.trim();
+        let line = code(raw);
         if is_comment(line) {
             continue;
         }
@@ -230,7 +245,7 @@ pub fn trough_switches(script: &str) -> Vec<i32> {
     let mut found = Vec::new();
     let mut in_trough_with = false;
     for raw in script.lines() {
-        let line = raw.trim();
+        let line = code(raw);
         if starts_ci(line, "with ") {
             in_trough_with = contains_ci(line, "trough");
         } else if starts_ci(line, "end with") {
@@ -281,7 +296,7 @@ pub fn mech_rest_switches(script: &str) -> Vec<i32> {
     let consts = consts(script);
     let mut out = Vec::new();
     for raw in script.lines() {
-        let line = raw.trim();
+        let line = code(raw);
         if is_comment(line) {
             continue;
         }
@@ -353,6 +368,14 @@ pub fn start_switches(script: &str) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commented_switches_are_ignored() {
+        let s = "Sub sw74_Hit: Controller.Switch(74) = 1 : bsTrough.AddBall Me ' Controller.Switch(55) = 1\n\
+                 bsTrough.InitSw 0, 74, 0, 0, 0, 0, 0, 0 'bsTrough.InitSw 0, 55\n";
+        assert_eq!(trough_switches(s), vec![74]);
+        assert_eq!(code("x = \"it's\" ' note"), "x = \"it's\"");
+    }
 
     #[test]
     fn core_script_and_its_switches() {
