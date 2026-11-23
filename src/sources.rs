@@ -36,6 +36,11 @@ const MAX_EMBEDDED: u64 = 256 << 20;
 const TRUSTED: i32 = 60;
 /// An untrusted candidate must decode to at least this many seconds.
 const UNTRUSTED_MIN_SECONDS: f64 = 20.0;
+/// A looped embedded sound shorter than this is an effect loop.
+const LOOP_MIN_SECONDS: f64 = 12.0;
+/// WAV files bigger than this are read through ffmpeg (which stops after
+/// [`DECODE_SECONDS`]) rather than whole.
+const MAX_WAV_READ: u64 = 64 << 20;
 
 /// What a table has to look in.
 pub struct Table<'a> {
@@ -46,6 +51,9 @@ pub struct Table<'a> {
     /// Whether the ROM itself can be recorded: then only trusted sources
     /// are worth taking over its recording.
     pub has_rom: bool,
+    /// Only sources that belong to the ROM itself (altsound, a PuP pack
+    /// named after it): the music is then kept as the ROM's.
+    pub rom_only: bool,
     pub vpx_dirs: &'a [PathBuf],
     pub popper_dir: Option<&'a Path>,
 }
@@ -54,6 +62,14 @@ pub struct Table<'a> {
 pub struct Found {
     pub pcm: wav::Pcm,
     pub what: String,
+}
+
+/// What a search came to.
+pub struct Search {
+    pub found: Option<Found>,
+    /// A candidate couldn't be read (no ffmpeg, a broken file): "nothing
+    /// found" isn't a verdict then.
+    pub unread: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +91,9 @@ struct Candidate {
     /// Bytes: a stand-in for length when ordering equal scores.
     size: u64,
     what: String,
+    /// It belongs to the ROM (altsound, a PuP pack named after it), not
+    /// to one table.
+    rom_own: bool,
 }
 
 /// The table's music, if any of its sources has some.
@@ -84,27 +103,31 @@ pub fn find(
     seconds: u32,
     tmp: &Path,
     cancelled: &dyn Fn() -> bool,
-) -> Option<Found> {
-    let mut cands = candidates(t);
-    if t.has_rom {
-        cands.retain(|c| c.score >= TRUSTED);
-    }
+) -> Search {
+    let mut search = Search {
+        found: None,
+        unread: false,
+    };
+    let cands = usable(t);
     if cands.is_empty() {
         log::debug!("{}: no music files found with the table", t.table.display());
-        return None;
+        return search;
     }
     let _ = std::fs::create_dir_all(tmp);
-    for c in cands.iter().take(MAX_TRIES) {
-        if cancelled() {
-            return None;
+    let mut tries = 0;
+    for c in &cands {
+        if cancelled() || tries >= MAX_TRIES {
+            break;
         }
         let pcm = match decode(t.table, &c.src, ffmpeg, tmp, cancelled) {
             Ok(p) => p,
             Err(e) => {
                 log::info!("  {}: couldn't read it: {e:#}", c.what);
+                search.unread = true;
                 continue;
             }
         };
+        tries += 1;
         let frames = pcm.samples.len() as f64 / pcm.channels.max(1) as f64;
         let len = frames / pcm.rate.max(1) as f64;
         if c.score < TRUSTED && len < UNTRUSTED_MIN_SECONDS {
@@ -130,7 +153,7 @@ pub fn find(
             log::info!("  {}: only {loud:.1} s of sound, passed over", c.what);
             continue;
         }
-        return Some(Found {
+        search.found = Some(Found {
             pcm: wav::Pcm {
                 samples: cut,
                 channels: pcm.channels,
@@ -138,29 +161,103 @@ pub fn find(
             },
             what: c.what.clone(),
         });
+        break;
     }
-    None
+    search
+}
+
+/// The candidates worth trying for this table, best first.
+fn usable(t: &Table) -> Vec<Candidate> {
+    let mut cands = candidates(t);
+    if t.has_rom {
+        cands.retain(|c| c.score >= TRUSTED);
+    }
+    if t.rom_only {
+        cands.retain(|c| c.rom_own);
+    }
+    cands
+}
+
+/// Changes when the table's music sources do (a file added or changed):
+/// for "nothing found" verdicts.
+pub fn fingerprint(t: &Table) -> String {
+    use sha1::{Digest, Sha1};
+    let mut text = String::new();
+    for c in usable(t) {
+        text.push_str(&format!(";{:?}:{}", c.src, c.size));
+    }
+    Sha1::digest(text.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---- finding candidates -----------------------------------------------------
 
+/// A name's words, lower case: split at anything not a letter or digit,
+/// at camelCase humps and between letters and digits.
+fn words(name: &str) -> Vec<String> {
+    let name = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    let name = name.rsplit_once('.').map_or(name, |(stem, ext)| {
+        if ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+            stem
+        } else {
+            name
+        }
+    });
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for c in name.chars() {
+        let split = match prev {
+            _ if !c.is_alphanumeric() => true,
+            Some(p) => {
+                (p.is_lowercase() && c.is_uppercase()) || (p.is_alphabetic() != c.is_alphabetic())
+            }
+            None => false,
+        };
+        if split && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if c.is_alphanumeric() {
+            cur.extend(c.to_lowercase());
+        }
+        prev = Some(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether any word of `name` is one of `list` (a list entry ending in
+/// `*` matches words starting with it).
+fn has_word(name: &str, list: &[&str]) -> bool {
+    words(name).iter().any(|w| {
+        list.iter().any(|l| match l.strip_suffix('*') {
+            Some(prefix) => w.starts_with(prefix),
+            None => w == l,
+        })
+    })
+}
+
 /// Words in a name that say music (and how sure that is).
 fn music_bonus(name: &str) -> i32 {
-    let n = name.to_ascii_lowercase();
     let strong = [
-        "attract",
-        "theme",
+        "attract*",
+        "theme*",
         "bgm",
-        "soundtrack",
-        "song",
-        "music",
-        "intro",
-        "title",
+        "soundtrack*",
+        "song*",
+        "music*",
+        "intro*",
+        "title*",
     ];
-    let weak = ["main", "menu", "track", "loop", "background", "bg_", "mus_"];
-    if strong.iter().any(|w| n.contains(w)) {
+    let weak = ["main", "menu", "track*", "loop*", "background", "bg", "mus"];
+    if has_word(name, &strong) {
         10
-    } else if weak.iter().any(|w| n.contains(w)) {
+    } else if has_word(name, &weak) {
         5
     } else {
         0
@@ -169,16 +266,77 @@ fn music_bonus(name: &str) -> i32 {
 
 /// Names of mechanical sounds and effects (some loop, and are long).
 fn is_effect(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    let n = n.rsplit(['\\', '/']).next().unwrap_or(&n);
-    [
-        "fx_", "sfx", "roll", "motor", "hum", "buzz", "flipper", "bumper", "sling", "drain",
-        "knock", "rubber", "metal", "plunger", "spinner", "kicker", "coil", "relay", "gate",
-        "target", "ramp", "click", "wire", "solenoid", "ballrel", "trough", "diverter", "post",
-        "hit", "bell", "chime", "tilt", "nudge",
-    ]
-    .iter()
-    .any(|w| n.contains(w))
+    has_word(
+        name,
+        &[
+            "fx",
+            "sfx",
+            "roll*",
+            "motor*",
+            "hum",
+            "buzz*",
+            "flipper*",
+            "bumper*",
+            "sling*",
+            "drain*",
+            "knock*",
+            "rubber*",
+            "metal*",
+            "plunger*",
+            "spinner*",
+            "kicker*",
+            "coil*",
+            "relay*",
+            "gate*",
+            "target*",
+            "ramp*",
+            "click*",
+            "wire*",
+            "solenoid*",
+            "ballrel*",
+            "trough*",
+            "diverter*",
+            "post*",
+            "hit*",
+            "bell*",
+            "chime*",
+            "tilt*",
+            "nudge*",
+            "ball*",
+            "flip*",
+            "switch*",
+            "saucer*",
+            "scoop*",
+            "popper*",
+            "lane*",
+            "magnet*",
+        ],
+    )
+}
+
+/// Looping sounds that set a mood but aren't music.
+fn is_ambience(name: &str) -> bool {
+    has_word(
+        name,
+        &[
+            "ambient*",
+            "ambience*",
+            "wind*",
+            "rain*",
+            "crowd*",
+            "engine*",
+            "fan*",
+            "siren*",
+            "shaker*",
+            "noise*",
+            "storm*",
+            "thunder*",
+            "water*",
+            "fire*",
+            "rumble*",
+            "hiss*",
+        ],
+    )
 }
 
 fn is_audio(p: &Path) -> bool {
@@ -203,6 +361,12 @@ fn audio_files(dir: &Path, depth: u32) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn size(p: &Path) -> u64 {
@@ -250,13 +414,14 @@ fn candidates(t: &Table) -> Vec<Candidate> {
     // 1. altsound
     if let Some(rom) = t.rom {
         for dir in altsound_dirs(t, rom) {
-            for f in altsound_music(&dir) {
+            for (i, f) in altsound_music(&dir).into_iter().enumerate() {
                 let s = size(&f);
                 push(Candidate {
                     what: format!("altsound music {}", f.display()),
                     src: Src::File(f),
-                    score: 95,
+                    score: 95 + if i < 3 { 3 - i as i32 } else { 0 },
                     size: s,
+                    rom_own: true,
                 });
             }
         }
@@ -272,7 +437,13 @@ fn candidates(t: &Table) -> Vec<Candidate> {
         .collect();
     for (i, lit) in refs.music.iter().enumerate() {
         for base in &music_bases {
-            let Some(p) = resolve(base, lit) else {
+            // A name built in the script ("Table\track" & n & ".mp3"):
+            // the folder its literal part names.
+            let p = resolve(base, lit).or_else(|| {
+                let (dir, _) = lit.rsplit_once(['\\', '/'])?;
+                resolve(base, dir).filter(|d| d.is_dir())
+            });
+            let Some(p) = p else {
                 continue;
             };
             let files = if p.is_dir() {
@@ -282,8 +453,11 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             } else {
                 Vec::new()
             };
+            if files.is_empty() {
+                continue;
+            }
             for f in files {
-                let name = f.to_string_lossy().into_owned();
+                let name = file_name(&f);
                 let s = size(&f);
                 // The first ones the script plays are usually the attract
                 // or main theme.
@@ -293,6 +467,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     score: 100 + music_bonus(&name) + order - if is_effect(&name) { 40 } else { 0 },
                     src: Src::File(f),
                     size: s,
+                    rom_own: false,
                 });
             }
             break;
@@ -305,7 +480,8 @@ fn candidates(t: &Table) -> Vec<Candidate> {
         let looped = refs.looped.iter().any(|n| n.eq_ignore_ascii_case(&e.name));
         let bonus = music_bonus(&e.name);
         let effect = is_effect(&e.name);
-        let score = if looped && !effect {
+        let ambience = is_ambience(&e.name) && bonus == 0;
+        let score = if looped && !effect && !ambience && e.seconds >= LOOP_MIN_SECONDS {
             90 + bonus
         } else if bonus >= 10 && !effect {
             70
@@ -323,6 +499,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             },
             score,
             size: e.size,
+            rom_own: false,
         });
     }
 
@@ -337,11 +514,9 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             let Some(dir) = child_ci(&pup, &pack).filter(|d| d.is_dir()) else {
                 continue;
             };
+            let rom_own = t.rom.is_some_and(|r| r.eq_ignore_ascii_case(&pack));
+            // A music folder says what's in it: no name filter.
             for f in pup_music(&dir) {
-                let name = f.to_string_lossy().into_owned();
-                if is_effect(&name) {
-                    continue;
-                }
                 let s = size(&f);
                 push(Candidate {
                     what: format!("PuP pack music {}", f.display()),
@@ -354,6 +529,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                         ),
                     src: Src::File(f),
                     size: s,
+                    rom_own,
                 });
             }
         }
@@ -362,7 +538,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
     // 6. A music folder beside the table that the script doesn't name.
     if let Some(dir) = child_ci(table_dir, "music") {
         for f in audio_files(&dir, 1) {
-            let name = f.to_string_lossy().into_owned();
+            let name = file_name(&f);
             if is_effect(&name) {
                 continue;
             }
@@ -372,6 +548,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                 score: 30 + music_bonus(&name),
                 src: Src::File(f),
                 size: s,
+                rom_own: false,
             });
         }
     }
@@ -466,11 +643,12 @@ fn altsound_dirs(t: &Table, rom: &str) -> Vec<PathBuf> {
     out
 }
 
-/// The music of an altsound package: CSV rows in GROUP 1 (altsound.csv,
-/// g-sound.csv), else files in a `music` folder.
+/// The music of an altsound package: `TYPE` MUSIC rows (g-sound.csv),
+/// else `CHANNEL` 0 rows (the music channel of altsound.csv; looping ones
+/// first), else files in a `music` folder.
 fn altsound_music(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for csv in ["altsound.csv", "g-sound.csv"] {
+    let mut out: Vec<(bool, PathBuf)> = Vec::new();
+    for csv in ["g-sound.csv", "altsound.csv"] {
         let Some(text) = child_ci(dir, csv).and_then(|p| std::fs::read(p).ok()) else {
             continue;
         };
@@ -481,23 +659,39 @@ fn altsound_music(dir: &Path) -> Vec<PathBuf> {
             .split(',')
             .map(|c| c.trim().trim_matches('"').to_ascii_uppercase())
             .collect();
-        let (Some(fname), Some(group)) = (
-            cols.iter().position(|c| c == "FNAME"),
-            cols.iter().position(|c| c == "GROUP"),
-        ) else {
+        let col = |n: &str| cols.iter().position(|c| c == n);
+        let Some(fname) = col("FNAME") else { continue };
+        let (kind, looped) = (col("TYPE"), col("LOOP"));
+        let channel = col("CHANNEL");
+        if kind.is_none() && channel.is_none() {
             continue;
-        };
+        }
         for l in lines {
             let f: Vec<&str> = l.split(',').map(|c| c.trim().trim_matches('"')).collect();
-            if f.get(group).is_some_and(|g| g.trim() == "1") {
-                if let Some(p) = f.get(fname).and_then(|n| resolve(dir, n)) {
-                    if p.is_file() && !out.contains(&p) {
-                        out.push(p);
-                    }
+            let music = match (kind, channel) {
+                (Some(k), _) => f.get(k).is_some_and(|v| v.eq_ignore_ascii_case("music")),
+                (None, Some(c)) => f.get(c).is_some_and(|v| v.trim() == "0"),
+                _ => false,
+            };
+            if !music {
+                continue;
+            }
+            let loops = looped
+                .and_then(|i| f.get(i))
+                .is_some_and(|v| v.trim() == "100");
+            if let Some(p) = f.get(fname).and_then(|n| resolve(dir, n)) {
+                if p.is_file() && !out.iter().any(|(_, q)| *q == p) {
+                    out.push((loops, p));
                 }
             }
         }
+        if !out.is_empty() {
+            break;
+        }
     }
+    // Stable: looping music first, the CSV's order otherwise.
+    out.sort_by_key(|(loops, _)| !loops);
+    let mut out: Vec<PathBuf> = out.into_iter().map(|(_, p)| p).collect();
     if out.is_empty() {
         if let Some(m) = child_ci(dir, "music") {
             out = audio_files(&m, 2);
@@ -568,10 +762,16 @@ fn read_str(r: &mut impl Read) -> Result<String> {
     Ok(b.iter().map(|&c| c as char).collect())
 }
 
+/// The extension of a sound's path when it names a stored file (1 to 5
+/// letters or digits, not wav): `Mr. Big theme` has none.
 fn ext_of(path: &str) -> Option<String> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     let (_, ext) = file.rsplit_once('.')?;
-    (!ext.is_empty() && !ext.eq_ignore_ascii_case("wav")).then(|| ext.to_ascii_lowercase())
+    (!ext.is_empty()
+        && ext.len() <= 5
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && !ext.eq_ignore_ascii_case("wav"))
+    .then(|| ext.to_ascii_lowercase())
 }
 
 struct Header {
@@ -616,6 +816,19 @@ fn read_header(r: &mut impl Read) -> Result<Header> {
     })
 }
 
+/// [`read_header`], checked against the stream's length (so a header
+/// read the wrong way, or a broken one, never allocates its data length).
+fn read_checked<R: Read + std::io::Seek>(r: &mut R) -> Result<Header> {
+    let h = read_header(r)?;
+    let at = r.stream_position()?;
+    let end = r.seek(std::io::SeekFrom::End(0))?;
+    r.seek(std::io::SeekFrom::Start(at))?;
+    if h.data_len > end.saturating_sub(at) {
+        bail!("sound data of {} bytes in a stream of {end}", h.data_len);
+    }
+    Ok(h)
+}
+
 fn sound_stream(index: u32) -> String {
     format!("/GameStg/Sound{index}")
 }
@@ -630,7 +843,7 @@ fn embedded_sounds(table: &Path) -> Vec<Embedded> {
         let Ok(mut s) = cf.open_stream(sound_stream(index)) else {
             break;
         };
-        let h = match read_header(&mut s) {
+        let h = match read_checked(&mut s) {
             Ok(h) => h,
             Err(e) => {
                 log::debug!("{} sound {index}: {e:#}", table.display());
@@ -683,9 +896,9 @@ fn decode(
     match src {
         Src::File(p) => {
             let is_wav = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav"));
-            if is_wav {
+            if is_wav && size(p) <= MAX_WAV_READ {
                 if let Ok(pcm) = wav::read(p) {
-                    return Ok(bounded(pcm));
+                    return bounded(pcm);
                 }
             }
             let ff = ffmpeg.context("needs ffmpeg to read it")?;
@@ -696,7 +909,7 @@ fn decode(
             let mut s = cf
                 .open_stream(sound_stream(*index))
                 .with_context(|| format!("no sound {index}"))?;
-            let h = read_header(&mut s)?;
+            let h = read_checked(&mut s)?;
             if !h.name.eq_ignore_ascii_case(name) {
                 bail!("the table changed");
             }
@@ -704,16 +917,16 @@ fn decode(
             s.read_exact(&mut data)?;
             drop(s);
             match (h.fmt, ext) {
-                (Some(f), _) if f.format_tag == 1 && f.bits == 16 && f.channels > 0 => {
+                (Some(f), _) if f.format_tag == 1 && f.bits == 16 => {
                     let samples = data
                         .chunks_exact(2)
                         .map(|c| i16::from_le_bytes([c[0], c[1]]))
                         .collect();
-                    Ok(bounded(wav::Pcm {
+                    bounded(wav::Pcm {
                         samples,
                         channels: f.channels,
                         rate: f.rate,
-                    }))
+                    })
                 }
                 (Some(f), _) => {
                     let ff = ffmpeg.context("needs ffmpeg to read it")?;
@@ -732,10 +945,15 @@ fn decode(
     }
 }
 
-fn bounded(mut pcm: wav::Pcm) -> wav::Pcm {
-    let max = DECODE_SECONDS as usize * pcm.rate as usize * pcm.channels.max(1) as usize;
+/// At most [`DECODE_SECONDS`] of it, and only a sane format (a broken
+/// header's rate or channels would overflow the WAV written later).
+fn bounded(mut pcm: wav::Pcm) -> Result<wav::Pcm> {
+    if !(1..=8).contains(&pcm.channels) || !(4000..=192_000).contains(&pcm.rate) {
+        bail!("{} channel(s) at {} Hz", pcm.channels, pcm.rate);
+    }
+    let max = DECODE_SECONDS as usize * pcm.rate as usize * pcm.channels as usize;
     pcm.samples.truncate(max);
-    pcm
+    Ok(pcm)
 }
 
 /// The first [`DECODE_SECONDS`] of `input` as 16-bit stereo 44.1 kHz.
@@ -812,6 +1030,13 @@ End Sub
         assert!(is_effect("fx_ballrolling0"));
         assert!(is_effect("Music\\x\\flipper_up.wav"));
         assert!(!is_effect("Attract Theme"));
+        assert!(!is_effect("Whitesnake - Here I Go Again.mp3"));
+        assert!(!is_effect("Human League"));
+        assert!(is_effect("BallRolling_2"));
+        assert!(is_ambience("WindLoop"));
+        assert_eq!(words("MainTheme02.ogg"), ["main", "theme", "02"]);
+        assert_eq!(ext_of("C:\\x\\Mr. Big theme"), None);
+        assert_eq!(ext_of("song.MP3").as_deref(), Some("mp3"));
         assert_eq!(music_bonus("Main_Theme"), 10);
         assert_eq!(music_bonus("track1"), 5);
         assert_eq!(music_bonus("knocker"), 0);
@@ -833,6 +1058,18 @@ End Sub
         let m = altsound_music(dir.path());
         assert_eq!(m.len(), 1);
         assert!(m[0].ends_with("m1.ogg"));
+
+        let g = tempfile::tempdir().unwrap();
+        std::fs::write(g.path().join("theme.ogg"), b"x").unwrap();
+        std::fs::write(g.path().join("callout.ogg"), b"x").unwrap();
+        std::fs::write(
+            g.path().join("g-sound.csv"),
+            "ID,TYPE,GAIN,DUCKING_PROFILE,FNAME\n0x01,CALLOUT,80,,callout.ogg\n0x02,MUSIC,80,,theme.ogg\n",
+        )
+        .unwrap();
+        let m = altsound_music(g.path());
+        assert_eq!(m.len(), 1);
+        assert!(m[0].ends_with("theme.ogg"));
     }
 
     #[test]
@@ -902,10 +1139,13 @@ End Sub
             script: Some(script),
             rom: None,
             has_rom: false,
+            rom_only: false,
             vpx_dirs: &dirs,
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false).unwrap();
+        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false)
+            .found
+            .unwrap();
         assert!(f.what.contains("script music"), "{}", f.what);
         let secs = f.pcm.samples.len() as f64 / rate as f64;
         assert!((19.0..=20.5).contains(&secs), "{secs}");
@@ -953,20 +1193,28 @@ End Sub
                 .unwrap()
                 .write_all(&sound("Ambient1", &tone))
                 .unwrap();
+            cf.create_stream("/GameStg/Sound2")
+                .unwrap()
+                .write_all(&sound("TableLoop", &tone))
+                .unwrap();
         }
         let e = embedded_sounds(&table);
-        assert_eq!(e.len(), 2);
+        assert_eq!(e.len(), 3);
         assert!((e[1].seconds - 25.0).abs() < 0.1);
-        let script = "Sub Table1_Init\n PlaySound \"ambient1\", -1\nEnd Sub";
+        let script =
+            "Sub Table1_Init\n PlaySound \"ambient1\", -1\n PlaySound \"tableloop\", -1\nEnd Sub";
         let t = Table {
             table: &table,
             script: Some(script),
             rom: None,
             has_rom: true,
+            rom_only: false,
             vpx_dirs: &[],
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false).unwrap();
-        assert!(f.what.contains("Ambient1"), "{}", f.what);
+        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false)
+            .found
+            .unwrap();
+        assert!(f.what.contains("TableLoop"), "{}", f.what);
     }
 }

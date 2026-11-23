@@ -211,14 +211,17 @@ fn run(cli: Cli) -> Result<()> {
             }
             let emus = db.emulators()?;
             drop(db);
-            let Some(dll) =
-                record::find_pinmame(pinmame_dll.as_deref(), &emus, opts.vpx_dir.as_deref())
-            else {
-                bail!(
+            let dll = record::find_pinmame(pinmame_dll.as_deref(), &emus, opts.vpx_dir.as_deref());
+            let roms_to_record = entries
+                .iter()
+                .any(|e| matches!(e.status, record::Status::Todo) && !e.from_table());
+            match &dll {
+                Some(d) => log::info!("libpinmame: {}", d.display()),
+                None if roms_to_record => bail!(
                     "couldn't find libpinmame. VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll; otherwise pass --pinmame-dll <path to libpinmame-*.dll>"
-                );
-            };
-            log::info!("libpinmame: {}", dll.display());
+                ),
+                None => {}
+            }
             let ffmpeg = encode::find_ffmpeg(ffmpeg.as_deref(), Some(&popper_dir));
             match &ffmpeg {
                 Some(f) => log::info!("Encoder: {}", f.display()),

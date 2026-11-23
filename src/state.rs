@@ -145,8 +145,7 @@ const RECORDER_VERSION: u32 = 5;
 const CLIP_VERSION: u32 = 3;
 
 /// The cache name for music taken from a table's own files (no ROM, or a
-/// ROM that gave none): `vpx-<file stem>-<hash>`, the hash over the
-/// table's path, size and date, so an updated table is looked at again.
+/// ROM zip missing): `vpx-<file stem>-<hash of its path>`.
 pub fn table_key(table: &Path) -> String {
     let stem: String = table
         .file_stem()
@@ -162,9 +161,17 @@ pub fn table_key(table: &Path) -> String {
         })
         .take(40)
         .collect();
-    let h = Sha1::digest(format!("{};v{RECORDER_VERSION}", describe(table)).as_bytes());
+    let path = table.to_string_lossy().to_ascii_lowercase();
+    let h = Sha1::digest(path.as_bytes());
     let hex: String = h.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("vpx-{stem}-{hex}")
+}
+
+/// The table file (size and date), what it has to look in, and the
+/// recorder version: a "nothing found" verdict holds while these do.
+pub fn table_fingerprint(table: &Path, sources: &str) -> String {
+    let h = Sha1::digest(format!("{};{sources};v{RECORDER_VERSION}", describe(table)).as_bytes());
+    h.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn fingerprint(zip: &Path, nvram: Option<&Path>) -> String {

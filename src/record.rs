@@ -51,6 +51,8 @@ pub struct Entry {
     /// Set when the music is to come from the table's own files (no ROM,
     /// or no ROM zip): the cache name for it.
     pub source_key: Option<String>,
+    /// Said along with the status (why there's no ROM recording).
+    pub note: Option<String>,
     pub status: Status,
 }
 
@@ -216,6 +218,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             rom_zip: None,
             rom_dirs: Vec::new(),
             source_key: None,
+            note: None,
             status: Status::Todo,
         };
         let Some(media) = emu.media_dir.as_deref() else {
@@ -242,7 +245,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             .or_else(|| script.as_deref().and_then(vpx::rom_name));
         let Some(rom) = entry.rom.clone() else {
             entry.status = Status::NoRom;
-            from_table(&mut entry, cache, opts);
+            from_table(&mut entry, script.as_deref(), cache, opts);
             out.push(entry);
             continue;
         };
@@ -253,8 +256,10 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             .map(|d| d.join(format!("{rom}.zip")))
             .find(|p| p.is_file());
         let Some(zip) = entry.rom_zip.clone() else {
-            entry.status = Status::RomZipMissing(rom);
-            from_table(&mut entry, cache, opts);
+            entry.status = Status::RomZipMissing(rom.clone());
+            if from_table(&mut entry, script.as_deref(), cache, opts) {
+                entry.note = Some(format!("{rom}.zip not found"));
+            }
             out.push(entry);
             continue;
         };
@@ -278,20 +283,52 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// Where a table's own files are looked for music.
+fn source_table<'a>(
+    e: &'a Entry,
+    table: &'a Path,
+    script: Option<&'a str>,
+    dirs: &'a [PathBuf],
+    opts: &'a Options,
+    rom_only: bool,
+) -> sources::Table<'a> {
+    sources::Table {
+        table,
+        script,
+        rom: e.rom.as_deref(),
+        has_rom: rom_only || script.is_some_and(vpx::uses_pinmame),
+        rom_only,
+        vpx_dirs: dirs,
+        popper_dir: opts.popper_dir.as_deref(),
+    }
+}
+
+/// What a "nothing in the table's files" verdict holds for: the table
+/// file and every music source found for it.
+fn table_fingerprint(e: &Entry, table: &Path, script: Option<&str>, opts: &Options) -> String {
+    let dirs = vpx_dirs(&e.emu, opts.vpx_dir.as_deref());
+    let t = source_table(e, table, script, &dirs, opts, false);
+    state::table_fingerprint(table, &sources::fingerprint(&t))
+}
+
 /// A table without a usable ROM gets its music from its own files, if it
-/// has a table file to look in.
-fn from_table(entry: &mut Entry, cache: &Cache, opts: &Options) {
-    let Some(t) = entry.table.as_deref().filter(|t| t.is_file()) else {
-        return;
+/// has a table file to look in (false when it hasn't).
+fn from_table(entry: &mut Entry, script: Option<&str>, cache: &Cache, opts: &Options) -> bool {
+    let Some(t) = entry.table.clone().filter(|t| t.is_file()) else {
+        return false;
     };
-    let key = state::table_key(t);
+    let key = state::table_key(&t);
     entry.status = if let Some(clip) = cache
         .clip(&key, opts.seconds, opts.format.ext())
         .filter(|_| !opts.retry)
     {
         Status::Cached(clip)
     } else if let Some(why) = cache
-        .verdict(&key, opts.seconds, &key)
+        .verdict(
+            &key,
+            opts.seconds,
+            &table_fingerprint(entry, &t, script, opts),
+        )
         .filter(|_| !opts.retry)
     {
         Status::Verdict(why)
@@ -299,13 +336,21 @@ fn from_table(entry: &mut Entry, cache: &Cache, opts: &Options) {
         Status::Todo
     };
     entry.source_key = Some(key);
+    true
 }
 
 /// What will happen to a table, in words.
 pub fn describe_entry(e: &Entry) -> String {
-    match &e.status {
+    let what = match &e.status {
         Status::Todo if e.from_table() => "will look for music in the table's files".into(),
+        Status::Cached(_) if e.from_table() => {
+            "will copy the music found in its files earlier".into()
+        }
         s => describe(s),
+    };
+    match &e.note {
+        Some(n) => format!("{n}; {what}"),
+        None => what,
     }
 }
 
@@ -553,6 +598,14 @@ pub enum Outcome {
     Failed,
 }
 
+/// What looking in the tables' files came to.
+struct Look {
+    found: bool,
+    /// Something couldn't be read: not a verdict.
+    unread: bool,
+    fingerprint: String,
+}
+
 struct Job {
     /// The ROM, or for music from table files the cache name.
     rom: String,
@@ -582,7 +635,8 @@ pub struct Progress<'a> {
 pub struct Runner<'a> {
     pub cache: &'a Cache,
     pub opts: &'a Options,
-    pub dll: PathBuf,
+    /// libpinmame: needed only for ROM recordings.
+    pub dll: Option<PathBuf>,
     pub ffmpeg: Option<PathBuf>,
     pub parallel: usize,
     /// Set to stop: no new recordings start, running ones are killed.
@@ -693,12 +747,16 @@ impl Runner<'_> {
         ));
         let _ = std::fs::remove_dir_all(&tmp);
         let Some(zip) = &job.zip else {
-            let outcome = if self.music_from_table(job, &tmp, false) {
+            let look = self.music_from_table(job, &tmp, false);
+            // A source that couldn't be read (no ffmpeg?) is no verdict.
+            let outcome = if look.found {
                 Outcome::Recorded
+            } else if look.unread {
+                Outcome::Failed
             } else {
                 Outcome::Nothing
             };
-            let fp = job.rom.clone();
+            let fp = look.fingerprint;
             return self.finish(
                 job,
                 outcome,
@@ -794,11 +852,11 @@ impl Runner<'_> {
                 outcome = Outcome::Recorded;
             }
         }
-        if outcome != Outcome::Recorded && !self.cancelled() {
-            // The table's own files may have its music (altsound, a PuP
-            // pack): better than a jingle.
+        if outcome == Outcome::Nothing && !self.cancelled() {
+            // The ROM's own music beside it (altsound, a PuP pack named
+            // after it): better than a jingle.
             let _ = std::fs::remove_dir_all(&tmp);
-            if self.music_from_table(job, &tmp, true) {
+            if self.music_from_table(job, &tmp, true).found {
                 outcome = Outcome::Recorded;
             }
         }
@@ -825,32 +883,35 @@ impl Runner<'_> {
 
     /// Looks for the music in the tables' own files; on success it's in
     /// `tmp\clip.wav`. `rom_table`: only sources trusted over a ROM.
-    fn music_from_table(&self, job: &Job, tmp: &Path, rom_table: bool) -> bool {
+    fn music_from_table(&self, job: &Job, tmp: &Path, rom_only: bool) -> Look {
+        let mut look = Look {
+            found: false,
+            unread: false,
+            fingerprint: String::new(),
+        };
         for e in &job.entries {
             if self.cancelled() {
-                return false;
+                break;
             }
             let Some(t) = e.table.as_deref().filter(|t| t.is_file()) else {
                 continue;
             };
             let script = vpx::read_script(t).ok();
             let dirs = vpx_dirs(&e.emu, self.opts.vpx_dir.as_deref());
-            let table = sources::Table {
-                table: t,
-                script: script.as_deref(),
-                rom: e.rom.as_deref(),
-                has_rom: rom_table || script.as_deref().is_some_and(vpx::uses_pinmame),
-                vpx_dirs: &dirs,
-                popper_dir: self.opts.popper_dir.as_deref(),
-            };
+            let table = source_table(e, t, script.as_deref(), &dirs, self.opts, rom_only);
+            if look.fingerprint.is_empty() {
+                look.fingerprint = table_fingerprint(e, t, script.as_deref(), self.opts);
+            }
             log::info!("{}: looking for music in the table's files", e.game.display);
-            let Some(found) = sources::find(
+            let search = sources::find(
                 &table,
                 self.ffmpeg.as_deref(),
                 self.opts.seconds,
                 &tmp.join("sources"),
                 &|| self.cancelled(),
-            ) else {
+            );
+            look.unread |= search.unread;
+            let Some(found) = search.found else {
                 continue;
             };
             let _ = std::fs::remove_dir_all(tmp.join("sources"));
@@ -859,10 +920,11 @@ impl Runner<'_> {
                 continue;
             }
             log::info!("{}: using the {}", e.game.display, found.what);
-            return true;
+            look.found = true;
+            break;
         }
         let _ = std::fs::remove_dir_all(tmp.join("sources"));
-        false
+        look
     }
 
     /// Encodes and installs a recording, or remembers that there was none.
@@ -982,7 +1044,7 @@ impl Runner<'_> {
             .arg("--seconds")
             .arg(self.opts.seconds.to_string())
             .arg("--dll")
-            .arg(&self.dll);
+            .arg(self.dll.as_deref().context("libpinmame not found")?);
         if slow {
             cmd.arg("--slow");
         }
@@ -1249,7 +1311,7 @@ mod tests {
         let runner = Runner {
             cache: &cache,
             opts: &opts(&roms),
-            dll: PathBuf::new(),
+            dll: None,
             ffmpeg: None,
             parallel: 1,
             cancel: None,

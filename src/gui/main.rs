@@ -361,10 +361,15 @@ impl App {
                     .collect();
                 let emus = db.emulators()?;
                 drop(db);
-                let Some(dll) = record::find_pinmame(settings.dll.as_deref(), &emus, None) else {
-                    anyhow::bail!("libpinmame not found: choose it with \"libpinmame…\" (VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll)");
-                };
-                log::info!("libpinmame: {}", dll.display());
+                let dll = record::find_pinmame(settings.dll.as_deref(), &emus, None);
+                let roms_to_record = entries
+                    .iter()
+                    .any(|e| matches!(e.status, Status::Todo) && !e.from_table());
+                match &dll {
+                    Some(d) => log::info!("libpinmame: {}", d.display()),
+                    None if roms_to_record => anyhow::bail!("libpinmame not found: choose it with \"libpinmame…\" (VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll)"),
+                    None => {}
+                }
                 let ffmpeg = encode::find_ffmpeg(None, Some(&popper_dir));
                 let roms: HashSet<&str> = entries
                     .iter()
