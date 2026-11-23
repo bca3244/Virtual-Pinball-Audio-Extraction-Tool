@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 const AUDIO_EXT: &[&str] = &["mp3", "ogg", "wav", "flac", "opus", "m4a", "wma"];
 /// At most this many candidates are decoded per table.
-const MAX_TRIES: usize = 5;
+const MAX_TRIES: usize = 8;
 /// Seconds of a source decoded: enough for any clip, bounded for speed.
 const DECODE_SECONDS: u32 = 240;
 /// Bigger embedded sounds than this are not read (a broken header).
@@ -253,8 +253,9 @@ fn music_bonus(name: &str) -> i32 {
         "music*",
         "intro*",
         "title*",
+        "mus",
     ];
-    let weak = ["main", "menu", "track*", "loop*", "background", "bg", "mus"];
+    let weak = ["main", "menu", "track*", "loop*", "background", "bg"];
     if has_word(name, &strong) {
         10
     } else if has_word(name, &weak) {
@@ -310,6 +311,27 @@ fn is_effect(name: &str) -> bool {
             "popper*",
             "lane*",
             "magnet*",
+        ],
+    )
+}
+
+/// Speech: callouts and voice lines (`voc_attract1` is a line spoken in
+/// attract mode, not its music).
+fn is_callout(name: &str) -> bool {
+    has_word(
+        name,
+        &[
+            "voc",
+            "vo",
+            "callout*",
+            "voice*",
+            "speech*",
+            "quote*",
+            "announce*",
+            "say*",
+            "spk",
+            "talk*",
+            "line*",
         ],
     )
 }
@@ -478,10 +500,18 @@ fn candidates(t: &Table) -> Vec<Candidate> {
     let embedded = embedded_sounds(t.table);
     for e in &embedded {
         let looped = refs.looped.iter().any(|n| n.eq_ignore_ascii_case(&e.name));
-        let bonus = music_bonus(&e.name);
-        let effect = is_effect(&e.name);
+        let declared = refs
+            .declared
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&e.name));
+        let callout = is_callout(&e.name) && !declared;
+        let bonus = if callout { 0 } else { music_bonus(&e.name) };
+        let effect = is_effect(&e.name) || callout;
         let ambience = is_ambience(&e.name) && bonus == 0;
-        let score = if looped && !effect && !ambience && e.seconds >= LOOP_MIN_SECONDS {
+        let score = if declared && e.seconds >= LOOP_MIN_SECONDS {
+            // The script lists it as a music track (GLF's AddMusic).
+            95 + bonus
+        } else if looped && !effect && !ambience && e.seconds >= LOOP_MIN_SECONDS {
             90 + bonus
         } else if bonus >= 10 && !effect {
             70
@@ -577,6 +607,9 @@ struct ScriptRefs {
     music: Vec<String>,
     /// Sounds started looping: `PlaySound "x", -1`.
     looped: Vec<String>,
+    /// Sounds the script declares as music tracks: `AddMusic "x", 92.2`
+    /// (Game Logic Framework tables).
+    declared: Vec<String>,
     /// Possible PuP pack names (`cPuPPack = "x"`, `pGameName = "x"`).
     pup_names: Vec<String>,
 }
@@ -620,6 +653,13 @@ fn script_refs(script: &str) -> ScriptRefs {
                         .is_some_and(|e| AUDIO_EXT.iter().any(|a| e.eq_ignore_ascii_case(a)));
                     if named && (folder || file) && !later.iter().any(|l| l == lit) {
                         later.push(lit.to_string());
+                    }
+                }
+            }
+            if lower.starts_with("addmusic") {
+                if let Some((_, name)) = literals(stmt).first() {
+                    if !r.declared.contains(name) {
+                        r.declared.push(name.clone());
                     }
                 }
             }
@@ -1097,6 +1137,12 @@ End Sub
         assert_eq!(r.music, vec!["MyTable\\attract.mp3", "MyTable\\", ".mp3"]);
         assert_eq!(r.looped, vec!["bgloop", "song2"]);
         assert_eq!(r.pup_names, vec!["mytable"]);
+        let glf =
+            script_refs("AddMusic \"mus_wave0\", 92.212, -1\nAddCallout \"voc_attract1\", 1.8");
+        assert_eq!(glf.declared, vec!["mus_wave0"]);
+        assert!(is_callout("voc_attract1"));
+        assert!(!is_callout("mus_wave0"));
+        assert_eq!(music_bonus("mus_wizard2"), 10);
 
         let bm =
             "Dim MusicDirectory : MusicDirectory = GetMusicFolder & \"\\Blood Machines OST\\\"\n\
