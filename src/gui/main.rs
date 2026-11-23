@@ -5,6 +5,8 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod player;
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashSet, VecDeque};
@@ -235,6 +237,7 @@ struct App {
     restore_open: bool,
     batches: Vec<backup::Batch>,
     parallel: usize,
+    player: player::Player,
 }
 
 fn has_audio(e: &Entry) -> bool {
@@ -268,6 +271,7 @@ impl App {
             restore_open: false,
             batches: Vec::new(),
             parallel: record::default_parallel(),
+            player: player::Player::default(),
         };
         app.rescan(&cc.egui_ctx);
         app
@@ -327,6 +331,8 @@ impl App {
     }
 
     fn start_recording(&mut self, ctx: &egui::Context) {
+        // A playing file is held open: it couldn't be replaced or moved.
+        self.player.stop();
         let Some(popper_dir) = self.popper_dir.clone() else {
             return;
         };
@@ -417,6 +423,8 @@ impl App {
     }
 
     fn remove_selected(&mut self, ctx: &egui::Context) {
+        // A playing file is held open: it couldn't be replaced or moved.
+        self.player.stop();
         let batch = backup::new_batch(&self.cache);
         let mut removed = 0;
         for e in self.selected().filter(|e| has_audio(e)) {
@@ -742,6 +750,14 @@ impl App {
             .collect();
         let busy = self.busy();
         let height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+        let player = &mut self.player;
+        let playing = player.playing().map(Path::to_path_buf);
+        if playing.is_some() {
+            // Notice when it ends, to show ▶ again.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        let rows = &mut self.rows;
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -764,7 +780,7 @@ impl App {
             })
             .body(|body| {
                 body.rows(height, shown.len(), |mut row| {
-                    let r = &mut self.rows[shown[row.index()]];
+                    let r = &mut rows[shown[row.index()]];
                     row.col(|ui| {
                         ui.add_enabled(!busy, egui::Checkbox::without_text(&mut r.selected));
                     });
@@ -811,6 +827,28 @@ impl App {
                             ),
                             s => (ui.visuals().weak_text_color(), record::describe(s)),
                         };
+                        let clip = match &r.entry.status {
+                            Status::HasAudio(p) | Status::Cached(p) => Some(p),
+                            _ => None,
+                        };
+                        if let Some(p) = clip {
+                            let on = playing.as_deref() == Some(p.as_path());
+                            let b = ui
+                                .add_enabled(
+                                    !busy || on,
+                                    egui::Button::new(if on { "⏹" } else { "⏵" }).small(),
+                                )
+                                .on_hover_text(if on {
+                                    "Stop"
+                                } else if matches!(r.entry.status, Status::Cached(_)) {
+                                    "Play the clip that Record would install"
+                                } else {
+                                    "Play this table's Audio media"
+                                });
+                            if b.clicked() {
+                                player.toggle(p);
+                            }
+                        }
                         ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
                     });
                 });

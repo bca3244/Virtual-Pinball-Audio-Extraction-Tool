@@ -29,6 +29,7 @@ Run **`vp-audio-extract-gui.exe`**. It finds Popper by itself (or use *Choose…
 
 - **Selecting tables:** tick tables one by one, or use *Select all*, *Select missing audio* or *Select none*. The filter box narrows the list, and the select buttons only act on what's shown.
 - **Record N** records the selected tables that have no audio. With *Replace existing audio* ticked it re-records tables that already have some, after asking. A table that gave nothing before is tried again when you select it.
+- **⏵** beside a table's Audio plays it in the window (**⏹** stops it); a clip recorded earlier but not installed yet can be previewed the same way.
 - **Remove audio from N** removes the selected tables' Audio media, after asking. The files are moved to `data\removed\<time>\` beside the exe rather than deleted, so you can put them back.
 - **Restore…** lists each removal with its time and tables, and puts a batch back where it came from. A file whose place has been taken by new audio since stays in the backup rather than overwrite it.
 - **Other controls:** clip length, format, how many recordings run at once, and the libpinmame DLL can be set in the window. A progress bar, a *Cancel* button and the log follow each run.

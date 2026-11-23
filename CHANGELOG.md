@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.10
+
+- A ⏵ button beside each table's Audio plays it in the window (⏹ stops it), one at a time, through the default sound device. Tables with a clip already recorded but not yet installed can be previewed the same way. Files the built-in decoders can't read open in the default player instead.
+
 ## 0.1.0-beta.9
 
 - Same code as beta.8, now reporting its own version (beta.8's exe still said 0.1.0-beta.7).
