@@ -274,6 +274,8 @@ pub struct WorkerArgs {
     pub trough: Vec<i32>,
     /// The slow-boot timeline (the retry for a ROM that gave no music).
     pub slow: bool,
+    /// Also write the whole recording here (diagnostics).
+    pub raw: Option<PathBuf>,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -311,6 +313,22 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
         capture::loudest(&run.samples, run.channels, run.rate, None, run.start_sample),
         capture::loudest(&run.samples, run.channels, run.rate, run.start_sample, None),
     );
+    println!(
+        "{}: {}",
+        a.rom,
+        capture::describe_after_start(&run.samples, run.channels, run.rate, run.start_sample)
+    );
+    if let Some(raw) = &a.raw {
+        let pcm = wav::Pcm {
+            samples: run.samples.clone(),
+            channels: run.channels as u16,
+            rate: run.rate,
+        };
+        match wav::write(raw, &pcm) {
+            Ok(()) => println!("{}: whole recording written to {}", a.rom, raw.display()),
+            Err(e) => println!("{}: couldn't write {}: {e:#}", a.rom, raw.display()),
+        }
+    }
     let recorded = run.samples.len() as f64 / run.channels.max(1) as f64 / run.rate.max(1) as f64;
     if run.end == pinmame::RunEnd::Stopped && run.samples.is_empty() {
         // PinmameRun accepts the name, then the emulation ends while loading

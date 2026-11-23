@@ -223,6 +223,35 @@ pub fn loudest(
     l.rms.iter().copied().fold(0.0, f64::max)
 }
 
+/// For the log: what the sound after Start looks like to the music finder.
+pub fn describe_after_start(
+    samples: &[i16],
+    channels: u32,
+    rate: u32,
+    start_sample: Option<u64>,
+) -> String {
+    let mut l = Loudness::new(channels, rate, start_sample);
+    l.update(samples);
+    let loud: Vec<usize> = (0..l.rms.len()).filter(|&i| l.rms[i] > QUIET).collect();
+    let noisy = loud.iter().filter(|&&i| l.zcr[i] > NOISY_ZCR).count();
+    let zcr = loud.iter().map(|&i| l.zcr[i]).sum::<f64>() / loud.len().max(1) as f64;
+    // Longest stretch without a 3 s gap, in blocks.
+    let (mut longest, mut first, mut last) = (0, 0, None::<usize>);
+    for &i in &loud {
+        if last.is_none_or(|l| i - l >= 30) {
+            first = i;
+        }
+        longest = longest.max(i - first + 1);
+        last = Some(i);
+    }
+    format!(
+        "after Start: {:.1} s loud, {:.1} s of it static-like, mean zero-crossing rate {zcr:.3}, longest stretch {:.1} s",
+        loud.len() as f64 / 10.0,
+        noisy as f64 / 10.0,
+        longest as f64 / 10.0
+    )
+}
+
 /// Zero-crossing rate above which a loud block sounds like static.
 const NOISY_ZCR: f64 = 0.3;
 
@@ -404,6 +433,17 @@ mod tests {
         assert!(mean.abs() < 300.0, "{mean}");
         let peak = c.iter().map(|&v| (v as i32).abs()).max().unwrap();
         assert!(peak > 25000, "full headroom: {peak}");
+    }
+
+    #[test]
+    fn after_start_summary() {
+        let rate = 22050;
+        let mut s = tone(3.0, rate, 1, 2000.0);
+        s.extend(vec![0i16; rate * 4]);
+        s.extend(tone(5.0, rate, 1, 2000.0));
+        let d = describe_after_start(&s, 1, rate as u32, Some(0));
+        assert!(d.contains("longest stretch 5.0 s"), "{d}");
+        assert!(d.contains("0.0 s of it static-like"), "{d}");
     }
 
     #[test]

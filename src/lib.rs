@@ -37,6 +37,9 @@ struct WorkerCli {
     trough: Vec<i32>,
     #[arg(long)]
     slow: bool,
+    /// Also write the whole recording as a WAV (diagnostics).
+    #[arg(long)]
+    raw: Option<PathBuf>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -56,6 +59,7 @@ pub fn run_worker_if_requested() {
         rom_dirs: w.rom_dirs,
         trough: w.trough,
         slow: w.slow,
+        raw: w.raw,
     };
     record::terminate(record::worker_main(&a));
 }
