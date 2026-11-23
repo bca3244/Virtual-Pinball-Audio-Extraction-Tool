@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.13
+
+- A ROM that stays quiet from the cabinet's nvram is tried once more with Start pressed twice. No Fear ignores the first press and now records its music.
+
 ## 0.1.0-beta.12
 
 - Music stored in a table as MP3 sounds is found when the script lists it as music (Game Logic Framework's `AddMusic`), or when it's named `mus_...`. Voice lines and callouts (`voc_...`) no longer count as music. Dark Chaos now gets its music.

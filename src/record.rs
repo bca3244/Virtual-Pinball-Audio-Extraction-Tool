@@ -784,9 +784,9 @@ impl Runner<'_> {
         ));
         let _ = std::fs::remove_file(&best);
         let best_len = std::cell::Cell::new(0.0f64);
-        let attempt = |slow: bool, nvram: Option<&Path>, no_escape: bool| {
+        let attempt = |slow: bool, nvram: Option<&Path>, no_escape: bool, twice: bool| {
             let _ = std::fs::remove_dir_all(&tmp);
-            let o = match self.spawn_worker(job, &tmp, slow, nvram, no_escape) {
+            let o = match self.spawn_worker(job, &tmp, slow, nvram, no_escape, twice) {
                 Ok(o) => o,
                 Err(e) => {
                     log::warn!("{}: {e:#}", job.rom);
@@ -818,7 +818,7 @@ impl Runner<'_> {
             }
             Outcome::Nothing
         };
-        let mut outcome = attempt(false, None, false);
+        let mut outcome = attempt(false, None, false, false);
         // From a blank nvram some machines never get past their factory
         // reset (Earthshaker) or won't start until a mechanism is
         // calibrated (Bride of Pin-bot): the cabinet's own nvram, copied,
@@ -832,7 +832,22 @@ impl Runner<'_> {
                 );
                 // Only a recording counts: anything else from this try
                 // leaves the blank run's "no music" and goes on.
-                if attempt(false, Some(nv), false) == Outcome::Recorded {
+                if attempt(false, Some(nv), false, false) == Outcome::Recorded {
+                    outcome = Outcome::Recorded;
+                }
+            }
+        }
+        if outcome == Outcome::Nothing && !self.cancelled() {
+            if let Some(nv) = &nvram {
+                // No Fear ignores the first Start (from the cabinet's
+                // nvram): once more with Start pressed twice. Kept out of
+                // the first tries, so a "player 2" sound never lands in
+                // the music of machines that start at once.
+                log::info!(
+                    "{}: no music; trying again with Start pressed twice",
+                    job.rom
+                );
+                if attempt(false, Some(nv), false, true) == Outcome::Recorded {
                     outcome = Outcome::Recorded;
                 }
             }
@@ -845,7 +860,7 @@ impl Runner<'_> {
                 "{}: no music; trying again without the service key",
                 job.rom
             );
-            if attempt(false, nvram.as_deref(), true) == Outcome::Recorded {
+            if attempt(false, nvram.as_deref(), true, false) == Outcome::Recorded {
                 outcome = Outcome::Recorded;
             }
         }
@@ -853,7 +868,7 @@ impl Runner<'_> {
             // Some machines boot slowly or ignore inputs for a while after
             // their self-test: once more, with everything later.
             log::info!("{}: no music; trying again with a slower start", job.rom);
-            if attempt(true, None, false) == Outcome::Recorded {
+            if attempt(true, None, false, false) == Outcome::Recorded {
                 outcome = Outcome::Recorded;
             }
         }
@@ -1019,6 +1034,7 @@ impl Runner<'_> {
         slow: bool,
         nvram: Option<&Path>,
         no_escape: bool,
+        twice: bool,
     ) -> Result<Outcome> {
         std::fs::create_dir_all(tmp)?;
         let script = job
@@ -1055,6 +1071,9 @@ impl Runner<'_> {
         }
         if no_escape {
             cmd.arg("--no-escape");
+        }
+        if twice {
+            cmd.arg("--start-presses").arg("2");
         }
         if let Some(nv) = nvram {
             cmd.arg("--nvram").arg(nv);
