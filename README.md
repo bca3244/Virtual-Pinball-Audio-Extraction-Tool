@@ -27,7 +27,7 @@ Run **`vp-audio-extract-gui.exe`**. It finds Popper by itself (or use *Choose…
 
 - **Selecting tables:** tick tables one by one, or use *Select all*, *Select missing audio* or *Select none*. The filter box narrows the list, and the select buttons only act on what's shown.
 - **Record N** records the selected tables that have no audio. With *Replace existing audio* ticked it re-records tables that already have some, after asking. A table that gave nothing before is tried again when you select it.
-- **Remove audio from N** removes the selected tables' Audio media, after asking. The files are moved to `%LOCALAPPDATA%\vp-audio-extract\removed\<time>\` rather than deleted, so you can put them back.
+- **Remove audio from N** removes the selected tables' Audio media, after asking. The files are moved to `data\removed\<time>\` beside the exe rather than deleted, so you can put them back.
 - **Restore…** lists each removal with its time and tables, and puts a batch back where it came from. A file whose place has been taken by new audio since stays in the backup rather than overwrite it.
 - **Other controls:** clip length, format, how many recordings run at once, and the libpinmame DLL can be set in the window. A progress bar, a *Cancel* button and the log follow each run.
 
@@ -68,7 +68,7 @@ Close VPX while it records, because each recording keeps one CPU core busy in re
 | `--include-hidden` | also tables hidden in Popper |
 | `-v` | more detail |
 
-Results are remembered in `%LOCALAPPDATA%\vp-audio-extract`:
+Results are remembered in a `data` folder beside the exe (or `%LOCALAPPDATA%\vp-audio-extract` if that folder can't be written, e.g. under Program Files; data an older version left there is moved over on first run):
 
 - **`clips\`** holds every recorded clip, so a table added later on a ROM already recorded gets its audio at once.
 - **`verdicts\`** lists the ROMs that gave no music. They aren't tried again until their zip files change (a parent set added, a newer version) or you pass `--retry`.
