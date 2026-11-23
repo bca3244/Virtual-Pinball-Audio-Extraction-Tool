@@ -7,16 +7,26 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bca3244/Virtual-Pinball-Audio-Extraction-Tool"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "vp-audio-extract"
 path = "src/main.rs"
+
+[[bin]]
+name = "vp-audio-extract-gui"
+path = "src/gui/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
 cfb = "0.16.0"
 clap = { version = "4.6.9", features = ["derive"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "wayland", "x11"] }
+egui_extras = "0.37"
 libloading = "0.9.1"
 log = "0.4.35"
+rfd = "0.17.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 sha1 = "0.11.0"
 simplelog = "0.12.2"

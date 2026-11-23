@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -198,6 +198,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         };
         if !opts.force {
             if let Some(found) = popper::existing_audio(media, &game.name) {
+                entry.rom = game.rom.clone();
                 entry.status = Status::HasAudio(found);
                 out.push(entry);
                 continue;
@@ -407,7 +408,7 @@ fn kill_with_us(child: &std::process::Child) {
 fn kill_with_us(_child: &std::process::Child) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
+pub enum Outcome {
     Recorded,
     Nothing,
     NotStarted,
@@ -428,12 +429,25 @@ pub struct Summary {
     pub failed: usize,
 }
 
+/// One ROM finished (for a progress display).
+pub struct Progress<'a> {
+    pub done: usize,
+    pub total: usize,
+    pub rom: &'a str,
+    /// Popper GameNames of the tables on this ROM.
+    pub games: Vec<&'a str>,
+    pub outcome: Outcome,
+}
+
 pub struct Runner<'a> {
     pub cache: &'a Cache,
     pub opts: &'a Options,
     pub dll: PathBuf,
     pub ffmpeg: Option<PathBuf>,
     pub parallel: usize,
+    /// Set to stop: no new recordings start, running ones are killed.
+    pub cancel: Option<&'a AtomicBool>,
+    pub on_progress: Option<&'a (dyn Fn(Progress) + Sync)>,
 }
 
 /// Recordings at once: each keeps an emulator busy in real time (about one
@@ -490,6 +504,9 @@ impl Runner<'_> {
         std::thread::scope(|s| {
             for _ in 0..self.parallel.min(jobs.len()) {
                 s.spawn(|| loop {
+                    if self.cancelled() {
+                        break;
+                    }
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     let Some(job) = jobs.get(i) else { break };
                     let started = Instant::now();
@@ -507,10 +524,23 @@ impl Runner<'_> {
                         titles.join(", "),
                         started.elapsed().as_secs_f64()
                     );
+                    if let Some(f) = self.on_progress {
+                        f(Progress {
+                            done: n,
+                            total: jobs.len(),
+                            rom: &job.rom,
+                            games: job.entries.iter().map(|e| e.game.name.as_str()).collect(),
+                            outcome,
+                        });
+                    }
                 });
             }
         });
         summary.into_inner().unwrap_or_default()
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::SeqCst))
     }
 
     fn record_one(&self, job: &Job, summary: &Mutex<Summary>) -> Outcome {
@@ -647,6 +677,12 @@ impl Runner<'_> {
             if let Some(st) = child.try_wait()? {
                 break Some(st);
             }
+            if self.cancelled() {
+                log::info!("{}: cancelled", job.rom);
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
             if started.elapsed() > limit {
                 log::warn!(
                     "{}: still running after {} s; stopped",
@@ -777,6 +813,8 @@ mod tests {
             dll: PathBuf::new(),
             ffmpeg: None,
             parallel: 1,
+            cancel: None,
+            on_progress: None,
         };
         let s = runner.run(plan2);
         assert_eq!(s.installed, 2);

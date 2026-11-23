@@ -1,16 +1,7 @@
-//! vp-audio-extract: records each Visual Pinball table's game music from its
-//! PinMAME ROM (headless libpinmame: coins in, Start pressed, the music
-//! captured straight from the emulator, never played aloud) and installs it
-//! as the table's PinUP Popper Audio media.
+//! Command line for vp-audio-extract (see the library docs). The window
+//! version is `vp-audio-extract-gui`.
 
-mod capture;
-mod encode;
-mod pinmame;
-mod popper;
-mod record;
-mod state;
-mod vpx;
-mod wav;
+use vp_audio_extract::{capture, encode, popper, record, state};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -55,24 +46,6 @@ enum Cmd {
         /// Show what would be recorded without running anything.
         #[arg(long)]
         dry_run: bool,
-    },
-    /// Records one ROM (run by `record`, one process per ROM).
-    #[command(hide = true)]
-    Worker {
-        #[arg(long)]
-        rom: String,
-        #[arg(long)]
-        scratch: PathBuf,
-        #[arg(long)]
-        out: PathBuf,
-        #[arg(long)]
-        seconds: u32,
-        #[arg(long)]
-        dll: PathBuf,
-        #[arg(long = "rom-dir")]
-        rom_dirs: Vec<PathBuf>,
-        #[arg(long, value_delimiter = ',')]
-        trough: Vec<i32>,
     },
 }
 
@@ -150,28 +123,8 @@ fn init_logging(verbose: bool, file: Option<PathBuf>) {
 }
 
 fn main() {
+    vp_audio_extract::run_worker_if_requested();
     let cli = Cli::parse();
-    if let Cmd::Worker {
-        rom,
-        scratch,
-        out,
-        seconds,
-        dll,
-        rom_dirs,
-        trough,
-    } = cli.command
-    {
-        let a = record::WorkerArgs {
-            rom: rom.to_ascii_lowercase(),
-            scratch,
-            out,
-            seconds: capture::clamp_seconds(seconds),
-            dll,
-            rom_dirs,
-            trough,
-        };
-        record::terminate(record::worker_main(&a));
-    }
     let cache_dir = cli.cache.clone();
     let log_file = state::Cache::open(cache_dir.as_deref())
         .ok()
@@ -241,6 +194,8 @@ fn run(cli: Cli) -> Result<()> {
                 dll,
                 ffmpeg,
                 parallel: parallel.unwrap_or_else(record::default_parallel).max(1),
+                cancel: None,
+                on_progress: None,
             };
             let s = runner.run(entries);
             log::info!(
@@ -252,7 +207,6 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Worker { .. } => unreachable!("handled in main"),
     }
 }
 

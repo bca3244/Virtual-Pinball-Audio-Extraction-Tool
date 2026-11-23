@@ -1,6 +1,6 @@
 # Virtual Pinball Audio Extraction Tool
 
-`vp-audio-extract.exe` gives your PinUP Popper tables their **Audio** media (the music that plays when the wheel rests on a table) by recording it from each table's own PinMAME ROM.
+`vp-audio-extract-gui.exe` (a window) and `vp-audio-extract.exe` (command line) give your PinUP Popper tables their **Audio** media (the music that plays when the wheel rests on a table) by recording it from each table's own PinMAME ROM.
 
 For every Visual Pinball table that has no Audio media yet, it:
 
@@ -20,7 +20,17 @@ The recording approach (timeline, clip cutting, trough switches) is ported from 
 - The tables' ROM zips, in VPinMAME's `roms` folder, the table folder's `pinmame\roms`, Popper's ROM folder, or anywhere you pass with `--rom-dir`. A clone ROM needs its parent set too, as in VPinMAME.
 - For MP3 output, nothing extra is needed. It uses ffmpeg if it finds one (Popper's `PinUPSystem\Recordings\ffmpeg.exe`, `--ffmpeg`, or PATH), otherwise Windows' own MP3 encoder. `--format ogg` needs ffmpeg.
 
-## Usage
+## The window
+
+Run **`vp-audio-extract-gui.exe`**. It finds Popper by itself (or use *Choose…*) and lists every Visual Pinball table with its ROM and whether it has Audio media.
+
+- **Selecting tables:** tick tables one by one, or use *Select all*, *Select missing audio* or *Select none*. The filter box narrows the list, and the select buttons only act on what's shown.
+- **Record N** records the selected tables that have no audio. With *Replace existing audio* ticked it re-records tables that already have some, after asking. A table that gave nothing before is tried again when you select it.
+- **Remove audio from N** removes the selected tables' Audio media, after asking. The files are moved to `%LOCALAPPDATA%\vp-audio-extract\removed\<time>\` rather than deleted, so you can put them back.
+- **Other controls:** clip length, format, how many recordings run at once, and the libpinmame DLL can be set in the window. A progress bar, a *Cancel* button and the log follow each run.
+
+## Command line
+
 
 ```powershell
 # What would happen to each table (has audio / will record / no ROM / ...)
