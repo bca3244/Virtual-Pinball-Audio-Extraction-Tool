@@ -44,6 +44,22 @@ pub fn set_dips(d: Vec<(i32, i64)>) {
     let _ = DIPS.set(d);
 }
 
+/// The machine's own coin and Start switches, from the table's core
+/// script (`swCoin1`, `swStartButton`). Pressed as switches alongside the
+/// keys: on some systems (Bally 6803) PinMAME's keys don't reach them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CabinetSwitches {
+    pub coin: Option<i32>,
+    pub start: Option<i32>,
+}
+
+static CABINET: OnceLock<CabinetSwitches> = OnceLock::new();
+
+/// Sets the coin and Start switches; call before [`run`].
+pub fn set_cabinet_switches(c: CabinetSwitches) {
+    let _ = CABINET.set(c);
+}
+
 /// Sets the diagnostic variations; call before [`run`].
 pub fn set_debug(d: Debug) {
     let _ = DEBUG.set(d);
@@ -533,6 +549,8 @@ pub fn run(
     let mut dips_set = false;
     let (mut shown, mut last_text) = (0, String::new());
     let mut loud: Option<capture::Loudness> = None;
+    let cabinet = CABINET.get().copied().unwrap_or_default();
+    let (mut coin_down, mut start_down) = (false, false);
     while now() < until && unsafe { is_running() } != 0 && clock.elapsed().as_secs_f64() < give_up {
         // Balls resting in the trough, so Start starts a game. Not before the
         // machine is up: setting switches right after PinmameRun crashes it.
@@ -556,6 +574,33 @@ pub fn run(
             balls_in = true;
         }
         let s = &*SHARED;
+        if balls_in {
+            let t = now();
+            if let Some(sw) = cabinet.coin {
+                let down = timeline.key_down(capture::KEY_NUMBER_5, t);
+                if down != coin_down {
+                    unsafe { set_switch(sw, down as c_int) };
+                    coin_down = down;
+                }
+            }
+            if let Some(sw) = cabinet.start {
+                let down = timeline.key_down(capture::KEY_NUMBER_1, t);
+                if down != start_down {
+                    unsafe { set_switch(sw, down as c_int) };
+                    start_down = down;
+                    if down {
+                        // As the Start key does, in case the keys aren't read.
+                        let f = s.frames.load(Ordering::Acquire) as i64;
+                        let _ = s.start_frame.compare_exchange(
+                            -1,
+                            f,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+        }
         if debug().show_display && shown < 120 {
             let text = s.displays.lock().map(|d| d.join(" | ")).unwrap_or_default();
             if text != last_text && !text.trim_matches([' ', '|']).is_empty() {

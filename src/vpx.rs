@@ -302,6 +302,42 @@ pub fn mech_rest_switches(script: &str) -> Vec<i32> {
     out
 }
 
+/// The core script a table loads: `LoadVPM "01500000", "6803.VBS", 3.2`
+/// gives `6803.VBS`. Only a bare file name is returned.
+pub fn core_script_name(script: &str) -> Option<String> {
+    for raw in script.lines() {
+        let line = raw.split('\'').next().unwrap_or("").trim();
+        let Some(rest) = after_ci(line, "loadvpm") else {
+            continue;
+        };
+        let mut quoted = rest.split('"').skip(1).step_by(2);
+        let _version = quoted.next();
+        if let Some(name) = quoted.next() {
+            let name = name.trim();
+            let ok = !name.is_empty()
+                && name.len() < 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                && name.to_ascii_lowercase().ends_with(".vbs");
+            if ok {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The coin and Start switches a core script names (`swCoin1`,
+/// `swStartButton`).
+pub fn cabinet_switches(core: &str) -> crate::pinmame::CabinetSwitches {
+    let c = consts(core);
+    crate::pinmame::CabinetSwitches {
+        coin: c.get("swcoin1").copied(),
+        start: c.get("swstartbutton").copied(),
+    }
+}
+
 /// The switches closed when a recording starts: balls in the trough and
 /// mechanisms at rest.
 pub fn start_switches(script: &str) -> Vec<i32> {
@@ -317,6 +353,16 @@ pub fn start_switches(script: &str) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_script_and_its_switches() {
+        let s = "' LoadVPM \"x\", \"old.vbs\"\nLoadVPM \"01500000\", \"6803.VBS\", 3.2\n";
+        assert_eq!(core_script_name(s).as_deref(), Some("6803.VBS"));
+        assert_eq!(core_script_name("LoadVPM \"01\", \"..\\x.vbs\", 1"), None);
+        let core = "Const swStartButton = 6, swCoin1 = 10\nConst swCPUDiag=-7\n";
+        let c = cabinet_switches(core);
+        assert_eq!((c.coin, c.start), (Some(10), Some(6)));
+    }
 
     #[test]
     fn mech_switches_closed_at_rest() {

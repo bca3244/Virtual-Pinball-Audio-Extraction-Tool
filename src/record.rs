@@ -309,6 +309,8 @@ pub struct WorkerArgs {
     pub nvram: Option<PathBuf>,
     /// DIP switch banks to set (bank, value), as the table script does.
     pub dips: Vec<(i32, i64)>,
+    /// The machine's coin and Start switches, from its core script.
+    pub cabinet: pinmame::CabinetSwitches,
 }
 
 /// The worker process: records one ROM into `out` as a WAV clip and
@@ -322,6 +324,7 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
     };
     pinmame::set_debug(a.debug);
     pinmame::set_dips(a.dips.clone());
+    pinmame::set_cabinet_switches(a.cabinet);
     let run = match pinmame::run(
         &a.dll,
         &a.scratch,
@@ -706,6 +709,34 @@ impl Runner<'_> {
         outcome
     }
 
+    /// The text of the core script the table loads (`LoadVPM ..., "6803.VBS"`),
+    /// from VPX's Scripts folder or beside the table.
+    fn core_script(&self, job: &Job, script: &str) -> Option<String> {
+        let name = vpx::core_script_name(script)?;
+        let mut dirs = Vec::new();
+        for t in job.entries.iter().filter_map(|e| e.table.as_deref()) {
+            if let Some(d) = t.parent() {
+                dirs.push(d.to_path_buf());
+                if let Some(vpx) = d.parent() {
+                    dirs.push(vpx.join("Scripts"));
+                }
+            }
+        }
+        if let Some(v) = &self.opts.vpx_dir {
+            dirs.push(v.join("Scripts"));
+        }
+        dirs.iter().find_map(|d| {
+            std::fs::read_dir(d).ok()?.flatten().find_map(|e| {
+                let f = e.file_name();
+                f.to_string_lossy()
+                    .eq_ignore_ascii_case(&name)
+                    .then(|| std::fs::read(e.path()).ok())
+                    .flatten()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            })
+        })
+    }
+
     fn spawn_worker(
         &self,
         job: &Job,
@@ -725,6 +756,11 @@ impl Runner<'_> {
             .map(vpx::start_switches)
             .unwrap_or_default();
         let dips = script.as_deref().map(vpx::dip_switches).unwrap_or_default();
+        let cabinet = script
+            .as_deref()
+            .and_then(|s| self.core_script(job, s))
+            .map(|core| vpx::cabinet_switches(&core))
+            .unwrap_or_default();
         let exe = std::env::current_exe().context("finding this exe")?;
         let mut cmd = Command::new(exe);
         cmd.arg("worker")
@@ -749,6 +785,12 @@ impl Runner<'_> {
         }
         for (bank, value) in &dips {
             cmd.arg("--dip").arg(format!("{bank}={value}"));
+        }
+        if let Some(sw) = cabinet.coin {
+            cmd.arg("--coin-switch").arg(sw.to_string());
+        }
+        if let Some(sw) = cabinet.start {
+            cmd.arg("--start-switch").arg(sw.to_string());
         }
         if !trough.is_empty() {
             cmd.arg("--trough").arg(

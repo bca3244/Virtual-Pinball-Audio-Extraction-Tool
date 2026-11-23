@@ -58,6 +58,12 @@ struct WorkerCli {
     /// A DIP switch bank to set, as bank=value (repeatable).
     #[arg(long = "dip")]
     dips: Vec<String>,
+    /// The machine's coin switch, pressed with the coin key.
+    #[arg(long, allow_hyphen_values = true)]
+    coin_switch: Option<i32>,
+    /// The machine's Start switch, pressed with the Start key.
+    #[arg(long, allow_hyphen_values = true)]
+    start_switch: Option<i32>,
 }
 
 /// If this process was started as a recording worker, records and ends the
@@ -85,6 +91,10 @@ pub fn run_worker_if_requested() {
             mechanics: w.mechanics,
         },
         nvram: w.nvram,
+        cabinet: pinmame::CabinetSwitches {
+            coin: w.coin_switch,
+            start: w.start_switch,
+        },
         dips: w
             .dips
             .iter()
