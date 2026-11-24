@@ -10,6 +10,8 @@ use vp_audio_extract::encode::Format;
 pub struct Settings {
     pub popper: Option<PathBuf>,
     pub dll: Option<PathBuf>,
+    /// ffmpeg chosen by hand (None: Popper's, or one on PATH).
+    pub ffmpeg: Option<PathBuf>,
     pub seconds: u32,
     pub format: Format,
     pub replace: bool,
@@ -27,6 +29,7 @@ impl Settings {
         let mut s = Settings {
             popper: None,
             dll: None,
+            ffmpeg: None,
             seconds: capture::DEFAULT_SECONDS,
             format: Format::Mp3,
             replace: false,
@@ -47,6 +50,7 @@ impl Settings {
             match k.trim() {
                 "popper" if !v.is_empty() => s.popper = Some(PathBuf::from(v)),
                 "dll" if !v.is_empty() => s.dll = Some(PathBuf::from(v)),
+                "ffmpeg" if !v.is_empty() => s.ffmpeg = Some(PathBuf::from(v)),
                 "seconds" => s.seconds = v.parse().map(capture::clamp_seconds).unwrap_or(s.seconds),
                 "format" => {
                     s.format = match v {
@@ -75,9 +79,10 @@ impl Settings {
                 .unwrap_or_default()
         };
         let text = format!(
-            "popper={}\ndll={}\nseconds={}\nformat={}\nparallel={}\nfade_in={}\nfade_out={}\nlevel={}\nlufs={}\n",
+            "popper={}\ndll={}\nffmpeg={}\nseconds={}\nformat={}\nparallel={}\nfade_in={}\nfade_out={}\nlevel={}\nlufs={}\n",
             p(&self.popper),
             p(&self.dll),
+            p(&self.ffmpeg),
             self.seconds,
             self.format.ext(),
             self.parallel.map(|n| n.to_string()).unwrap_or_default(),

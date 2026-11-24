@@ -505,8 +505,16 @@ fn resolve(base: &Path, rel: &str) -> Option<PathBuf> {
 
 fn candidates(t: &Table) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
+    // Windows paths ignore case: PUPVideos\Matrix and PUPVideos\matrix
+    // (a pack named by the script and by the ROM) are one folder.
+    let same = |a: &Src, b: &Src| match (a, b) {
+        (Src::File(x), Src::File(y)) => {
+            x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+        }
+        _ => a == b,
+    };
     let mut push = |c: Candidate| {
-        if !out.iter().any(|o| o.src == c.src) {
+        if !out.iter().any(|o| same(&o.src, &c.src)) {
             out.push(c);
         }
     };

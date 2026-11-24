@@ -34,7 +34,7 @@ Run **`vp-audio-extract-gui.exe`**. It finds Popper by itself (or use *Choose…
 - **⏵** beside a table's Audio plays it in the window (**⏹** stops it, and Space plays or stops the last row clicked); a clip recorded earlier but not installed yet can be previewed the same way.
 - **Remove audio from N** removes the selected tables' Audio media, after asking. The files are moved to `data\removed\<time>\` beside the exe rather than deleted, so you can put them back.
 - **Restore…** lists each removal with its time and tables, and puts a batch back where it came from. A file whose place has been taken by new audio since stays in the backup rather than overwrite it.
-- **Settings…** holds the libpinmame DLL (found by itself, or chosen), clip length, format, how many recordings run at once, fades and loudness. The toolbar warns in red when libpinmame can't be found. During a run each table shows what it's doing, the progress bar says about how long is left, and *Cancel* stops it (closing the window asks, then stops it too). The *Source* column says where the audio this tool made came from (hover for the file), and a banner sums up each run.
+- **Settings…** holds the libpinmame DLL and ffmpeg (each found by itself, or chosen), clip length, format, how many recordings run at once, fades and loudness. The toolbar warns in red when libpinmame can't be found. During a run each table shows what it's doing, the progress bar says about how long is left, and *Cancel* stops it (closing the window asks, then stops it too). The *Source* column says where the audio this tool made came from (hover for the file), and a banner sums up each run.
 
 ## Command line
 

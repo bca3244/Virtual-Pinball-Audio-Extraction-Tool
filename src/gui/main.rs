@@ -152,6 +152,8 @@ struct App {
     took: Vec<f64>,
     /// ROM recordings in the run, and finished.
     roms: (usize, usize),
+    /// A look through tables' files failed this run (no ffmpeg?).
+    table_failed: bool,
     /// Tables in the run going on.
     run_tables: usize,
     /// Closing was asked for while recording: asking whether to stop.
@@ -194,6 +196,7 @@ impl App {
             running: HashMap::new(),
             took: Vec::new(),
             roms: (0, 0),
+            table_failed: false,
             run_tables: 0,
             ask_close: false,
             close_when_done: false,
@@ -316,6 +319,7 @@ impl App {
         self.running.clear();
         self.took.clear();
         self.roms = (0, 0);
+        self.table_failed = false;
         self.run_tables = keys.len();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -338,7 +342,10 @@ impl App {
                     None if roms_to_record => anyhow::bail!("libpinmame not found: choose it with \"libpinmame…\" (VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll)"),
                     None => {}
                 }
-                let ffmpeg = encode::find_ffmpeg(None, Some(&popper_dir));
+                let ffmpeg = find_ffmpeg(settings.ffmpeg.as_deref(), Some(&popper_dir));
+                if ffmpeg.is_none() {
+                    log::warn!("ffmpeg not found: PuP, altsound and table music can't be read (set it in Settings…)");
+                }
                 let progress = |p: record::Event| {
                     match &p {
                         record::Event::Planned { total, .. } => t.store(*total, Ordering::SeqCst),
@@ -511,6 +518,7 @@ impl App {
                 }
                 RunEvent::Finished(rom, games, outcome, secs, rom_recording) => {
                     self.running.remove(&rom);
+                    self.table_failed |= !rom_recording && outcome == record::Outcome::Failed;
                     if rom_recording {
                         self.roms.1 += 1;
                         // Cut short or broken: says nothing of how long one takes.
@@ -619,11 +627,14 @@ impl App {
                 self.settings.popper = Settings::load(&self.cache).popper;
             }
             JobResult::Recorded(failed, msg) => {
-                let msg = if failed {
+                let mut msg = if failed {
                     msg
                 } else {
                     self.run_banner(cancelled)
                 };
+                if self.table_failed && !cancelled && self.ffmpeg().is_none() {
+                    msg.push_str(" ffmpeg wasn't found, so music from PuP packs, altsound and table files couldn't be read: set it in Settings….");
+                }
                 let failed = failed
                     || self.live.values().any(|l| {
                         matches!(l, Live::Finished(record::Outcome::Failed)) && !cancelled
@@ -639,6 +650,11 @@ impl App {
                 self.rescan(ctx);
             }
         }
+    }
+
+    /// The ffmpeg runs use: the one chosen, else Popper's or one on PATH.
+    fn ffmpeg(&self) -> Option<PathBuf> {
+        find_ffmpeg(self.settings.ffmpeg.as_deref(), self.popper_dir.as_deref())
     }
 
     /// Finds libpinmame again (after a scan, or when it's chosen).
@@ -796,6 +812,42 @@ impl App {
             });
             if let Some(p) = self.dll_problem() {
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 70), p);
+            }
+            ui.add_space(4.0);
+            ui.strong("ffmpeg");
+            let ffmpeg = self.ffmpeg();
+            ui.horizontal_wrapped(|ui| {
+                path_label(ui, ffmpeg.as_deref(), "not found");
+                if ffmpeg.is_some() && ffmpeg != self.settings.ffmpeg {
+                    ui.weak("(found by itself)");
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Choose…"))
+                    .clicked()
+                {
+                    if let Some(f) = rfd::FileDialog::new()
+                        .set_title("ffmpeg (Popper ships one in its Recordings folder)")
+                        .add_filter("ffmpeg", &["exe"])
+                        .pick_file()
+                    {
+                        self.settings.ffmpeg = Some(f);
+                        changed = true;
+                    }
+                }
+                if self.settings.ffmpeg.is_some()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Automatic"))
+                        .clicked()
+                {
+                    self.settings.ffmpeg = None;
+                    changed = true;
+                }
+            });
+            if ffmpeg.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 70),
+                    "ffmpeg not found: music from PuP packs, altsound and table files can't be read, and clips are encoded without it. Popper ships one in its Recordings folder; or choose an ffmpeg.exe.",
+                );
             }
             ui.separator();
             ui.strong("Clips");
@@ -1580,6 +1632,11 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.close_window(&ctx);
     }
+}
+
+/// The ffmpeg chosen, or (when it's gone) Popper's or one on PATH.
+fn find_ffmpeg(chosen: Option<&Path>, popper: Option<&Path>) -> Option<PathBuf> {
+    encode::find_ffmpeg(chosen, popper).or_else(|| encode::find_ffmpeg(None, popper))
 }
 
 /// The app icon (copper-ring note wheel) for the title bar and Alt-Tab.

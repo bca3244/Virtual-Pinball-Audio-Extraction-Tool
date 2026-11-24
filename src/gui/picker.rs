@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vp_audio_extract::record::{self, Entry};
-use vp_audio_extract::{encode, sources, state, wav};
+use vp_audio_extract::{sources, state, wav};
 
 /// The "Choose music" window for one table: its sources are listed, and
 /// previews made, in the background.
@@ -53,7 +53,7 @@ impl App {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let opts = self.options(false, false);
-        let ffmpeg = encode::find_ffmpeg(None, self.popper_dir.as_deref());
+        let ffmpeg = self.ffmpeg();
         let state = Arc::new(Mutex::new(PickState {
             pin: entry.pin.clone(),
             ..PickState::default()

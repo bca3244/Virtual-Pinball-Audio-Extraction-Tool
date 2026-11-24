@@ -2,6 +2,12 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.0
+
+A reworked window. Chips under the list show one kind of table at a time, and the column headers sort. The options moved into *Settings…*, which also shows the libpinmame and ffmpeg found. During a run each table shows what it's doing, and the progress bar says how long is left. A *Source* column says where each table's audio came from, and a banner sums up each run. Closing mid-run asks first. Keyboard shortcuts: Ctrl+F, Esc, Ctrl+A, Shift-click and Space. Changes since beta.3, from cabinet testing and the final review:
+- ffmpeg can be chosen in *Settings…*, which says when none is found. Without it, music from PuP packs, altsound and table files can't be read, and the banner after a run now says so. A chosen ffmpeg that has gone missing falls back to Popper's.
+- A PuP pack folder named in two cases (`Matrix`, `matrix`) is looked through once.
+
 ## 0.3.0-beta.3
 
 Fixes from review:
