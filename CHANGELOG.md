@@ -2,6 +2,17 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.0-beta.3
+
+Fixes from review:
+- *Record* installs a clip recorded earlier with the same settings at once, as the list says, instead of recording it again (`--retry` on the command line still records again).
+- The time left counts only ROM recordings, and guesses before the first one finishes; looks through table files no longer make it far too low.
+- The window can always be closed: a second close after *Stop and close* closes at once, and a run that breaks down ends instead of holding the window open.
+- Tables left out of a run (or whose audio couldn't be written) no longer stay on "waiting to record…"; after Cancel, chosen music isn't encoded any more.
+- ROMs that really gave no music count as that in the banner after a Cancel, not as failures.
+- Source shows PuP or altsound only for music from those, not for any path containing the word.
+- Space presses a focused button or checkbox rather than playing.
+
 ## 0.3.0-beta.2
 
 GUI:

@@ -191,9 +191,9 @@ pub fn source_kind(source: &str, what: &str, chosen: bool) -> &'static str {
         "chosen"
     } else if w.starts_with("rom") || (w.is_empty() && source.starts_with("rom:")) {
         "ROM"
-    } else if w.contains("altsound") {
+    } else if w.starts_with("altsound") {
         "altsound"
-    } else if w.contains("pup") {
+    } else if w.starts_with("pup") {
         "PuP"
     } else {
         "table"

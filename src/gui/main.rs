@@ -45,27 +45,38 @@ struct Row {
 
 /// What a recording run reports, for the rows and the progress bar.
 enum RunEvent {
-    Planned,
-    Started(String, Vec<Key>),
-    Finished(String, Vec<Key>, record::Outcome, f64),
+    /// Recordings, and how many of them are of ROMs.
+    Planned(usize),
+    Started(String, Vec<Key>, bool),
+    /// ROM, tables, outcome, seconds it took, whether it was a ROM recording.
+    Finished(String, Vec<Key>, record::Outcome, f64, bool),
     Installed(Key, String, bool),
+    Skipped(Key, bool),
 }
 
 impl RunEvent {
     fn from(ev: record::Event) -> RunEvent {
         let keys = |g: Vec<(i64, &str)>| g.into_iter().map(|(e, n)| (e, n.to_string())).collect();
         match ev {
-            record::Event::Planned { .. } => RunEvent::Planned,
-            record::Event::Started { rom, games } => RunEvent::Started(rom.into(), keys(games)),
+            record::Event::Planned { roms, .. } => RunEvent::Planned(roms),
+            record::Event::Started {
+                rom,
+                games,
+                rom_recording,
+            } => RunEvent::Started(rom.into(), keys(games), rom_recording),
             record::Event::Finished {
                 rom,
                 games,
                 outcome,
                 secs,
+                rom_recording,
                 ..
-            } => RunEvent::Finished(rom.into(), keys(games), outcome, secs),
+            } => RunEvent::Finished(rom.into(), keys(games), outcome, secs, rom_recording),
             record::Event::Installed { game, what, chosen } => {
                 RunEvent::Installed((game.0, game.1.to_string()), what.into(), chosen)
+            }
+            record::Event::Skipped { game, failed } => {
+                RunEvent::Skipped((game.0, game.1.to_string()), failed)
             }
         }
     }
@@ -135,9 +146,12 @@ struct App {
     /// The tables of the run going on (or just done), until the list is
     /// read again.
     live: HashMap<Key, Live>,
-    /// Recordings running, by ROM, and how long finished ones took.
-    running: HashMap<String, Instant>,
+    /// Recordings running, by ROM, and how long finished ROM recordings
+    /// took (looks through table files take seconds: left out of the ETA).
+    running: HashMap<String, (Instant, bool)>,
     took: Vec<f64>,
+    /// ROM recordings in the run, and finished.
+    roms: (usize, usize),
     /// Tables in the run going on.
     run_tables: usize,
     /// Closing was asked for while recording: asking whether to stop.
@@ -179,6 +193,7 @@ impl App {
             live: HashMap::new(),
             running: HashMap::new(),
             took: Vec::new(),
+            roms: (0, 0),
             run_tables: 0,
             ask_close: false,
             close_when_done: false,
@@ -203,6 +218,7 @@ impl App {
             format: self.settings.format,
             force,
             retry,
+            reclip: false,
             include_hidden: true,
             games: Vec::new(),
             extra_rom_dirs: Vec::new(),
@@ -299,10 +315,12 @@ impl App {
         self.live = keys.iter().map(|k| (k.clone(), Live::Queued)).collect();
         self.running.clear();
         self.took.clear();
+        self.roms = (0, 0);
         self.run_tables = keys.len();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let summary = (|| -> anyhow::Result<String> {
+            // A panic still ends the run (or the window could never close).
+            let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<String> {
                 let db = popper::Db::open(&popper_dir)?;
                 let cache = state::Cache::open(Some(&cache_dir))?;
                 let entries: Vec<Entry> = record::plan(&db, &cache, &opts)?
@@ -323,7 +341,7 @@ impl App {
                 let ffmpeg = encode::find_ffmpeg(None, Some(&popper_dir));
                 let progress = |p: record::Event| {
                     match &p {
-                        record::Event::Planned { total } => t.store(*total, Ordering::SeqCst),
+                        record::Event::Planned { total, .. } => t.store(*total, Ordering::SeqCst),
                         record::Event::Finished { done, .. } => d.store(*done, Ordering::SeqCst),
                         _ => {}
                     }
@@ -347,7 +365,8 @@ impl App {
                     "Done: {} table(s) got audio, {} ROM(s) recorded, {} gave no music or would not start, {} failed",
                     s.installed, s.recorded, s.nothing, s.failed
                 ))
-            })();
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("it stopped unexpectedly (see the log)")));
             let (failed, msg) = match summary {
                 Ok(m) => (false, m),
                 Err(e) => (true, format!("Recording failed: {e:#}")),
@@ -482,17 +501,23 @@ impl App {
         let events = std::mem::take(&mut *job.events.lock().unwrap_or_else(|e| e.into_inner()));
         for ev in events {
             match ev {
-                RunEvent::Planned => {}
-                RunEvent::Started(rom, games) => {
+                RunEvent::Planned(roms) => self.roms = (roms, 0),
+                RunEvent::Started(rom, games, rom_recording) => {
                     let now = Instant::now();
-                    self.running.insert(rom, now);
+                    self.running.insert(rom, (now, rom_recording));
                     for g in games {
                         self.live.insert(g, Live::Recording(now));
                     }
                 }
-                RunEvent::Finished(rom, games, outcome, secs) => {
+                RunEvent::Finished(rom, games, outcome, secs, rom_recording) => {
                     self.running.remove(&rom);
-                    self.took.push(secs);
+                    if rom_recording {
+                        self.roms.1 += 1;
+                        // Cut short or broken: says nothing of how long one takes.
+                        if outcome != record::Outcome::Failed {
+                            self.took.push(secs);
+                        }
+                    }
                     for g in games {
                         if let Some(l) = after(self.live.get(&g), outcome) {
                             self.live.insert(g, l);
@@ -501,6 +526,12 @@ impl App {
                 }
                 RunEvent::Installed(g, what, chosen) => {
                     self.live.insert(g, Live::Got(what, chosen));
+                }
+                RunEvent::Skipped(g, false) => {
+                    self.live.remove(&g);
+                }
+                RunEvent::Skipped(g, true) => {
+                    self.live.insert(g, Live::Finished(record::Outcome::Failed));
                 }
             }
         }
@@ -522,9 +553,7 @@ impl App {
         for k in keys {
             match &self.live[k] {
                 Live::Got(what, chosen) => got.push(source_kind("", what, *chosen)),
-                Live::Finished(record::Outcome::Nothing | record::Outcome::NotStarted)
-                    if !cancelled =>
-                {
+                Live::Finished(record::Outcome::Nothing | record::Outcome::NotStarted) => {
                     none.push(title(k))
                 }
                 Live::Finished(_) => failed.push(title(k)),
@@ -538,9 +567,12 @@ impl App {
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else { return };
+        // The result first: every event is pushed before it.
+        let result = job.result.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.poll_events();
         let Some(job) = &self.job else { return };
-        let Some(result) = job.result.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        let Some(result) = result else {
             return;
         };
         let cancelled = job.cancel.load(Ordering::SeqCst);
@@ -980,14 +1012,16 @@ impl App {
             );
             if t > 0 {
                 let now = Instant::now();
-                let running = if self.running.is_empty() {
+                let running: Vec<f64> = self
+                    .running
+                    .values()
+                    .filter(|(_, rom_recording)| *rom_recording)
+                    .map(|(s, _)| now.duration_since(*s).as_secs_f64())
+                    .collect();
+                let running = if running.is_empty() {
                     0.0
                 } else {
-                    self.running
-                        .values()
-                        .map(|s| now.duration_since(*s).as_secs_f64())
-                        .sum::<f64>()
-                        / self.running.len() as f64
+                    running.iter().sum::<f64>() / running.len() as f64
                 };
                 let mut text = format!(
                     "{} {} of {t} (for {} table{})",
@@ -996,7 +1030,15 @@ impl App {
                     self.run_tables,
                     if self.run_tables == 1 { "" } else { "s" }
                 );
-                if let Some(eta) = eta_secs(&self.took, t - d, running, self.parallel) {
+                // Until one has finished: about the length of a recording.
+                let guess = [capture::run_seconds(self.settings.seconds) + 5.0];
+                let took = if self.took.is_empty() {
+                    &guess[..]
+                } else {
+                    &self.took[..]
+                };
+                let left = self.roms.0.saturating_sub(self.roms.1);
+                if let Some(eta) = eta_secs(took, left, running, self.parallel) {
                     text = format!("{text} · {}", eta_text(eta));
                 }
                 ui.add(
@@ -1301,7 +1343,10 @@ impl App {
                 }
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+        // Space presses a focused button or checkbox instead.
+        if ctx.memory(|m| m.focused().is_none())
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
             let recording = self.recording();
             let clip = self.last_clicked.as_ref().and_then(|k| {
                 self.rows
@@ -1471,13 +1516,15 @@ impl eframe::App for App {
         if self.busy() || self.picker.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.recording() {
+        // Asked again after "Stop and close": it closes now.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.recording()
+            && !self.close_when_done
+        {
             // Recordings are child processes writing into Popper's media:
             // they're stopped first.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if !self.close_when_done {
-                self.ask_close = true;
-            }
+            self.ask_close = true;
         }
         self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| {

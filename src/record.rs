@@ -79,6 +79,8 @@ pub struct Options {
     pub format: Format,
     pub force: bool,
     pub retry: bool,
+    /// Record again even where a clip is cached (with these settings).
+    pub reclip: bool,
     /// Also re-record tables with audio whose ROM zip or table changed
     /// since that audio was installed.
     pub changed: bool,
@@ -307,7 +309,7 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         let rom_clip = cache
             .clip(&rom, opts.seconds, &opts.finish, opts.format.ext())
             .filter(|c| !older_than(c, &zip));
-        if let Some(clip) = rom_clip.or(own).filter(|_| !opts.retry) {
+        if let Some(clip) = rom_clip.or(own).filter(|_| !opts.reclip) {
             entry.status = Status::Cached(clip);
         } else if let Some(why) = cache
             .verdict(
@@ -586,7 +588,7 @@ fn from_table(entry: &mut Entry, script: Option<&str>, cache: &Cache, opts: &Opt
     let key = state::table_key(&t);
     entry.status = if let Some(clip) = cache
         .clip(&key, opts.seconds, &opts.finish, opts.format.ext())
-        .filter(|c| !opts.retry && !older_than(c, &t))
+        .filter(|c| !opts.reclip && !older_than(c, &t))
     {
         Status::Cached(clip)
     } else if let Some(why) = cache
@@ -896,12 +898,14 @@ pub struct Summary {
 /// What a run is doing, for a progress display. A table is known by its
 /// emulator id and Popper GameName.
 pub enum Event<'a> {
-    /// The recordings to run (cached clips go in before them).
-    Planned { total: usize },
+    /// The recordings to run (cached clips go in before them), and how
+    /// many of them are of ROMs (the rest look through tables' files).
+    Planned { total: usize, roms: usize },
     /// A recording started: of a ROM, or a look through tables' own files.
     Started {
         rom: &'a str,
         games: Vec<(i64, &'a str)>,
+        rom_recording: bool,
     },
     /// It finished.
     Finished {
@@ -911,7 +915,12 @@ pub enum Event<'a> {
         games: Vec<(i64, &'a str)>,
         outcome: Outcome,
         secs: f64,
+        /// It was a ROM recording (not a look through tables' files).
+        rom_recording: bool,
     },
+    /// A table that won't get audio this run without a recording finishing:
+    /// left as it is, or its audio couldn't be installed (`failed`).
+    Skipped { game: (i64, &'a str), failed: bool },
     /// A table got audio, from `what` (see [`state::Installed::what`]).
     Installed {
         game: (i64, &'a str),
@@ -971,6 +980,17 @@ impl Runner<'_> {
         // Cached clips go straight in.
         let mut jobs: BTreeMap<String, Job> = BTreeMap::new();
         for e in entries {
+            // Nothing more starts once cancelled (chosen music is encoded
+            // here).
+            if self.cancelled() {
+                break;
+            }
+            let skip = |e: &Entry| {
+                self.event(Event::Skipped {
+                    game: (e.emu.id, &e.game.name),
+                    failed: false,
+                })
+            };
             match &e.status {
                 Status::Cached(clip) => {
                     let clip = clip.clone();
@@ -986,7 +1006,7 @@ impl Runner<'_> {
                 Status::Todo if e.pin.is_some() && self.pinned(&e, &summary) => {}
                 // A choice that couldn't be used doesn't replace the audio
                 // it gave (unless everything is being replaced).
-                Status::Todo if e.pin.is_some() && e.replace && !self.opts.force => {}
+                Status::Todo if e.pin.is_some() && e.replace && !self.opts.force => skip(&e),
                 Status::Todo => {
                     // A choice that couldn't be used: what's installed
                     // instead is from the ROM or the sources found.
@@ -995,7 +1015,10 @@ impl Runner<'_> {
                     let (key, zip) = match (e.rom.clone(), e.rom_zip.clone(), &e.source_key) {
                         (Some(rom), Some(zip), _) => (rom, Some(zip)),
                         (_, None, Some(k)) => (k.clone(), None),
-                        _ => continue,
+                        _ => {
+                            skip(&e);
+                            continue;
+                        }
                     };
                     jobs.entry(key.clone())
                         .or_insert_with(|| Job {
@@ -1006,11 +1029,14 @@ impl Runner<'_> {
                         .entries
                         .push(e);
                 }
-                _ => {}
+                _ => skip(&e),
             }
         }
         let jobs: Vec<Job> = jobs.into_values().collect();
-        self.event(Event::Planned { total: jobs.len() });
+        self.event(Event::Planned {
+            total: jobs.len(),
+            roms: jobs.iter().filter(|j| j.zip.is_some()).count(),
+        });
         if jobs.is_empty() {
             return summary.into_inner().unwrap_or_default();
         }
@@ -1036,6 +1062,7 @@ impl Runner<'_> {
                     self.event(Event::Started {
                         rom: &job.rom,
                         games: games(&job.entries),
+                        rom_recording: job.zip.is_some(),
                     });
                     let outcome = self.record_one(job, &summary);
                     let n = done.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1058,6 +1085,7 @@ impl Runner<'_> {
                         games: games(&job.entries),
                         outcome,
                         secs: started.elapsed().as_secs_f64(),
+                        rom_recording: job.zip.is_some(),
                     });
                 });
             }
@@ -1469,6 +1497,9 @@ impl Runner<'_> {
             Outcome::Nothing | Outcome::NotStarted if self.cancelled() => {
                 // Cut short: not a verdict on the ROM.
                 s.failed += 1;
+                drop(s);
+                let _ = std::fs::remove_dir_all(tmp);
+                return Outcome::Failed;
             }
             Outcome::Nothing | Outcome::NotStarted => {
                 s.nothing += 1;
@@ -1741,7 +1772,13 @@ impl Runner<'_> {
                         chosen: e.pin.is_some(),
                     });
                 }
-                Err(err) => log::warn!("{}: {err:#}", e.game.display),
+                Err(err) => {
+                    log::warn!("{}: {err:#}", e.game.display);
+                    self.event(Event::Skipped {
+                        game: (e.emu.id, &e.game.name),
+                        failed: true,
+                    });
+                }
             }
         }
     }
@@ -1786,6 +1823,7 @@ mod tests {
             format: Format::Mp3,
             force: false,
             retry: false,
+            reclip: false,
             include_hidden: false,
             games: Vec::new(),
             extra_rom_dirs: vec![roms.to_path_buf()],

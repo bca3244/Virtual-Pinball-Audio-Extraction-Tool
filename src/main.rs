@@ -107,6 +107,7 @@ impl Common {
             format: self.format,
             force: self.force,
             retry: self.retry,
+            reclip: self.retry,
             include_hidden: self.include_hidden,
             games: self.games.clone(),
             extra_rom_dirs: self.rom_dirs.clone(),
