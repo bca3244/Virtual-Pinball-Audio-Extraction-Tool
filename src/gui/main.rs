@@ -322,6 +322,8 @@ impl App {
             result.clone(),
             events.clone(),
         );
+        // Not while recording: the scan after it counts again.
+        self.choices_gen.fetch_add(1, Ordering::SeqCst);
         self.live = keys.iter().map(|k| (k.clone(), Live::Queued)).collect();
         self.running.clear();
         self.took.clear();
@@ -618,11 +620,11 @@ impl App {
                         entry,
                     })
                     .collect();
-                self.count_choices(ctx);
                 if self.settings.popper.is_none() {
                     log::info!("Popper: {}", dir.display());
                 }
                 self.popper_dir = Some(dir);
+                self.count_choices(ctx);
                 self.error = None;
                 // A folder chosen is kept once it reads.
                 self.settings.save(&self.cache);
@@ -677,17 +679,24 @@ impl App {
             ctx.clone(),
         );
         std::thread::spawn(move || {
+            let started = Instant::now();
+            let (total, mut with) = (entries.len(), 0);
             for e in entries {
                 if current.load(Ordering::SeqCst) != gen {
                     return;
                 }
                 let n = record::choices(&e, &opts).len();
+                with += (n > 0) as usize;
                 counts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key(&e), n);
                 ctx.request_repaint();
             }
+            log::info!(
+                "Looked for music in {total} table(s)' files: {with} have some to choose from ({:.0} s)",
+                started.elapsed().as_secs_f64()
+            );
         });
     }
 

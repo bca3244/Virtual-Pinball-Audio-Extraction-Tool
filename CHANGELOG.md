@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.1
+
+- *Music…* is offered only for tables whose files hold music to choose from (or whose music was already chosen by hand, to go back to Automatic). The list looks through the table files in the background after it loads (about 45 s for 137 tables), and the log says how many have a choice; hovering a greyed-out button says why. The look pauses while recording.
+
 ## 0.3.1-beta.1
 
 - *Music…* is offered only for tables whose files hold music to choose from (or whose music was already chosen by hand, to go back to Automatic). The list looks through the table files in the background after it loads; hovering a greyed-out button says why.
