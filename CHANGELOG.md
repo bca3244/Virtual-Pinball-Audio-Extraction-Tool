@@ -2,6 +2,12 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.2.0-beta.3
+
+- Tables whose ROM zip or table files changed since this tool made their audio can be recorded again: `record --changed`, or in the GUI they show as "changed since its audio was made", *Select missing or changed* picks them, and Record asks before replacing. Audio you replaced by hand, or that this tool didn't make, is left alone. A ROM zip that has gone missing, or a changed ROM that now gives no music, keeps the old recording.
+- Audio that gets replaced (Replace, `--force`, or a changed table) is moved to `data\removed\<time>\` first, so *Restore* (or `restore`) can put it back, and it's put back at once if the new file can't be written.
+- A clip cached before its ROM zip was last changed is recorded again rather than reused.
+
 ## 0.2.0-beta.2
 
 - Fixed: beta.1's `record` and `scan` crashed at startup (the new `--lufs` option was declared and read as different types). `--lufs -16` with a space also works now, as well as `--lufs=-16`.

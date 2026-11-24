@@ -7,7 +7,7 @@
 use crate::encode::{self, Format};
 use crate::popper::{self, Db, Emulator, Game};
 use crate::state::{self, Cache};
-use crate::{capture, pinmame, sources, vpx, wav};
+use crate::{backup, capture, pinmame, sources, vpx, wav};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -54,6 +54,11 @@ pub struct Entry {
     /// Said along with the status (why there's no ROM recording).
     pub note: Option<String>,
     pub status: Status,
+    /// Its Audio media is to be replaced (Replace, or its source changed).
+    pub replace: bool,
+    /// The Audio media it has, while it's planned to be re-recorded because
+    /// what it came from changed (see [`Options::changed`]).
+    pub existing: Option<PathBuf>,
 }
 
 impl Entry {
@@ -70,6 +75,9 @@ pub struct Options {
     pub format: Format,
     pub force: bool,
     pub retry: bool,
+    /// Also re-record tables with audio whose ROM zip or table changed
+    /// since that audio was installed.
+    pub changed: bool,
     pub include_hidden: bool,
     pub games: Vec<String>,
     pub extra_rom_dirs: Vec<PathBuf>,
@@ -227,6 +235,8 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             source_key: None,
             note: None,
             status: Status::Todo,
+            replace: opts.force,
+            existing: None,
         };
         let Some(media) = emu.media_dir.as_deref() else {
             entry.status = Status::NoMediaDir;
@@ -246,9 +256,14 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             .or_else(|| script.as_deref().and_then(vpx::rom_name));
         if !opts.force {
             if let Some(found) = popper::existing_audio(media, &game.name) {
-                entry.status = Status::HasAudio(found);
-                out.push(entry);
-                continue;
+                if opts.changed {
+                    // Planned as if it had none; settled below.
+                    entry.existing = Some(found);
+                } else {
+                    entry.status = Status::HasAudio(found);
+                    out.push(entry);
+                    continue;
+                }
             }
         }
         let Some(rom) = entry.rom.clone() else {
@@ -273,18 +288,20 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         };
         // The table's own music, kept when its ROM gave none.
         let own = table.as_deref().and_then(|t| {
-            cache.clip(
-                &state::table_key(t),
-                opts.seconds,
-                &opts.finish,
-                opts.format.ext(),
-            )
+            cache
+                .clip(
+                    &state::table_key(t),
+                    opts.seconds,
+                    &opts.finish,
+                    opts.format.ext(),
+                )
+                .filter(|c| !older_than(c, t))
         });
-        if let Some(clip) = cache
+        // A clip from before the zip was last changed is of the old ROM.
+        let rom_clip = cache
             .clip(&rom, opts.seconds, &opts.finish, opts.format.ext())
-            .or(own)
-            .filter(|_| !opts.retry)
-        {
+            .filter(|c| !older_than(c, &zip));
+        if let Some(clip) = rom_clip.or(own).filter(|_| !opts.retry) {
             entry.status = Status::Cached(clip);
         } else if let Some(why) = cache
             .verdict(
@@ -304,7 +321,90 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         }
         out.push(entry);
     }
+    if opts.changed {
+        for e in out.iter_mut() {
+            settle_existing(e, cache, opts);
+        }
+    }
     Ok(out)
+}
+
+/// Whether `a` was last modified before `b`.
+fn older_than(a: &Path, b: &Path) -> bool {
+    let t = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((t(a), t(b)), (Some(x), Some(y)) if x < y)
+}
+
+/// What a table's music came from, as it is now: its ROM zip, or (for music
+/// from its own files) the table and the music sources found with it. Sizes
+/// and times only, no paths (see [`state::same_source`]).
+pub fn source_id(e: &Entry, opts: &Options) -> String {
+    use sha1::{Digest, Sha1};
+    if let Some(zip) = &e.rom_zip {
+        return format!("rom:{}", state::stamp_id(zip));
+    }
+    let Some(t) = e.table.as_deref().filter(|t| t.is_file()) else {
+        return String::new();
+    };
+    let script = vpx::read_script(t).ok();
+    let dirs = vpx_dirs(&e.emu, opts.vpx_dir.as_deref());
+    let found = source_table(e, t, script.as_deref(), &dirs, opts);
+    let h: String = Sha1::digest(sources::fingerprint(&found).as_bytes())
+        .iter()
+        .take(10)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("table:{}:{h}", state::stamp_id(t))
+}
+
+/// A table that has audio stays "has audio" unless what that audio came
+/// from changed since this tool installed it, and the file is still the one
+/// it installed. Audio from before this was remembered counts as this
+/// tool's only when it's a copy of one of its clips.
+fn settle_existing(e: &mut Entry, cache: &Cache, opts: &Options) {
+    let Some(found) = e.existing.take() else {
+        return;
+    };
+    // Only what can be recorded again counts: a verdict is of the files as
+    // they are now, and a ROM zip gone missing isn't a reason to swap a ROM
+    // recording for the table's own music.
+    let recordable = matches!(e.status, Status::Todo | Status::Cached(_))
+        && (e.rom.is_none() || e.rom_zip.is_some());
+    let media = e.emu.media_dir.clone();
+    let (Some(media), true) = (media, recordable) else {
+        e.status = Status::HasAudio(found);
+        return;
+    };
+    let now = source_id(e, opts);
+    let changed = match cache.installed(&media, &e.game.name) {
+        Some(was) => {
+            !now.is_empty()
+                && !state::same_source(&was.source, &now)
+                && state::stamp(&found).is_some_and(|s| s == was.file)
+        }
+        None => {
+            let ours = e.rom.iter().any(|r| cache.is_clip_of(r, &found))
+                || e.table
+                    .as_deref()
+                    .is_some_and(|t| cache.is_clip_of(&state::table_key(t), &found));
+            // A copy of a clip made before the zip last changed (Windows
+            // keeps the clip's time on a copy) is of the old ROM.
+            let stale = ours && e.rom_zip.as_deref().is_some_and(|z| older_than(&found, z));
+            if ours && !stale && !now.is_empty() {
+                cache.set_installed(&media, &e.game.name, &now, &found);
+            }
+            stale
+        }
+    };
+    if !changed {
+        e.status = Status::HasAudio(found);
+        return;
+    }
+    e.replace = true;
+    e.existing = Some(found);
+    e.note = Some("its ROM or table changed since its audio was made".into());
+    // A cached clip is of the old files.
+    e.status = Status::Todo;
 }
 
 /// Where a table's own files are looked for music.
@@ -361,7 +461,7 @@ fn from_table(entry: &mut Entry, script: Option<&str>, cache: &Cache, opts: &Opt
     let key = state::table_key(&t);
     entry.status = if let Some(clip) = cache
         .clip(&key, opts.seconds, &opts.finish, opts.format.ext())
-        .filter(|_| !opts.retry)
+        .filter(|c| !opts.retry && !older_than(c, &t))
     {
         Status::Cached(clip)
     } else if let Some(why) = cache
@@ -685,6 +785,10 @@ pub struct Runner<'a> {
     /// Set to stop: no new recordings start, running ones are killed.
     pub cancel: Option<&'a AtomicBool>,
     pub on_progress: Option<&'a (dyn Fn(Progress) + Sync)>,
+    /// Where replaced Audio media goes this run (made when first needed);
+    /// held while a table's audio is swapped, so the restore list is
+    /// written by one thread at a time.
+    pub batch: Mutex<Option<PathBuf>>,
 }
 
 /// Recordings at once: each keeps an emulator busy in real time (about one
@@ -942,7 +1046,9 @@ impl Runner<'_> {
         // of the tables' own music either.
         let mut rest = job.entries.clone();
         if matches!(outcome, Outcome::Nothing | Outcome::NotStarted) && !self.cancelled() {
-            rest.retain(|e| !self.own_music(e, summary));
+            // A table re-recorded because its ROM changed keeps its old
+            // recording rather than swap it for its own files' music.
+            rest.retain(|e| (e.replace && !self.opts.force) || !self.own_music(e, summary));
             if rest.is_empty() {
                 let _ = std::fs::remove_dir_all(&tmp);
                 // Every table has its own music now: the ROM still gave
@@ -1329,9 +1435,32 @@ impl Runner<'_> {
             let Some(media) = e.emu.media_dir.as_deref() else {
                 continue;
             };
-            match popper::install(clip, media, &e.game.name, self.opts.force) {
+            let replace = self.opts.force || e.replace;
+            let installed = if replace {
+                // The old audio is kept, so a re-record can be undone
+                // (Restore), and put back if the new one can't be written.
+                let mut batch = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+                let dir = batch
+                    .get_or_insert_with(|| backup::new_batch(&self.cache.dir))
+                    .clone();
+                match backup::set_aside(media, &e.game.name, &dir) {
+                    Err(err) => Err(err.context("couldn't set the old audio aside")),
+                    Ok(moved) => {
+                        let r = popper::install(clip, media, &e.game.name, true);
+                        if r.is_err() {
+                            backup::put_back(&moved);
+                        }
+                        r
+                    }
+                }
+            } else {
+                popper::install(clip, media, &e.game.name, false)
+            };
+            match installed {
                 Ok(dest) => {
                     log::info!("{}: wrote {}", e.game.display, dest.display());
+                    self.cache
+                        .set_installed(media, &e.game.name, &source_id(e, self.opts), &dest);
                     summary.lock().unwrap_or_else(|e| e.into_inner()).installed += 1;
                 }
                 Err(err) => log::warn!("{}: {err:#}", e.game.display),
@@ -1384,6 +1513,7 @@ mod tests {
             extra_rom_dirs: vec![roms.to_path_buf()],
             vpx_dir: None,
             popper_dir: None,
+            changed: false,
         }
     }
 
@@ -1463,11 +1593,55 @@ mod tests {
             parallel: 1,
             cancel: None,
             on_progress: None,
+            batch: Default::default(),
         };
         let s = runner.run(plan2);
         assert_eq!(s.installed, 2);
         assert!(media.join("Audio").join("AFM.mp3").is_file());
         assert!(media.join("Audio").join("AFM Mod.mp3").is_file());
+
+        // With --changed, audio stays while its ROM zip is the same...
+        let changed = Options {
+            changed: true,
+            ..opts(&roms)
+        };
+        let status = |plan: &[Entry], n: &str| {
+            let e = plan.iter().find(|e| e.game.name == n).unwrap();
+            (e.status.clone(), e.replace)
+        };
+        let p = super::plan(&db, &cache, &changed).unwrap();
+        assert!(matches!(status(&p, "AFM"), (Status::HasAudio(_), false)));
+        assert!(matches!(
+            status(&p, "Has Audio"),
+            (Status::HasAudio(_), false)
+        ));
+        assert!(matches!(
+            status(&p, "Twilight"),
+            (Status::Verdict(_), false)
+        ));
+
+        // ...and is re-recorded once the zip changes,
+        std::fs::write(roms.join("afm_113b.zip"), b"a newer zip").unwrap();
+        let p = super::plan(&db, &cache, &changed).unwrap();
+        assert!(matches!(status(&p, "AFM"), (Status::Todo, true)));
+        assert!(p
+            .iter()
+            .find(|e| e.game.name == "AFM")
+            .unwrap()
+            .existing
+            .is_some());
+        // (not audio this tool didn't make)
+        assert!(matches!(
+            status(&p, "Has Audio"),
+            (Status::HasAudio(_), false)
+        ));
+        // but not without --changed,
+        let p = super::plan(&db, &cache, &opts(&roms)).unwrap();
+        assert!(matches!(status(&p, "AFM"), (Status::HasAudio(_), false)));
+        // nor when the audio was replaced by hand since.
+        std::fs::write(media.join("Audio").join("AFM.mp3"), b"my own").unwrap();
+        let p = super::plan(&db, &cache, &changed).unwrap();
+        assert!(matches!(status(&p, "AFM"), (Status::HasAudio(_), false)));
     }
 
     #[test]

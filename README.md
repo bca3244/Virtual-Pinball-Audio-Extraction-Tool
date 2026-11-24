@@ -27,8 +27,8 @@ The recording approach (timeline, clip cutting, trough switches) is ported from 
 
 Run **`vp-audio-extract-gui.exe`**. It finds Popper by itself (or use *Choose…*) and lists every Visual Pinball table with its ROM and whether it has Audio media.
 
-- **Selecting tables:** tick tables one by one, or use *Select all*, *Select missing audio* or *Select none*. The filter box narrows the list, and the select buttons only act on what's shown.
-- **Record N** records the selected tables that have no audio. With *Replace existing audio* ticked it re-records tables that already have some, after asking. A table that gave nothing before is tried again when you select it.
+- **Selecting tables:** tick tables one by one, or use *Select all*, *Select missing or changed* (tables without audio, and tables whose ROM zip or table changed since this tool made their audio) or *Select none*. The filter box narrows the list, and the select buttons only act on what's shown.
+- **Record N** records the selected tables that have no audio. With *Replace existing audio* ticked it re-records tables that already have some, after asking. Replaced audio is moved to `data\removed\<time>\` first, so *Restore* can put it back. A table that gave nothing before is tried again when you select it.
 - **⏵** beside a table's Audio plays it in the window (**⏹** stops it); a clip recorded earlier but not installed yet can be previewed the same way.
 - **Remove audio from N** removes the selected tables' Audio media, after asking. The files are moved to `data\removed\<time>\` beside the exe rather than deleted, so you can put them back.
 - **Restore…** lists each removal with its time and tables, and puts a batch back where it came from. A file whose place has been taken by new audio since stays in the backup rather than overwrite it.
@@ -68,7 +68,8 @@ Close VPX while it records, because each recording keeps one CPU core busy in re
 | `--lufs N\|off` | loudness every clip is levelled to, -40 to -6 LUFS (default -16); `off` normalises by peak instead |
 | `--fade-in S`, `--fade-out S` | fade lengths in seconds, 0 to 10 (defaults 0 and 1) |
 | `--format mp3\|ogg\|wav` | output format (default mp3) |
-| `--force` | replace existing Audio media of the same name and format |
+| `--force` | replace existing Audio media of the same name and format (the old file is kept under `data\removed`) |
+| `--changed` | also re-record tables whose ROM zip or table changed since this tool made their audio (audio replaced by hand, or not made by this tool, is left alone) |
 | `--retry` | ignore remembered results ("gave no music", cached clips) |
 | `--include-hidden` | also tables hidden in Popper |
 | `-v` | more detail |
@@ -77,7 +78,8 @@ Results are remembered in a `data` folder beside the exe (or `%LOCALAPPDATA%\vp-
 
 - **`clips\`** holds every recorded clip, so a table added later on a ROM already recorded gets its audio at once.
 - **`verdicts\`** lists the ROMs that gave no music. They aren't tried again until their zip files change (a parent set added, a newer version) or you pass `--retry`.
-- **`removed\`** holds audio removed in the window, one folder per removal, until it's restored.
+- **`installed\`** remembers what each table's audio was made from, for `--changed`.
+- **`removed\`** holds audio removed in the window or replaced, one folder per removal, until it's restored.
 - **`vp-audio-extract.log`** is the log of each run.
 
 Some ROMs only play attract or boot sounds, or need a special start sequence, so give the results a listen. Delete a bad file from Popper's `Audio` folder and re-run with `--retry -g <table>`, or replace it by hand.

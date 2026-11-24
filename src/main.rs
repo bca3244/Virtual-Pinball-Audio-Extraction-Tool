@@ -79,6 +79,10 @@ struct Common {
     /// Try ROMs again that gave nothing before, and re-record cached clips.
     #[arg(long)]
     retry: bool,
+    /// Also re-record tables whose audio this tool made, when their ROM zip
+    /// or table files changed since (the old file is kept under data\removed).
+    #[arg(long)]
+    changed: bool,
     /// Include tables hidden in Popper.
     #[arg(long)]
     include_hidden: bool,
@@ -108,6 +112,7 @@ impl Common {
             extra_rom_dirs: self.rom_dirs.clone(),
             vpx_dir: self.vpx.clone(),
             popper_dir: None,
+            changed: self.changed,
         }
     }
 }
@@ -254,6 +259,7 @@ fn run(cli: Cli) -> Result<()> {
                 parallel: parallel.unwrap_or_else(record::default_parallel).max(1),
                 cancel: None,
                 on_progress: None,
+                batch: Default::default(),
             };
             let s = runner.run(entries);
             log::info!(
@@ -308,7 +314,7 @@ mod tests {
         for (args, want) in [
             (vec!["x", "scan"], Some(-16.0)),
             (vec!["x", "record", "--lufs", "-20"], Some(-20.0)),
-            (vec!["x", "record", "--lufs=-12"], Some(-12.0)),
+            (vec!["x", "record", "--lufs=-12", "--changed"], Some(-12.0)),
             (vec!["x", "record", "--lufs", "off"], None),
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();

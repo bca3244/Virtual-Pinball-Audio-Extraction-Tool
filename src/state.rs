@@ -124,6 +124,135 @@ impl Cache {
     }
 }
 
+/// What was installed for a table, to tell later whether its source changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Installed {
+    /// [`record`]'s source id when it was installed.
+    pub source: String,
+    /// Size and modified time of the file installed: a file replaced by
+    /// hand since is left alone.
+    pub file: (u64, u64),
+}
+
+/// Size and modified time (seconds) of a file.
+pub fn stamp(p: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((m.len(), mtime))
+}
+
+impl Cache {
+    /// Per table: the same GameName under two emulators is two tables.
+    fn installed_file(&self, media_dir: &Path, game: &str) -> PathBuf {
+        let h: String = Sha1::digest(format!("{}\n{game}", media_dir.display()).as_bytes())
+            .iter()
+            .take(10)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        self.dir.join("installed").join(format!("{h}.txt"))
+    }
+
+    pub fn installed(&self, media_dir: &Path, game: &str) -> Option<Installed> {
+        let text = std::fs::read_to_string(self.installed_file(media_dir, game)).ok()?;
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+                .map(str::to_string)
+        };
+        Some(Installed {
+            source: get("source")?,
+            file: (get("size")?.parse().ok()?, get("mtime")?.parse().ok()?),
+        })
+    }
+
+    /// Remembers that `file` was installed for `game` from `source`.
+    pub fn set_installed(&self, media_dir: &Path, game: &str, source: &str, file: &Path) {
+        let Some((size, mtime)) = stamp(file) else {
+            return;
+        };
+        let p = self.installed_file(media_dir, game);
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&self.dir));
+        let line = |v: &str| v.replace(['\r', '\n'], " ");
+        if let Err(e) = std::fs::write(
+            &p,
+            format!(
+                "game={}\nsource={}\nsize={size}\nmtime={mtime}\n",
+                line(game),
+                line(source)
+            ),
+        ) {
+            log::warn!("{game}: couldn't remember what was installed: {e}");
+        }
+    }
+
+    /// Whether `file` is a copy of a clip this tool made for `key` (a ROM or
+    /// table key), with any settings or recorder version.
+    pub fn is_clip_of(&self, key: &str, file: &Path) -> bool {
+        let Ok(len) = std::fs::metadata(file).map(|m| m.len()) else {
+            return false;
+        };
+        let Ok(dir) = std::fs::read_dir(self.dir.join("clips")) else {
+            return false;
+        };
+        let key = key.to_ascii_lowercase();
+        let mut bytes: Option<Vec<u8>> = None;
+        for e in dir.flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            let ours = name
+                .strip_prefix(&key)
+                .is_some_and(|r| r.starts_with('-') || r.starts_with('.'));
+            if !ours || e.metadata().map(|m| m.len()).ok() != Some(len) {
+                continue;
+            }
+            let mine = match &bytes {
+                Some(b) => b,
+                None => match std::fs::read(file) {
+                    Ok(b) => bytes.insert(b),
+                    Err(_) => return false,
+                },
+            };
+            if std::fs::read(e.path()).is_ok_and(|c| &c == mine) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// A file's size and modified time as `size:mtime`, for a source id (no
+/// path: the same zip found through another folder is the same zip).
+pub fn stamp_id(p: &Path) -> String {
+    stamp(p).map_or_else(String::new, |(len, t)| format!("{len}:{t}"))
+}
+
+/// Whether two source ids (`kind:size:mtime[:rest]`) name the same files.
+/// Times may differ by a FAT file system's 2 s, or by exactly an hour (FAT
+/// keeps local time, so daylight saving moves it).
+pub fn same_source(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let split = |s: &str| -> Option<(String, String, u64, String)> {
+        let mut p = s.splitn(4, ':');
+        let kind = p.next()?.to_string();
+        let size = p.next()?.to_string();
+        let t = p.next()?.parse().ok()?;
+        Some((kind, size, t, p.next().unwrap_or_default().to_string()))
+    };
+    match (split(a), split(b)) {
+        (Some((k1, s1, t1, r1)), Some((k2, s2, t2, r2))) => {
+            let d = t1.abs_diff(t2);
+            k1 == k2 && s1 == s2 && r1 == r2 && (d <= 2 || d.abs_diff(3600) <= 2)
+        }
+        _ => false,
+    }
+}
+
 fn describe(p: &Path) -> String {
     match std::fs::metadata(p) {
         Ok(m) => {
@@ -313,5 +442,17 @@ mod tests {
                 .unwrap(),
             "wav"
         );
+    }
+
+    #[test]
+    fn source_ids_allow_fat_time_shifts() {
+        use super::same_source;
+        assert!(same_source("rom:10:1000", "rom:10:1000"));
+        assert!(same_source("rom:10:1000", "rom:10:1002"));
+        assert!(same_source("rom:10:1000", "rom:10:4600"));
+        assert!(!same_source("rom:10:1000", "rom:10:2000"));
+        assert!(!same_source("rom:10:1000", "rom:11:1000"));
+        assert!(!same_source("table:10:1000:ab", "table:10:1000:cd"));
+        assert!(!same_source("rom:10:1000", "table:10:1000"));
     }
 }

@@ -314,7 +314,17 @@ struct App {
 }
 
 fn has_audio(e: &Entry) -> bool {
-    matches!(e.status, Status::HasAudio(_))
+    matches!(e.status, Status::HasAudio(_)) || e.existing.is_some()
+}
+
+/// Whether recording it replaces audio it has (always after asking).
+fn replaces(e: &Entry, replace_ticked: bool) -> bool {
+    recordable(e) && has_audio(e) && (replace_ticked || e.replace)
+}
+
+/// Whether Record records it.
+fn to_record(e: &Entry, replace_ticked: bool) -> bool {
+    recordable(e) && (!has_audio(e) || replaces(e, replace_ticked))
 }
 
 /// Tables that could get audio recorded (or copied from a cached clip).
@@ -366,6 +376,7 @@ impl App {
             extra_rom_dirs: Vec::new(),
             vpx_dir: None,
             popper_dir: self.popper_dir.clone(),
+            changed: true,
         }
     }
 
@@ -412,7 +423,7 @@ impl App {
         };
         let keys: HashSet<Key> = self
             .selected()
-            .filter(|e| recordable(e) && (self.settings.replace || !has_audio(e)))
+            .filter(|e| to_record(e, self.settings.replace))
             .map(key)
             .collect();
         if keys.is_empty() {
@@ -475,6 +486,7 @@ impl App {
                     parallel,
                     cancel: Some(&c),
                     on_progress: Some(&progress),
+                    batch: Default::default(),
                 };
                 let s = runner.run(entries);
                 Ok(format!(
@@ -789,8 +801,10 @@ impl App {
                 }
             }
             if ui
-                .add_enabled(!busy, egui::Button::new("Select missing audio"))
-                .on_hover_text("Tables without Audio media that have a ROM to record")
+                .add_enabled(!busy, egui::Button::new("Select missing or changed"))
+                .on_hover_text(
+                    "Tables without Audio media that can get some, and tables whose ROM or table changed since this tool made their audio",
+                )
                 .clicked()
             {
                 let vis: Vec<bool> = self.rows.iter().map(|r| self.visible(&r.entry)).collect();
@@ -814,7 +828,7 @@ impl App {
             let with_audio = self.selected().filter(|e| has_audio(e)).count();
             let to_record = self
                 .selected()
-                .filter(|e| recordable(e) && (self.settings.replace || !has_audio(e)))
+                .filter(|e| to_record(e, self.settings.replace))
                 .count();
             ui.separator();
             ui.label(format!("{n} selected"));
@@ -826,7 +840,10 @@ impl App {
                 )
                 .clicked()
             {
-                if self.settings.replace && with_audio > 0 {
+                if self
+                    .selected()
+                    .any(|e| replaces(e, self.settings.replace))
+                {
                     self.confirm = Confirm::Replace;
                 } else {
                     self.start_recording(ui.ctx());
@@ -937,7 +954,9 @@ impl App {
                             ),
                             Status::Todo => (
                                 egui::Color32::from_rgb(220, 170, 60),
-                                if r.entry.from_table() {
+                                if r.entry.replace {
+                                    "changed since its audio was made: can record again".to_string()
+                                } else if r.entry.from_table() {
                                     "missing: can look in the table's files".to_string()
                                 } else {
                                     "missing: can record".to_string()
@@ -954,14 +973,18 @@ impl App {
                             s => (ui.visuals().weak_text_color(), record::describe(s)),
                         };
                         let clip = match &r.entry.status {
-                            Status::HasAudio(p) | Status::Cached(p) => Some(p),
+                            Status::HasAudio(p) => Some(p),
+                            _ if r.entry.existing.is_some() => r.entry.existing.as_ref(),
+                            Status::Cached(p) => Some(p),
                             _ => None,
                         };
                         if let Some(p) = clip {
                             let on = playing.as_deref() == Some(p.as_path());
                             let b = play_button(ui, on, !busy || on).on_hover_text(if on {
                                 "Stop"
-                            } else if matches!(r.entry.status, Status::Cached(_)) {
+                            } else if r.entry.existing.is_none()
+                                && matches!(r.entry.status, Status::Cached(_))
+                            {
                                 "Play the clip that Record would install"
                             } else {
                                 "Play this table's Audio media"
@@ -981,6 +1004,10 @@ impl App {
             return;
         }
         let with_audio = self.selected().filter(|e| has_audio(e)).count();
+        let replacing = self
+            .selected()
+            .filter(|e| replaces(e, self.settings.replace))
+            .count();
         let backup_dir = backup::root(&self.cache);
         let mut go = false;
         let mut close = false;
@@ -995,8 +1022,11 @@ impl App {
                     ));
                 }
                 _ => {
-                    ui.heading(format!("Replace audio on {with_audio} table(s)?"));
-                    ui.label("Those tables already have Audio media. It will be replaced by a new recording from the ROM.");
+                    ui.heading(format!("Replace audio on {replacing} table(s)?"));
+                    ui.label(format!(
+                        "Those tables already have Audio media (some because their ROM or table changed since it was made). It will be replaced by a new recording, and the old files kept in {} for Restore….",
+                        backup_dir.display()
+                    ));
                 }
             }
             ui.add_space(8.0);
