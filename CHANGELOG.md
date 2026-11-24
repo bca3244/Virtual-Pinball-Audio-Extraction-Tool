@@ -2,6 +2,22 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.2.0-beta.4
+
+- **Choose a table's music by hand:** the GUI's *Music…* button lists the music found in the table's files, altsound and PuP pack. ▶ plays each one as it would be installed, and *Use* installs it (the old audio is kept for Restore) and keeps it for that table when it's recorded again. *Automatic* goes back to the ROM recording or the best source.
+- Very quiet ROMs (Apollo 13, Goldeneye: Sega boards at about -60 dBFS) are now levelled too: levelling may add up to +48 dB (was +30).
+- The true peak (between samples) is held under -2 dBTP before encoding, so MP3s stay under -1 dBTP. Before, a few came out at 0 dBTP.
+- GUI:
+  - results and errors of Record, Remove and Restore show in a banner, not only in the log;
+  - rows hidden by the filter aren't acted on, and the confirm dialogs name the tables;
+  - *Select missing or changed* skips ROMs that gave no music last time;
+  - *Replace existing audio* isn't remembered between launches, and *At once* is;
+  - a Popper folder that doesn't read isn't saved;
+  - Cancel shows that it's cancelling;
+  - the ROM filter ignores case;
+  - hover help for fades and loudness.
+- Clips cached by earlier betas are recorded again (new levelling).
+
 ## 0.2.0-beta.3
 
 - Tables whose ROM zip or table files changed since this tool made their audio can be recorded again: `record --changed`, or in the GUI they show as "changed since its audio was made", *Select missing or changed* picks them, and Record asks before replacing. Audio you replaced by hand, or that this tool didn't make, is left alone. A ROM zip that has gone missing, or a changed ROM that now gives no music, keeps the old recording.

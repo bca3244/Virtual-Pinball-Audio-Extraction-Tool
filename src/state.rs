@@ -190,6 +190,36 @@ impl Cache {
         }
     }
 
+    fn pin_file(&self, media_dir: &Path, game: &str) -> PathBuf {
+        let mut p = self.installed_file(media_dir, game);
+        p.set_extension("pin");
+        p
+    }
+
+    /// The music source chosen by hand for a table ([`crate::sources::Choice::id`]).
+    pub fn pin(&self, media_dir: &Path, game: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.pin_file(media_dir, game)).ok()?;
+        let id = text.lines().find_map(|l| l.strip_prefix("source="))?;
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    /// Chooses a table's music source by hand, or (None) goes back to
+    /// finding it by itself.
+    pub fn set_pin(&self, media_dir: &Path, game: &str, id: Option<&str>) -> std::io::Result<()> {
+        let p = self.pin_file(media_dir, game);
+        match id {
+            Some(id) => {
+                std::fs::create_dir_all(p.parent().unwrap_or(&self.dir))?;
+                let line = |v: &str| v.replace(['\r', '\n'], " ");
+                std::fs::write(&p, format!("game={}\nsource={}\n", line(game), line(id)))
+            }
+            None => match std::fs::remove_file(&p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+        }
+    }
+
     /// Whether `file` is a copy of a clip this tool made for `key` (a ROM or
     /// table key), with any settings or recorder version.
     pub fn is_clip_of(&self, key: &str, file: &Path) -> bool {
@@ -277,7 +307,7 @@ const RECORDER_VERSION: u32 = 7;
 /// Bumped when clips recorded before it can't be trusted (v2: static
 /// from an idle sound board is no longer taken for music; v3: a short
 /// start jingle is no longer taken for the music).
-const CLIP_VERSION: u32 = 4;
+const CLIP_VERSION: u32 = 5;
 
 /// The cache name for music taken from a table's own files (no ROM, or a
 /// ROM zip missing): `vpx-<file stem>-<hash of its path>`.
@@ -454,5 +484,19 @@ mod tests {
         assert!(!same_source("rom:10:1000", "rom:11:1000"));
         assert!(!same_source("table:10:1000:ab", "table:10:1000:cd"));
         assert!(!same_source("rom:10:1000", "table:10:1000"));
+    }
+
+    #[test]
+    fn pins_are_per_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(Some(dir.path())).unwrap();
+        let (m1, m2) = (Path::new("C:/media/vpx"), Path::new("C:/media/fx3"));
+        assert_eq!(c.pin(m1, "Tron"), None);
+        c.set_pin(m1, "Tron", Some("file:theme.mp3:123")).unwrap();
+        assert_eq!(c.pin(m1, "Tron").as_deref(), Some("file:theme.mp3:123"));
+        assert_eq!(c.pin(m2, "Tron"), None);
+        c.set_pin(m1, "Tron", None).unwrap();
+        c.set_pin(m1, "Tron", None).unwrap();
+        assert_eq!(c.pin(m1, "Tron"), None);
     }
 }

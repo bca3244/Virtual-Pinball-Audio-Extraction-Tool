@@ -549,13 +549,30 @@ fn remove_dc(cut: &mut [i16], channels: usize) {
     }
 }
 
-/// Most gain either way of levelling (about +30 dB, as peak mode's 32x).
-const MAX_GAIN: f64 = 32.0;
-/// The limiter's ceiling: -1 dBFS.
+/// Most gain levelling gives (+48 dB): some Sega boards play at about
+/// -60 dBFS in libpinmame, and need +46 dB to reach -16 LUFS.
+const MAX_GAIN: f64 = 256.0;
+/// Peak mode's own gain limit (+30 dB), as before.
+const MAX_PEAK_GAIN: f64 = 32.0;
+/// The limiter's ceiling: -1 dBFS, sample peak.
 const CEILING: f64 = 0.891 * i16::MAX as f64;
+/// The true (inter-sample) peak allowed before encoding: -2 dBTP, which
+/// leaves room for an MP3 encoder's overshoot under -1 dBTP.
+const TRUE_PEAK: f64 = 0.794;
 
 /// Integrated loudness (EBU R128 / BS.1770, gated) of interleaved samples,
 /// None when too short or silent.
+/// The true peak (4x oversampled, BS.1770) of interleaved samples, as a
+/// fraction of full scale.
+pub fn true_peak(samples: &[i16], channels: usize, rate: usize) -> Option<f64> {
+    let mut m =
+        ebur128::EbuR128::new(channels as u32, rate as u32, ebur128::Mode::TRUE_PEAK).ok()?;
+    m.add_frames_i16(samples).ok()?;
+    (0..channels as u32)
+        .map(|c| m.true_peak(c).ok())
+        .try_fold(0.0f64, |a, p| Some(a.max(p?)))
+}
+
 pub fn integrated_lufs(samples: &[i16], channels: usize, rate: usize) -> Option<f64> {
     let mut m = ebur128::EbuR128::new(channels as u32, rate as u32, ebur128::Mode::I).ok()?;
     m.add_frames_i16(samples).ok()?;
@@ -578,27 +595,42 @@ pub fn finish_clip(cut: &[i16], channels: usize, rate: usize, finish: &Finish) -
             Some((target, measured)) => {
                 // The limiter takes some loudness off: measured again and
                 // made up for, a couple of times, within the gain limit.
+                // Then a true peak over TRUE_PEAK lowers the ceiling and
+                // it's done again.
                 let orig = x.clone();
-                let mut gain = 10f64.powf((target - measured) / 20.0).min(MAX_GAIN);
-                for _ in 0..3 {
-                    x = orig.iter().map(|v| v * gain).collect();
-                    limit(&mut x, channels, rate);
-                    let q: Vec<i16> = x
-                        .iter()
+                let quant = |x: &[f64]| -> Vec<i16> {
+                    x.iter()
                         .map(|&v| v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
-                        .collect();
-                    let Some(now) = integrated_lufs(&q, channels, rate) else {
-                        break;
-                    };
-                    let short = target - now;
-                    if short < 0.5 || gain >= MAX_GAIN {
-                        break;
+                        .collect()
+                };
+                let mut ceiling = CEILING;
+                for _ in 0..4 {
+                    let mut gain = 10f64.powf((target - measured) / 20.0).min(MAX_GAIN);
+                    for _ in 0..3 {
+                        x = orig.iter().map(|v| v * gain).collect();
+                        limit(&mut x, channels, rate, ceiling);
+                        let Some(now) = integrated_lufs(&quant(&x), channels, rate) else {
+                            break;
+                        };
+                        let short = target - now;
+                        if short < 0.5 || gain >= MAX_GAIN {
+                            break;
+                        }
+                        gain = (gain * 10f64.powf(short / 20.0)).min(MAX_GAIN);
                     }
-                    gain = (gain * 10f64.powf(short / 20.0)).min(MAX_GAIN);
+                    match true_peak(&quant(&x), channels, rate) {
+                        Some(tp) if tp > TRUE_PEAK => {
+                            // From the highest sample actually reached (it
+                            // may be under the ceiling already).
+                            let top = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                            ceiling = ceiling.min(top) * TRUE_PEAK / tp * 0.99;
+                        }
+                        _ => break,
+                    }
                 }
             }
             None => {
-                let gain = (0.8 * i16::MAX as f64 / peak).min(MAX_GAIN);
+                let gain = (0.8 * i16::MAX as f64 / peak).min(MAX_PEAK_GAIN);
                 for v in x.iter_mut() {
                     *v *= gain;
                 }
@@ -626,10 +658,10 @@ pub fn finish_clip(cut: &[i16], channels: usize, rate: usize, finish: &Finish) -
         .collect()
 }
 
-/// A look-ahead peak limiter to [`CEILING`]: the gain each frame needs is
+/// A look-ahead peak limiter to `ceiling` (at most [`CEILING`]): the gain each frame needs is
 /// held over 5 ms either side and smoothed over 5 ms, so it's already down
 /// when a peak arrives, then recovers over about 100 ms.
-fn limit(x: &mut [f64], channels: usize, rate: usize) {
+fn limit(x: &mut [f64], channels: usize, rate: usize, ceiling: f64) {
     let frames = x.len() / channels;
     if frames == 0 {
         return;
@@ -638,8 +670,8 @@ fn limit(x: &mut [f64], channels: usize, rate: usize) {
         .chunks(channels)
         .map(|f| {
             let p = f.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-            if p > CEILING {
-                CEILING / p
+            if p > ceiling {
+                ceiling / p
             } else {
                 1.0
             }
@@ -723,6 +755,26 @@ mod tests {
         assert!((l - -16.0).abs() < 1.5, "{l}");
         let top = out.iter().map(|&v| (v as i32).abs()).max().unwrap() as f64;
         assert!(top <= CEILING + 1.0, "{top}");
+
+        // About -60 dBFS (a Sega board in libpinmame) still gets there.
+        let quiet: Vec<i16> = (0..rate * 20)
+            .map(|i| ((i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 40.0) as i16)
+            .collect();
+        let out = finish_clip(&quiet, 1, rate, &f);
+        let l = integrated_lufs(&out, 1, rate).unwrap();
+        assert!((l - -16.0).abs() < 1.5, "{l}");
+
+        // Peaks between samples (a quarter-rate tone sampled off its crests)
+        // are held under the true-peak limit too.
+        let tp: Vec<i16> = (0..rate * 20)
+            .map(|i| {
+                let ph = i as f64 * std::f64::consts::FRAC_PI_2 + std::f64::consts::FRAC_PI_4;
+                (ph.sin() * 2000.0 * (1.0 + (i / rate % 3) as f64)) as i16
+            })
+            .collect();
+        let out = finish_clip(&tp, 1, rate, &f);
+        let peak = true_peak(&out, 1, rate).unwrap();
+        assert!(peak <= TRUE_PEAK * 1.01, "{peak}");
     }
 
     #[test]

@@ -233,9 +233,9 @@ fn run(cli: Cli) -> Result<()> {
             let emus = db.emulators()?;
             drop(db);
             let dll = record::find_pinmame(pinmame_dll.as_deref(), &emus, opts.vpx_dir.as_deref());
-            let roms_to_record = entries
-                .iter()
-                .any(|e| matches!(e.status, record::Status::Todo) && !e.from_table());
+            let roms_to_record = entries.iter().any(|e| {
+                matches!(e.status, record::Status::Todo) && !e.from_table() && e.pin.is_none()
+            });
             match &dll {
                 Some(d) => log::info!("libpinmame: {}", d.display()),
                 None if roms_to_record => bail!(
