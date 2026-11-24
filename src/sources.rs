@@ -51,9 +51,6 @@ pub struct Table<'a> {
     /// Whether the ROM itself can be recorded: then only trusted sources
     /// are worth taking over its recording.
     pub has_rom: bool,
-    /// Only sources that belong to the ROM itself (altsound, a PuP pack
-    /// named after it): the music is then kept as the ROM's.
-    pub rom_only: bool,
     pub vpx_dirs: &'a [PathBuf],
     pub popper_dir: Option<&'a Path>,
 }
@@ -91,9 +88,6 @@ struct Candidate {
     /// Bytes: a stand-in for length when ordering equal scores.
     size: u64,
     what: String,
-    /// It belongs to the ROM (altsound, a PuP pack named after it), not
-    /// to one table.
-    rom_own: bool,
     /// Held to [`UNTRUSTED_MIN_SECONDS`] even when trusted.
     min_len: bool,
 }
@@ -178,9 +172,6 @@ fn usable(t: &Table) -> Vec<Candidate> {
     let mut cands = candidates(t);
     if t.has_rom {
         cands.retain(|c| c.score >= TRUSTED);
-    }
-    if t.rom_only {
-        cands.retain(|c| c.rom_own);
     }
     cands
 }
@@ -457,7 +448,6 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     src: Src::File(f),
                     score: 95 + if i < 3 { 3 - i as i32 } else { 0 },
                     size: s,
-                    rom_own: true,
                     min_len: false,
                 });
             }
@@ -504,8 +494,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     score: 100 + music_bonus(&name) + order - if is_effect(&name) { 40 } else { 0 },
                     src: Src::File(f),
                     size: s,
-                    rom_own: false,
-min_len: false,
+                min_len: false,
                 });
             }
             break;
@@ -545,8 +534,7 @@ min_len: false,
             },
             score,
             size: e.size,
-            rom_own: false,
-min_len: false,
+                min_len: false,
         });
     }
 
@@ -574,7 +562,6 @@ min_len: false,
             let Some(dir) = child_ci(&pup, &pack).filter(|d| d.is_dir()) else {
                 continue;
             };
-            let rom_own = t.rom.is_some_and(|r| r.eq_ignore_ascii_case(&pack));
             // A music folder says what's in it: no name filter.
             for pf in pup_music(&dir) {
                 let f = pf.path;
@@ -585,29 +572,9 @@ min_len: false,
                     score: pf.score + bonus,
                     src: Src::File(f),
                     size: s,
-                    rom_own,
                     min_len: pf.min_len,
                 });
             }
-        }
-    }
-
-    // 6. A music folder beside the table that the script doesn't name.
-    if let Some(dir) = child_ci(table_dir, "music") {
-        for f in audio_files(&dir, 1) {
-            let name = file_name(&f);
-            if is_effect(&name) {
-                continue;
-            }
-            let s = size(&f);
-            push(Candidate {
-                what: format!("music file {}", f.display()),
-                score: 30 + music_bonus(&name),
-                src: Src::File(f),
-                size: s,
-                rom_own: false,
-min_len: false,
-            });
         }
     }
 
@@ -1367,7 +1334,6 @@ End Sub
             script: None,
             rom: Some("lah_113"),
             has_rom: true,
-            rom_only: true,
             vpx_dirs: &dirs,
             popper_dir: None,
         };
@@ -1533,7 +1499,6 @@ End Sub
             script: Some(script),
             rom: None,
             has_rom: false,
-            rom_only: false,
             vpx_dirs: &dirs,
             popper_dir: None,
         };
@@ -1602,7 +1567,6 @@ End Sub
             script: Some(script),
             rom: None,
             has_rom: true,
-            rom_only: false,
             vpx_dirs: &[],
             popper_dir: None,
         };

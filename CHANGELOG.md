@@ -2,6 +2,16 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.21
+
+Four ways of finding music that never produced any in two full runs over 137 tables are gone, so silent ROMs are given up on sooner:
+- the retry with a slower boot sequence;
+- the ROM-wide fallback to its altsound or a PuP pack named after it (each table's own music, which looks in the same places, covers it);
+- a `music` folder beside the table that the script doesn't name;
+- keeping a start jingle when nothing longer turns up (a ROM that only gives a jingle now counts as "no music").
+
+A ROM's "no music" verdict also changes when the music sources of its table do (an altsound folder or PuP pack added), so it's tried again then.
+
 ## 0.1.0-beta.20
 
 Fixes from a code review of beta.15 to beta.19:

@@ -306,22 +306,20 @@ fn source_table<'a>(
     script: Option<&'a str>,
     dirs: &'a [PathBuf],
     opts: &'a Options,
-    rom_only: bool,
 ) -> sources::Table<'a> {
     sources::Table {
         table,
         script,
         rom: e.rom.as_deref(),
-        has_rom: rom_only || script.is_some_and(vpx::uses_pinmame),
-        rom_only,
+        has_rom: script.is_some_and(vpx::uses_pinmame),
         vpx_dirs: dirs,
         popper_dir: opts.popper_dir.as_deref(),
     }
 }
 
 /// What a ROM's "no music" verdict holds for: its zip, its nvram and the
-/// music that belongs to it beside the table (altsound, a PuP pack named
-/// after it), so adding one of those tries the ROM again.
+/// music sources of its first table, so adding one (altsound, a PuP pack)
+/// tries the ROM again.
 fn rom_fingerprint(
     zip: &Path,
     nvram: Option<&Path>,
@@ -334,7 +332,7 @@ fn rom_fingerprint(
         return base;
     };
     let dirs = vpx_dirs(&e.emu, opts.vpx_dir.as_deref());
-    let t = source_table(e, table, script, &dirs, opts, true);
+    let t = source_table(e, table, script, &dirs, opts);
     format!("{base}+{}", sources::fingerprint(&t))
 }
 
@@ -342,7 +340,7 @@ fn rom_fingerprint(
 /// file and every music source found for it.
 fn table_fingerprint(e: &Entry, table: &Path, script: Option<&str>, opts: &Options) -> String {
     let dirs = vpx_dirs(&e.emu, opts.vpx_dir.as_deref());
-    let t = source_table(e, table, script, &dirs, opts, false);
+    let t = source_table(e, table, script, &dirs, opts);
     state::table_fingerprint(table, &sources::fingerprint(&t))
 }
 
@@ -791,7 +789,7 @@ impl Runner<'_> {
         ));
         let _ = std::fs::remove_dir_all(&tmp);
         let Some(zip) = &job.zip else {
-            let look = self.music_from_table(job, &tmp, false);
+            let look = self.music_from_table(job, &tmp);
             // A source that couldn't be read (no ffmpeg?) is no verdict.
             let outcome = if look.found {
                 Outcome::Recorded
@@ -820,18 +818,11 @@ impl Runner<'_> {
         let fp = rom_fingerprint(zip, nvram.as_deref(), first, first_script.as_deref(), self.opts);
         // A recording much shorter than the clip is a start jingle, not the
         // music (a blank nvram leaves Attack from Mars' volume near zero
-        // after it): kept as a fallback while the other ways are tried.
+        // after it): the other ways are tried.
         let enough = full_enough(self.opts.seconds);
-        let best = work_dir().join(format!(
-            "vp-audio-extract-{}-{}-best.wav",
-            job.rom,
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&best);
-        let best_len = std::cell::Cell::new(0.0f64);
-        let attempt = |slow: bool, nvram: Option<&Path>, no_escape: bool, twice: bool, bare: bool| {
+        let attempt = |nvram: Option<&Path>, no_escape: bool, twice: bool, bare: bool| {
             let _ = std::fs::remove_dir_all(&tmp);
-            let o = match self.spawn_worker(job, &tmp, slow, nvram, no_escape, twice, bare) {
+            let o = match self.spawn_worker(job, &tmp, nvram, no_escape, twice, bare) {
                 Ok(o) => o,
                 Err(e) => {
                     log::warn!("{}: {e:#}", job.rom);
@@ -858,12 +849,9 @@ impl Runner<'_> {
                 "{}: only {len:.1} s of sound after Start (a start jingle?)",
                 job.rom
             );
-            if len > best_len.get() && std::fs::copy(&clip, &best).is_ok() {
-                best_len.set(len);
-            }
             Outcome::Nothing
         };
-        let mut outcome = attempt(false, None, false, false, false);
+        let mut outcome = attempt(None, false, false, false);
         // From a blank nvram some machines never get past their factory
         // reset (Earthshaker) or won't start until a mechanism is
         // calibrated (Bride of Pin-bot): the cabinet's own nvram, copied,
@@ -877,7 +865,7 @@ impl Runner<'_> {
                 );
                 // Only a recording counts: anything else from this try
                 // leaves the blank run's "no music" and goes on.
-                if attempt(false, Some(nv), false, false, false) == Outcome::Recorded {
+                if attempt(Some(nv), false, false, false) == Outcome::Recorded {
                     outcome = Outcome::Recorded;
                 }
             }
@@ -892,7 +880,7 @@ impl Runner<'_> {
                     "{}: no music; trying again with Start pressed twice",
                     job.rom
                 );
-                if attempt(false, Some(nv), false, true, false) == Outcome::Recorded {
+                if attempt(Some(nv), false, true, false) == Outcome::Recorded {
                     outcome = Outcome::Recorded;
                 }
             }
@@ -915,7 +903,7 @@ impl Runner<'_> {
                 "{}: no music; trying again without the script's start switches",
                 job.rom
             );
-            if attempt(false, nvram.as_deref(), false, false, true) == Outcome::Recorded {
+            if attempt(nvram.as_deref(), false, false, true) == Outcome::Recorded {
                 outcome = Outcome::Recorded;
             }
         }
@@ -927,23 +915,7 @@ impl Runner<'_> {
                 "{}: no music; trying again without the service key",
                 job.rom
             );
-            if attempt(false, nvram.as_deref(), true, false, false) == Outcome::Recorded {
-                outcome = Outcome::Recorded;
-            }
-        }
-        if outcome == Outcome::Nothing && !self.cancelled() {
-            // Some machines boot slowly or ignore inputs for a while after
-            // their self-test: once more, with everything later.
-            log::info!("{}: no music; trying again with a slower start", job.rom);
-            if attempt(true, None, false, false, false) == Outcome::Recorded {
-                outcome = Outcome::Recorded;
-            }
-        }
-        if outcome == Outcome::Nothing && !self.cancelled() {
-            // The ROM's own music beside it (altsound, a PuP pack named
-            // after it): better than a jingle.
-            let _ = std::fs::remove_dir_all(&tmp);
-            if self.music_from_table(job, &tmp, true).found {
+            if attempt(nvram.as_deref(), true, false, false) == Outcome::Recorded {
                 outcome = Outcome::Recorded;
             }
         }
@@ -956,7 +928,6 @@ impl Runner<'_> {
         if matches!(outcome, Outcome::Nothing | Outcome::NotStarted) && !self.cancelled() {
             rest.retain(|e| !self.own_music(e, summary));
             if rest.is_empty() {
-                let _ = std::fs::remove_file(&best);
                 let _ = std::fs::remove_dir_all(&tmp);
                 // Every table has its own music now: the ROM still gave
                 // none, so a clip of it from an earlier run (a jingle)
@@ -976,19 +947,6 @@ impl Runner<'_> {
             zip: job.zip.clone(),
             entries: rest,
         };
-        if outcome != Outcome::Recorded && !self.cancelled() && best_len.get() > 0.0 {
-            // Nothing longer anywhere: the jingle is better than no audio.
-            let _ = std::fs::create_dir_all(&tmp);
-            if std::fs::copy(&best, tmp.join("clip.wav")).is_ok() {
-                log::info!(
-                    "{}: keeping the {:.1} s recording, the longest it gave",
-                    job.rom,
-                    best_len.get()
-                );
-                outcome = Outcome::Recorded;
-            }
-        }
-        let _ = std::fs::remove_file(&best);
         let reason = if outcome == Outcome::Nothing {
             "the ROM gave no music"
         } else {
@@ -999,7 +957,7 @@ impl Runner<'_> {
 
     /// Looks for the music in the tables' own files; on success it's in
     /// `tmp\clip.wav`. `rom_table`: only sources trusted over a ROM.
-    fn music_from_table(&self, job: &Job, tmp: &Path, rom_only: bool) -> Look {
+    fn music_from_table(&self, job: &Job, tmp: &Path) -> Look {
         let mut look = Look {
             found: false,
             unread: false,
@@ -1014,7 +972,7 @@ impl Runner<'_> {
             };
             let script = vpx::read_script(t).ok();
             let dirs = vpx_dirs(&e.emu, self.opts.vpx_dir.as_deref());
-            let table = source_table(e, t, script.as_deref(), &dirs, self.opts, rom_only);
+            let table = source_table(e, t, script.as_deref(), &dirs, self.opts);
             if look.fingerprint.is_empty() {
                 look.fingerprint = table_fingerprint(e, t, script.as_deref(), self.opts);
             }
@@ -1057,7 +1015,7 @@ impl Runner<'_> {
             zip: None,
             entries: vec![e.clone()],
         };
-        let found = self.music_from_table(&one, &tmp, false).found;
+        let found = self.music_from_table(&one, &tmp).found;
         let mut ok = false;
         if found {
             let stem = self.cache.clip_stem(&key, self.opts.seconds);
@@ -1164,7 +1122,6 @@ impl Runner<'_> {
         &self,
         job: &Job,
         tmp: &Path,
-        slow: bool,
         nvram: Option<&Path>,
         no_escape: bool,
         twice: bool,
@@ -1201,9 +1158,6 @@ impl Runner<'_> {
             .arg(self.opts.seconds.to_string())
             .arg("--dll")
             .arg(self.dll.as_deref().context("libpinmame not found")?);
-        if slow {
-            cmd.arg("--slow");
-        }
         if no_escape {
             cmd.arg("--no-escape");
         }
@@ -1298,11 +1252,7 @@ impl Runner<'_> {
                 })
             })
             .collect();
-        let timeline = if slow {
-            capture::Timeline::SLOW
-        } else {
-            capture::Timeline::NORMAL
-        };
+        let timeline = capture::Timeline::NORMAL;
         let limit = Duration::from_secs_f64(timeline.max_seconds(self.opts.seconds) * 1.5 + 60.0);
         let started = Instant::now();
         let status = loop {
