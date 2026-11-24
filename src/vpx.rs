@@ -695,7 +695,9 @@ pub fn mechs(script: &str) -> Vec<ScriptMech> {
     }
     found
         .into_iter()
-        .filter(|(m, started)| *started && m.sol1 != 0 && m.steps > 0)
+        // PinMAME divides by the length (mech.c): a mech without one, as
+        // Road Show's script reads to us, crashes the emulator at once.
+        .filter(|(m, started)| *started && m.sol1 != 0 && m.steps > 0 && m.length > 0)
         .map(|(m, _)| m)
         .collect()
 }
@@ -834,7 +836,7 @@ mod tests {
         assert_eq!(eval_terms("-5", &c), Some(-5));
         assert_eq!(eval_terms("foo", &c), None);
         let s = "Sub Options_Menu\n Set mX = New cvpmMech\n mX.Sol1 = 3 : mX.Steps = 9 : mX.Start\nEnd Sub\n\
-                 Set mY = New cvpmMech\nWith mY\n .Sol1 = -4\n With Controller\n End With\n .Steps = 2*5\n .AddSw 7, 0, 1\n .AddSw 8, bogus, 3\n .AddPulseSw 9, 50, 3\n .Start\nEnd With\n";
+                 Set mY = New cvpmMech\nWith mY\n .Sol1 = -4\n With Controller\n End With\n .Steps = 2*5\n .Length = 50\n .AddSw 7, 0, 1\n .AddSw 8, bogus, 3\n .AddPulseSw 9, 50, 3\n .Start\nEnd With\n";
         let m = mechs(s);
         assert_eq!(m.len(), 1, "a mech in a non-startup sub doesn't count");
         assert_eq!((m[0].sol1, m[0].steps), (-4, 10));

@@ -2,6 +2,11 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.14
+
+- A script mechanism without a length is no longer handed to PinMAME, which divides by it and crashed at once (Red & Ted's Road Show).
+- Sound names with "fx" run into a word (`gotfx-dragonwings`) count as effects, not music (Game of Thrones).
+
 ## 0.1.0-beta.13
 
 - A ROM that stays quiet from the cabinet's nvram is tried once more with Start pressed twice. No Fear ignores the first press and now records its music.

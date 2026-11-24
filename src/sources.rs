@@ -267,6 +267,13 @@ fn music_bonus(name: &str) -> i32 {
 
 /// Names of mechanical sounds and effects (some loop, and are long).
 fn is_effect(name: &str) -> bool {
+    // fx run into a word: gotfx-dragonwings, sfxBumper, FXDrain.
+    if words(name)
+        .iter()
+        .any(|w| w.ends_with("fx") || w.starts_with("fx") || w.starts_with("sfx"))
+    {
+        return true;
+    }
     has_word(
         name,
         &[
@@ -1163,6 +1170,7 @@ End Sub
         assert!(!is_effect("Whitesnake - Here I Go Again.mp3"));
         assert!(!is_effect("Human League"));
         assert!(is_effect("BallRolling_2"));
+        assert!(is_effect("gotfx-dragonwings"));
         assert!(is_ambience("WindLoop"));
         assert_eq!(words("MainTheme02.ogg"), ["main", "theme", "02"]);
         assert_eq!(ext_of("C:\\x\\Mr. Big theme"), None);
