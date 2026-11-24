@@ -272,6 +272,37 @@ pub fn describe_after_start(
 /// libpinmame display type; segment bits are a..g = 0..6 (g is the left
 /// middle on 16 segments), then comma 7, and on 16 segments i 8, j 9, k 10,
 /// right middle 11, m 12, n 13, o 14, period 15. None for a DMD or video.
+/// A DMD frame as text, two pixel rows per line and one column per two
+/// pixels: `#` lit, `.` dim, space dark (diagnostics).
+pub fn dmd_text(px: &[u8], width: usize, height: usize) -> String {
+    let max = px.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for y in (0..height).step_by(2) {
+        let mut line = String::new();
+        for x in (0..width).step_by(2) {
+            let v = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
+                .iter()
+                .filter(|(a, b)| *a < width && *b < height)
+                .map(|(a, b)| px.get(b * width + a).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            line.push(if v as u32 * 2 > max as u32 {
+                '#'
+            } else if v > 0 {
+                '.'
+            } else {
+                ' '
+            });
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 pub fn segment_text(kind: i32, cells: &[u16]) -> Option<String> {
     const SEG16: &[(char, &[u8])] = &[
         ('A', &[0, 1, 2, 4, 5, 6, 11]),

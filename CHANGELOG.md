@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.18
+
+- The worker's `--show-display` diagnostic also prints DMD frames (as text, about once a second while they change) and which solenoids fired every 2 s, to see why a game doesn't start.
+
 ## 0.1.0-beta.17
 
 - A PuP pack's music is also found through the playlists its `triggers.pup` plays on a music screen (`screens.pup`: Music, MusicVideos or MusicOnly), and the sound of music videos (mp4 and the like) counts. Linkin Park and Nine Inch Nails keep their songs as music videos this way.

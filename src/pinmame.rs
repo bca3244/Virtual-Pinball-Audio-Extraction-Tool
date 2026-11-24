@@ -197,6 +197,7 @@ struct Config {
 
 const CB_ON_DISPLAY_UPDATED: usize = 2;
 const CB_ON_AUDIO_AVAILABLE: usize = 3;
+const CB_ON_SOLENOID_UPDATED: usize = 7;
 const CB_ON_AUDIO_UPDATED: usize = 4;
 const CB_IS_KEY_PRESSED: usize = 9;
 const CB_ON_SOUND_COMMAND: usize = 11;
@@ -244,6 +245,10 @@ struct Shared {
     audio: Mutex<Vec<i16>>,
     /// Text of each alphanumeric display (diagnostics).
     displays: Mutex<Vec<String>>,
+    /// The DMD as text, when the game has one (diagnostics).
+    dmd: Mutex<String>,
+    /// Times each solenoid turned on (diagnostics).
+    solenoids: [AtomicU32; 80],
     /// Wall clock, used only until the first sound arrives.
     since: OnceLock<Instant>,
 }
@@ -256,6 +261,8 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     start_frame: AtomicI64::new(-1),
     audio: Mutex::new(Vec::new()),
     displays: Mutex::new(Vec::new()),
+    dmd: Mutex::new(String::new()),
+    solenoids: [const { AtomicU32::new(0) }; 80],
     since: OnceLock::new(),
 });
 
@@ -329,6 +336,16 @@ unsafe extern "system" fn on_display_updated(
     let Some(l) = (unsafe { layout.as_ref() }) else {
         return;
     };
+    if !data.is_null() && (16..=256).contains(&l.width) && (8..=64).contains(&l.height) {
+        let px = unsafe {
+            std::slice::from_raw_parts(data as *const u8, (l.width * l.height) as usize)
+        };
+        let text = capture::dmd_text(px, l.width as usize, l.height as usize);
+        if let Ok(mut d) = SHARED.dmd.lock() {
+            *d = text;
+        }
+        return;
+    }
     if data.is_null() || !(0..=16).contains(&index) || !(1..=64).contains(&l.length) {
         return;
     }
@@ -342,6 +359,23 @@ unsafe extern "system" fn on_display_updated(
             d.resize(index as usize + 1, String::new());
         }
         d[index as usize] = text;
+    }
+}
+
+#[repr(C)]
+struct SolenoidState {
+    sol_no: c_int,
+    state: c_int,
+}
+
+unsafe extern "system" fn on_solenoid_updated(st: *mut SolenoidState, _user: *mut c_void) {
+    let Some(st) = (unsafe { st.as_ref() }) else {
+        return;
+    };
+    if st.state != 0 {
+        if let Some(c) = SHARED.solenoids.get(st.sol_no.max(0) as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -596,6 +630,7 @@ pub fn run(
     callbacks[CB_ON_SOUND_COMMAND] = on_sound_command as *const () as usize;
     if debug().show_display {
         callbacks[CB_ON_DISPLAY_UPDATED] = on_display_updated as *const () as usize;
+        callbacks[CB_ON_SOLENOID_UPDATED] = on_solenoid_updated as *const () as usize;
     }
     let config = Box::leak(Box::new(Config {
         audio_format: PINMAME_AUDIO_FORMAT_INT16,
@@ -672,6 +707,7 @@ pub fn run(
     let mut dips_set = false;
     let mut mechs_set = false;
     let (mut shown, mut last_text) = (0, String::new());
+    let (mut dmd_shown, mut last_dmd, mut next_dmd, mut next_sol) = (0, String::new(), 0.0, 0.0);
     let mut loud: Option<capture::Loudness> = None;
     // Switch presses, each one closed at the first look at or after its
     // time and opened at least one look later: a loop that steps past a
@@ -799,6 +835,30 @@ pub fn run(
                 shown += 1;
                 last_text = text;
             }
+        }
+        if debug().show_display && dmd_shown < 90 && now() >= next_dmd {
+            let frame = s.dmd.lock().map(|d| d.clone()).unwrap_or_default();
+            if frame != last_dmd && frame.contains('#') {
+                println!("[{:5.1} s] DMD\n{frame}", now());
+                dmd_shown += 1;
+                last_dmd = frame;
+                next_dmd = now() + 1.0;
+            }
+        }
+        if debug().show_display && now() >= next_sol {
+            let fired: Vec<String> = s
+                .solenoids
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    let n = c.swap(0, Ordering::Relaxed);
+                    (n > 0).then(|| format!("{i}x{n}"))
+                })
+                .collect();
+            if !fired.is_empty() {
+                println!("[{:5.1} s] solenoids on: {}", now(), fired.join(" "));
+            }
+            next_sol = now() + 2.0;
         }
         let start = s.start_frame.load(Ordering::Acquire);
         if music.is_none() && start >= 0 {
