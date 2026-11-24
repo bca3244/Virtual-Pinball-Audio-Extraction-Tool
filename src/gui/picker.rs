@@ -53,7 +53,14 @@ impl App {
             .iter()
             .find(|r| key(&r.entry) == key(&entry))
             .and_then(|r| r.installed.as_ref())
-            .is_some_and(|i| i.source.starts_with("pick:"));
+            .is_some_and(|i| {
+                // 0.3.1's Automatic kept the chosen file but noted it as
+                // from the ROM: its what= still names the file.
+                i.source.starts_with("pick:")
+                    || (entry.rom_zip.is_some()
+                        && !i.what.is_empty()
+                        && i.what != record::ROM_RECORDING)
+            });
         // Previews from earlier windows (the player has let go of them; one
         // still being made fails harmlessly).
         let root = self.cache.join("preview");
@@ -115,11 +122,12 @@ impl App {
                 let in_use = st.pin.is_none() && !pk.picked_audio;
                 let rom = pk.entry.rom_zip.is_some();
                 let hover = if rom {
-                    "Record this table's ROM again and install it now (the audio it has is kept \
-                     for Restore…). From then on its music is found by itself."
+                    "Install this table's ROM recording now (recorded again unless one with \
+                     these settings is kept; the audio it has is kept for Restore…). From then \
+                     on its music is found by itself."
                 } else {
-                    "Find the best music in this table's files again and install it now (the \
-                     audio it has is kept for Restore…). From then on its music is found by itself."
+                    "Install the best music found in this table's files now (the audio it has is \
+                     kept for Restore…). From then on its music is found by itself."
                 };
                 if ui
                     .add_enabled(

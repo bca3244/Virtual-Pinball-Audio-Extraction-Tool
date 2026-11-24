@@ -312,6 +312,10 @@ impl App {
         // A playing file is held open: it couldn't be replaced or moved.
         self.player.stop();
         let Some(popper_dir) = self.popper_dir.clone() else {
+            self.notice = Some((
+                true,
+                "Popper's tables couldn't be read, so nothing was recorded.".into(),
+            ));
             return;
         };
         // Picking a table is asking for it: earlier "gave nothing" results

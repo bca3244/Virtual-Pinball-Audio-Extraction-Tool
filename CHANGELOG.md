@@ -2,6 +2,11 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.2-beta.2
+
+- Tables sent back with 0.3.1's *Automatic* (which kept the chosen file) offer *Use* on the ROM recording row too, instead of showing *In use*.
+- If Popper can't be read when that recording should start, a banner says so.
+
 ## 0.3.2-beta.1
 
 - The Music… window lists **ROM recording (automatic)** as its first row (*Automatic* for tables without a ROM). Its *Use* goes back to it at once: the table is recorded again (or a clip already recorded is installed), its old audio kept for Restore…, and the choice forgotten. Before, *Automatic* only forgot the choice and left the chosen music in place. It also shows *In use* only when the audio really is the automatic one.
