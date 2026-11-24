@@ -2,6 +2,8 @@
 
 `vp-audio-extract-gui.exe` (a window) and `vp-audio-extract.exe` (command line) give your PinUP Popper tables their **Audio** media (the music that plays when the wheel rests on a table) by recording it from each table's own PinMAME ROM.
 
+<img width="1002" height="732" alt="Screenshot 2026-11-24 110252" src="https://github.com/user-attachments/assets/b5363a9c-be8d-4a61-9462-f745c372273d" />
+
 For every Visual Pinball table that has no Audio media yet, it:
 
 1. boots the table's ROM in **libpinmame**, headless and silent. The sound is captured straight from the emulator and never plays through your speakers. It runs on a scratch copy of the ROM with empty nvram, so your scores, credits and settings are never touched.
