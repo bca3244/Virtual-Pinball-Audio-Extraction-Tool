@@ -1,6 +1,8 @@
 //! What the table list shows and acts on: pure functions of an Entry.
 
-use vp_audio_extract::record::{Entry, Status};
+use std::time::Instant;
+use vp_audio_extract::record::{Entry, Outcome, Status};
+use vp_audio_extract::state::Installed;
 
 /// A table is known by its emulator and Popper GameName (display names can repeat).
 pub type Key = (i64, String);
@@ -163,6 +165,118 @@ pub fn range_between(shown: &[Key], from: &Key, to: &Key) -> Vec<Key> {
     shown[a..=b].to_vec()
 }
 
+/// What a table in a run is doing, until the list is read again after it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Live {
+    Queued,
+    Recording(Instant),
+    /// It got audio from this (see [`Installed::what`]); chosen by hand.
+    Got(String, bool),
+    Finished(Outcome),
+}
+
+/// After a recording finished: what each of its tables that didn't get
+/// audio came to.
+pub fn after(live: Option<&Live>, outcome: Outcome) -> Option<Live> {
+    match live {
+        Some(Live::Got(..)) => None,
+        _ => Some(Live::Finished(outcome)),
+    }
+}
+
+/// The short kind of a table's music for the Source column.
+pub fn source_kind(source: &str, what: &str, chosen: bool) -> &'static str {
+    let w = what.to_lowercase();
+    if chosen || source.starts_with("pick:") {
+        "chosen"
+    } else if w.starts_with("rom") || (w.is_empty() && source.starts_with("rom:")) {
+        "ROM"
+    } else if w.contains("altsound") {
+        "altsound"
+    } else if w.contains("pup") {
+        "PuP"
+    } else {
+        "table"
+    }
+}
+
+pub fn installed_kind(i: &Installed) -> &'static str {
+    source_kind(&i.source, &i.what, false)
+}
+
+/// Seconds left: `remaining` recordings (counting those running, which
+/// have been going `running` seconds on average), `parallel` at once, each
+/// taking about the mean of `took`.
+pub fn eta_secs(took: &[f64], remaining: usize, running: f64, parallel: usize) -> Option<f64> {
+    if took.is_empty() || remaining == 0 {
+        return None;
+    }
+    let mean = took.iter().sum::<f64>() / took.len() as f64;
+    let rounds = remaining.div_ceil(parallel.max(1)) as f64;
+    Some((mean * rounds - running.min(mean)).max(0.0))
+}
+
+/// "about 9 min left", "under a minute left".
+pub fn eta_text(secs: f64) -> String {
+    if secs < 60.0 {
+        "under a minute left".into()
+    } else {
+        format!("about {} min left", (secs / 60.0).round() as u64)
+    }
+}
+
+/// The banner after a run: what got audio, from where, and which tables
+/// didn't. `got`: the kind of each table that got audio.
+pub fn run_summary(got: &[&str], no_music: &[&str], failed: &[&str], cancelled: bool) -> String {
+    let list = |names: &[&str]| {
+        let mut s = names.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+        if names.len() > 6 {
+            s.push_str(&format!(" and {} more", names.len() - 6));
+        }
+        s
+    };
+    let mut parts = Vec::new();
+    if got.is_empty() {
+        parts.push("No table got audio".to_string());
+    } else {
+        let mut kinds: Vec<(&str, usize)> = Vec::new();
+        for k in got {
+            match kinds.iter_mut().find(|(n, _)| n == k) {
+                Some((_, c)) => *c += 1,
+                None => kinds.push((k, 1)),
+            }
+        }
+        kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{n} {k}")).collect();
+        parts.push(format!(
+            "{} table{} got audio ({})",
+            got.len(),
+            if got.len() == 1 { "" } else { "s" },
+            kinds.join(", ")
+        ));
+    }
+    if !no_music.is_empty() {
+        parts.push(format!(
+            "{} gave no music: {}",
+            no_music.len(),
+            list(no_music)
+        ));
+    }
+    if !failed.is_empty() {
+        parts.push(format!(
+            "{} failed: {} (see the log)",
+            failed.len(),
+            list(failed)
+        ));
+    }
+    let s = parts.join("; ") + ".";
+    if cancelled {
+        format!("Cancelled. {s}")
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +364,45 @@ mod tests {
             [k("a"), k("b"), k("c")]
         );
         assert_eq!(range_between(&shown, &k("x"), &k("b")), [k("b")]);
+    }
+
+    #[test]
+    fn eta_and_summary() {
+        assert_eq!(eta_secs(&[], 5, 0.0, 2), None);
+        assert_eq!(eta_secs(&[60.0], 0, 0.0, 2), None);
+        // 5 left, 2 at once: 3 rounds of 60 s, 20 s into the first.
+        assert_eq!(eta_secs(&[50.0, 70.0], 5, 20.0, 2), Some(160.0));
+        assert_eq!(eta_text(30.0), "under a minute left");
+        assert_eq!(eta_text(540.0), "about 9 min left");
+        assert_eq!(
+            run_summary(&["ROM", "PuP", "ROM"], &["Tron"], &[], false),
+            "3 tables got audio (2 ROM, 1 PuP); 1 gave no music: Tron."
+        );
+        assert_eq!(
+            run_summary(&[], &[], &["A"], true),
+            "Cancelled. No table got audio; 1 failed: A (see the log)."
+        );
+        assert_eq!(source_kind("pick:x", "PuP pack music", false), "chosen");
+        assert_eq!(source_kind("rom:1:2", "", false), "ROM");
+        assert_eq!(
+            source_kind("table:1", "altsound music a.ogg", false),
+            "altsound"
+        );
+        assert_eq!(source_kind("table:1", "PuP pack music b.mp4", false), "PuP");
+        assert_eq!(
+            source_kind("table:1", "sound \"x\" in the table", false),
+            "table"
+        );
+        assert_eq!(
+            after(
+                Some(&Live::Got("ROM recording".into(), false)),
+                Outcome::Recorded
+            ),
+            None
+        );
+        assert_eq!(
+            after(None, Outcome::Nothing),
+            Some(Live::Finished(Outcome::Nothing))
+        );
     }
 }

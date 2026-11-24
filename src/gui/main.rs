@@ -16,16 +16,18 @@ use applog::{init_log, log_lines, LOG};
 use picker::Picker;
 use settings::Settings;
 use view::{
-    has_audio, key, range_between, replaces, row_clip, sort_rows, to_record, Chip, Key, SortBy,
+    after, eta_secs, eta_text, has_audio, installed_kind, key, range_between, replaces, row_clip,
+    run_summary, sort_rows, source_kind, to_record, Chip, Key, Live, SortBy,
 };
 use widgets::{ago, path_label, play_button};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use vp_audio_extract::encode::Format;
 use vp_audio_extract::record::{self, Entry, Status};
 use vp_audio_extract::{backup, capture, encode, popper, state};
@@ -37,6 +39,36 @@ struct Row {
     selected: bool,
     /// It has a table file to choose music from (found once per scan).
     can_pick: bool,
+    /// What this tool installed for it, while that's still its audio.
+    installed: Option<state::Installed>,
+}
+
+/// What a recording run reports, for the rows and the progress bar.
+enum RunEvent {
+    Planned,
+    Started(String, Vec<Key>),
+    Finished(String, Vec<Key>, record::Outcome, f64),
+    Installed(Key, String, bool),
+}
+
+impl RunEvent {
+    fn from(ev: record::Event) -> RunEvent {
+        let keys = |g: Vec<(i64, &str)>| g.into_iter().map(|(e, n)| (e, n.to_string())).collect();
+        match ev {
+            record::Event::Planned { .. } => RunEvent::Planned,
+            record::Event::Started { rom, games } => RunEvent::Started(rom.into(), keys(games)),
+            record::Event::Finished {
+                rom,
+                games,
+                outcome,
+                secs,
+                ..
+            } => RunEvent::Finished(rom.into(), keys(games), outcome, secs),
+            record::Event::Installed { game, what, chosen } => {
+                RunEvent::Installed((game.0, game.1.to_string()), what.into(), chosen)
+            }
+        }
+    }
 }
 
 /// Work running in the background.
@@ -46,12 +78,20 @@ struct Job {
     total: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<JobResult>>>,
+    events: Arc<Mutex<Vec<RunEvent>>>,
 }
 
 enum JobResult {
-    Scanned(anyhow::Result<(PathBuf, Vec<Entry>, Vec<popper::Emulator>)>),
+    Scanned(anyhow::Result<Scan>),
     /// How it went, and whether it failed.
     Recorded(bool, String),
+}
+
+struct Scan {
+    dir: PathBuf,
+    entries: Vec<Entry>,
+    emus: Vec<popper::Emulator>,
+    installed: HashMap<Key, state::Installed>,
 }
 
 #[derive(PartialEq)]
@@ -92,6 +132,18 @@ struct App {
     /// Space plays.
     last_clicked: Option<Key>,
     focus_filter: bool,
+    /// The tables of the run going on (or just done), until the list is
+    /// read again.
+    live: HashMap<Key, Live>,
+    /// Recordings running, by ROM, and how long finished ones took.
+    running: HashMap<String, Instant>,
+    took: Vec<f64>,
+    /// Tables in the run going on.
+    run_tables: usize,
+    /// Closing was asked for while recording: asking whether to stop.
+    ask_close: bool,
+    /// Close once the run has stopped.
+    close_when_done: bool,
 }
 
 impl App {
@@ -124,6 +176,12 @@ impl App {
             sort: (SortBy::Title, true),
             last_clicked: None,
             focus_filter: false,
+            live: HashMap::new(),
+            running: HashMap::new(),
+            took: Vec::new(),
+            run_tables: 0,
+            ask_close: false,
+            close_when_done: false,
         };
         app.parallel = app
             .settings
@@ -172,7 +230,17 @@ impl App {
                 let db = popper::Db::open(&dir)?;
                 let cache = state::Cache::open(Some(&cache))?;
                 let emus = db.emulators()?;
-                Ok((dir, record::plan(&db, &cache, &opts)?, emus))
+                let entries = record::plan(&db, &cache, &opts)?;
+                let installed = entries
+                    .iter()
+                    .filter_map(|e| Some((key(e), record::installed_info(&cache, e)?)))
+                    .collect();
+                Ok(Scan {
+                    dir,
+                    entries,
+                    emus,
+                    installed,
+                })
             })();
             *r.lock().unwrap_or_else(|e| e.into_inner()) = Some(JobResult::Scanned(scanned));
             ctx.request_repaint();
@@ -183,6 +251,7 @@ impl App {
             total: Arc::new(AtomicUsize::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             result,
+            events: Default::default(),
         });
     }
 
@@ -219,7 +288,18 @@ impl App {
         let total = Arc::new(AtomicUsize::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
-        let (d, t, c, r) = (done.clone(), total.clone(), cancel.clone(), result.clone());
+        let events: Arc<Mutex<Vec<RunEvent>>> = Default::default();
+        let (d, t, c, r, ev) = (
+            done.clone(),
+            total.clone(),
+            cancel.clone(),
+            result.clone(),
+            events.clone(),
+        );
+        self.live = keys.iter().map(|k| (k.clone(), Live::Queued)).collect();
+        self.running.clear();
+        self.took.clear();
+        self.run_tables = keys.len();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let summary = (|| -> anyhow::Result<String> {
@@ -241,20 +321,15 @@ impl App {
                     None => {}
                 }
                 let ffmpeg = encode::find_ffmpeg(None, Some(&popper_dir));
-                let roms: HashSet<&str> = entries
-                    .iter()
-                    .filter(|e| matches!(e.status, Status::Todo) && e.pin.is_none())
-                    .filter_map(|e| {
-                        if e.from_table() {
-                            e.source_key.as_deref()
-                        } else {
-                            e.rom.as_deref()
-                        }
-                    })
-                    .collect();
-                t.store(roms.len(), Ordering::SeqCst);
-                let progress = |p: record::Progress| {
-                    d.store(p.done, Ordering::SeqCst);
+                let progress = |p: record::Event| {
+                    match &p {
+                        record::Event::Planned { total } => t.store(*total, Ordering::SeqCst),
+                        record::Event::Finished { done, .. } => d.store(*done, Ordering::SeqCst),
+                        _ => {}
+                    }
+                    ev.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(RunEvent::from(p));
                     ctx.request_repaint();
                 };
                 let runner = record::Runner {
@@ -291,6 +366,7 @@ impl App {
             total,
             cancel,
             result,
+            events,
         });
     }
 
@@ -390,14 +466,93 @@ impl App {
         }
     }
 
+    fn recording(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.what == "Recording")
+    }
+
+    /// Whether a row's clip can be played now: not while the run may be
+    /// replacing it (its row is in the run, or it's a cached clip).
+    fn can_play(live: &HashMap<Key, Live>, recording: bool, e: &Entry) -> bool {
+        !recording || !(live.contains_key(&key(e)) || matches!(e.status, Status::Cached(_)))
+    }
+
+    /// Takes in what the run reported since the last frame.
+    fn poll_events(&mut self) {
+        let Some(job) = &self.job else { return };
+        let events = std::mem::take(&mut *job.events.lock().unwrap_or_else(|e| e.into_inner()));
+        for ev in events {
+            match ev {
+                RunEvent::Planned => {}
+                RunEvent::Started(rom, games) => {
+                    let now = Instant::now();
+                    self.running.insert(rom, now);
+                    for g in games {
+                        self.live.insert(g, Live::Recording(now));
+                    }
+                }
+                RunEvent::Finished(rom, games, outcome, secs) => {
+                    self.running.remove(&rom);
+                    self.took.push(secs);
+                    for g in games {
+                        if let Some(l) = after(self.live.get(&g), outcome) {
+                            self.live.insert(g, l);
+                        }
+                    }
+                }
+                RunEvent::Installed(g, what, chosen) => {
+                    self.live.insert(g, Live::Got(what, chosen));
+                }
+            }
+        }
+    }
+
+    /// The banner after a run, from what each table came to.
+    fn run_banner(&self, cancelled: bool) -> String {
+        fn title<'a>(rows: &'a [Row], k: &'a Key) -> &'a str {
+            rows.iter()
+                .find(|r| &key(&r.entry) == k)
+                .map_or(k.1.as_str(), |r| r.entry.game.display.as_str())
+        }
+        let title = |k: &'_ Key| -> String { title(&self.rows, k).to_string() };
+        let mut got = Vec::new();
+        let mut none: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        let mut keys: Vec<&Key> = self.live.keys().collect();
+        keys.sort_by_key(|k| title(k).to_lowercase());
+        for k in keys {
+            match &self.live[k] {
+                Live::Got(what, chosen) => got.push(source_kind("", what, *chosen)),
+                Live::Finished(record::Outcome::Nothing | record::Outcome::NotStarted)
+                    if !cancelled =>
+                {
+                    none.push(title(k))
+                }
+                Live::Finished(_) => failed.push(title(k)),
+                // Not reached: cancelled before it started.
+                Live::Queued | Live::Recording(_) => {}
+            }
+        }
+        let none: Vec<&str> = none.iter().map(String::as_str).collect();
+        let failed: Vec<&str> = failed.iter().map(String::as_str).collect();
+        run_summary(&got, &none, &failed, cancelled)
+    }
+
     fn poll_job(&mut self, ctx: &egui::Context) {
+        self.poll_events();
         let Some(job) = &self.job else { return };
         let Some(result) = job.result.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
         };
+        let cancelled = job.cancel.load(Ordering::SeqCst);
         self.job = None;
         match result {
-            JobResult::Scanned(Ok((dir, entries, emus))) => {
+            JobResult::Scanned(Ok(Scan {
+                dir,
+                entries,
+                emus,
+                mut installed,
+            })) => {
+                self.live.clear();
                 self.emus = emus;
                 self.find_dll();
                 let was: HashSet<Key> = self
@@ -412,6 +567,7 @@ impl App {
                         selected: was.contains(&key(&entry)),
                         can_pick: entry.table.as_deref().is_some_and(Path::is_file)
                             && entry.emu.media_dir.is_some(),
+                        installed: installed.remove(&key(&entry)),
                         entry,
                     })
                     .collect();
@@ -431,9 +587,22 @@ impl App {
                 self.settings.popper = Settings::load(&self.cache).popper;
             }
             JobResult::Recorded(failed, msg) => {
+                let msg = if failed {
+                    msg
+                } else {
+                    self.run_banner(cancelled)
+                };
+                let failed = failed
+                    || self.live.values().any(|l| {
+                        matches!(l, Live::Finished(record::Outcome::Failed)) && !cancelled
+                    });
                 self.notice = Some((failed, msg));
                 if failed {
                     self.show_log = true;
+                }
+                if self.close_when_done {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
                 }
                 self.rescan(ctx);
             }
@@ -810,10 +979,30 @@ impl App {
                 job.total.load(Ordering::SeqCst),
             );
             if t > 0 {
+                let now = Instant::now();
+                let running = if self.running.is_empty() {
+                    0.0
+                } else {
+                    self.running
+                        .values()
+                        .map(|s| now.duration_since(*s).as_secs_f64())
+                        .sum::<f64>()
+                        / self.running.len() as f64
+                };
+                let mut text = format!(
+                    "{} {} of {t} (for {} table{})",
+                    job.what,
+                    (d + 1).min(t),
+                    self.run_tables,
+                    if self.run_tables == 1 { "" } else { "s" }
+                );
+                if let Some(eta) = eta_secs(&self.took, t - d, running, self.parallel) {
+                    text = format!("{text} · {}", eta_text(eta));
+                }
                 ui.add(
                     egui::ProgressBar::new(d as f32 / t as f32)
-                        .text(format!("{}: {d} of {t} ROM(s)", job.what))
-                        .desired_width(360.0),
+                        .text(text)
+                        .desired_width(460.0),
                 );
             } else {
                 ui.spinner();
@@ -862,6 +1051,8 @@ impl App {
         let mut clicked: Option<(Key, bool)> = None;
         let shift = ui.input(|i| i.modifiers.shift);
         let busy = self.busy();
+        let recording = self.recording();
+        let live = &self.live;
         let height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let mut pick: Option<Entry> = None;
         let player = &mut self.player;
@@ -879,6 +1070,7 @@ impl App {
             .column(Column::exact(24.0))
             .column(Column::initial(320.0).at_least(120.0).clip(true))
             .column(Column::initial(100.0).at_least(60.0))
+            .column(Column::initial(70.0).at_least(50.0))
             .column(Column::remainder().clip(true))
             .header(height, |mut h| {
                 h.col(|_| {});
@@ -903,6 +1095,10 @@ impl App {
                 };
                 head(&mut h, "Table", SortBy::Title);
                 head(&mut h, "ROM", SortBy::Rom);
+                h.col(|ui| {
+                    ui.strong("Source")
+                        .on_hover_text("Where the audio this tool made came from");
+                });
                 head(&mut h, "Audio", SortBy::Status);
             })
             .body(|body| {
@@ -935,6 +1131,32 @@ impl App {
                     });
                     row.col(|ui| {
                         ui.monospace(r.entry.rom.as_deref().unwrap_or("–"));
+                    });
+                    let state = live.get(&k);
+                    row.col(|ui| {
+                        let got = match state {
+                            Some(Live::Got(what, chosen)) => {
+                                Some((source_kind("", what, *chosen), what.clone()))
+                            }
+                            _ => None,
+                        };
+                        match got.or_else(|| {
+                            r.installed.as_ref().map(|i| {
+                                let what = if i.what.is_empty() {
+                                    "made by this tool before it noted where from".to_string()
+                                } else {
+                                    i.what.clone()
+                                };
+                                (installed_kind(i), what)
+                            })
+                        }) {
+                            Some((kind, what)) => {
+                                ui.label(kind).on_hover_text(what);
+                            }
+                            None => {
+                                ui.weak("–").on_hover_text("Not made by this tool, or no audio");
+                            }
+                        }
                     });
                     row.col(|ui| {
                         let (color, text) = match &r.entry.status {
@@ -971,7 +1193,8 @@ impl App {
                         };
                         if let Some(p) = row_clip(&r.entry) {
                             let on = playing.as_deref() == Some(p.as_path());
-                            let b = play_button(ui, on, !busy || on).on_hover_text(if on {
+                            let ok = App::can_play(live, recording, &r.entry);
+                            let b = play_button(ui, on, ok || on).on_hover_text(if on {
                                 "Stop"
                             } else if r.entry.existing.is_none()
                                 && matches!(r.entry.status, Status::Cached(_))
@@ -999,6 +1222,27 @@ impl App {
                         if r.entry.pin.is_some() && !matches!(r.entry.status, Status::Todo) {
                             text.push_str(" · music chosen by hand");
                         }
+                        let green = egui::Color32::from_rgb(90, 180, 100);
+                        let (color, text) = match state {
+                            None => (color, text),
+                            Some(Live::Queued) => (color, "waiting to record…".to_string()),
+                            Some(Live::Recording(since)) => {
+                                ui.spinner();
+                                let t = since.elapsed().as_secs();
+                                (color, format!("recording… {}:{:02}", t / 60, t % 60))
+                            }
+                            Some(Live::Got(what, _)) => (green, format!("got audio: {what}")),
+                            Some(Live::Finished(o)) => (
+                                egui::Color32::from_rgb(220, 80, 70),
+                                match o {
+                                    record::Outcome::Nothing => "no music",
+                                    record::Outcome::NotStarted => "PinMAME couldn't start the ROM",
+                                    record::Outcome::Failed if recording => "stopped or failed",
+                                    _ => "failed (see the log)",
+                                }
+                                .to_string(),
+                            ),
+                        };
                         ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
                     });
                 });
@@ -1034,7 +1278,8 @@ impl App {
         let dialog = self.confirm != Confirm::None
             || self.restore_open
             || self.picker.is_some()
-            || self.settings_open;
+            || self.settings_open
+            || self.ask_close;
         if dialog {
             return;
         }
@@ -1057,14 +1302,18 @@ impl App {
             }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            let recording = self.recording();
             let clip = self.last_clicked.as_ref().and_then(|k| {
                 self.rows
                     .iter()
                     .find(|r| &key(&r.entry) == k)
-                    .and_then(|r| row_clip(&r.entry).cloned())
+                    .and_then(|r| {
+                        let ok = App::can_play(&self.live, recording, &r.entry);
+                        row_clip(&r.entry).map(|p| (p.clone(), ok))
+                    })
             });
             let playing = self.player.playing().map(Path::to_path_buf);
-            if let Some(p) = clip.filter(|p| !self.busy() || playing.as_ref() == Some(p)) {
+            if let Some((p, _)) = clip.filter(|(p, ok)| *ok || playing.as_ref() == Some(p)) {
                 self.player.toggle(&p);
             }
         }
@@ -1088,6 +1337,50 @@ impl App {
         });
         if dismiss {
             self.notice = None;
+        }
+    }
+
+    /// Asked to close while recording.
+    fn close_window(&mut self, ctx: &egui::Context) {
+        if !self.ask_close {
+            return;
+        }
+        if !self.recording() {
+            self.ask_close = false;
+            return;
+        }
+        let mut stop = false;
+        let mut keep = false;
+        let modal = egui::Modal::new(egui::Id::unique("close")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Stop recording and close?");
+            ui.label("The recordings running are stopped and nothing more starts. Tables that already got audio keep it. The window closes once they've stopped.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Stop and close").clicked() {
+                    stop = true;
+                }
+                let k = ui.button("Keep recording");
+                if ui.memory(|m| m.focused().is_none()) {
+                    k.request_focus();
+                }
+                if k.clicked() {
+                    keep = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            keep = true;
+        }
+        if stop {
+            if let Some(job) = &self.job {
+                job.cancel.store(true, Ordering::SeqCst);
+            }
+            log::info!("Closing: stopping the recordings first");
+            self.close_when_done = true;
+            self.ask_close = false;
+        } else if keep {
+            self.ask_close = false;
         }
     }
 
@@ -1178,6 +1471,14 @@ impl eframe::App for App {
         if self.busy() || self.picker.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        if ctx.input(|i| i.viewport().close_requested()) && self.recording() {
+            // Recordings are child processes writing into Popper's media:
+            // they're stopped first.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.close_when_done {
+                self.ask_close = true;
+            }
+        }
         self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
@@ -1230,6 +1531,7 @@ impl eframe::App for App {
         self.restore_window(&ctx);
         self.picker_window(&ctx);
         self.settings_window(&ctx);
+        self.close_window(&ctx);
     }
 }
 

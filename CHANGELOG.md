@@ -2,6 +2,17 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.0-beta.2
+
+GUI:
+- Each table in a run shows what it's doing: waiting, recording (with the time so far), got audio (and from what), no music or failed. The progress bar counts recordings and tables and says about how long is left.
+- A *Source* column says where audio this tool made came from (ROM, PuP, altsound, table, chosen), with the file on hover. Audio from before this version shows its kind once it's made again.
+- The banner after a run sums it up: "12 tables got audio (9 ROM, 2 PuP, 1 altsound); 2 gave no music: …".
+- Closing the window while recording asks first, then stops the recordings and closes once they have stopped.
+- Play buttons stay usable during a run, except on the tables in it.
+
+The manifest in `data\installed\` notes what each table's audio is (`what=`); older files still read.
+
 ## 0.3.0-beta.1
 
 GUI:

@@ -427,7 +427,8 @@ fn settle_existing(e: &mut Entry, cache: &Cache, opts: &Options) {
                 && state::stamp(&found).is_some_and(|s| s == was.file)
         }
         None => {
-            let ours = e.rom.iter().any(|r| cache.is_clip_of(r, &found))
+            let of_rom = e.rom.iter().any(|r| cache.is_clip_of(r, &found));
+            let ours = of_rom
                 || e.table
                     .as_deref()
                     .is_some_and(|t| cache.is_clip_of(&state::table_key(t), &found));
@@ -435,7 +436,8 @@ fn settle_existing(e: &mut Entry, cache: &Cache, opts: &Options) {
             // keeps the clip's time on a copy) is of the old ROM.
             let stale = ours && e.rom_zip.as_deref().is_some_and(|z| older_than(&found, z));
             if ours && !stale && !now.is_empty() {
-                cache.set_installed(&media, &e.game.name, &now, &found);
+                let what = if of_rom { ROM_RECORDING } else { "" };
+                cache.set_installed(&media, &e.game.name, &now, what, &found);
             }
             stale
         }
@@ -451,6 +453,18 @@ fn settle_existing(e: &mut Entry, cache: &Cache, opts: &Options) {
     e.status = Status::Todo;
 }
 
+/// What this tool remembers installing for a table, while its Audio media
+/// is still that file (None for audio from elsewhere, or replaced since).
+pub fn installed_info(cache: &Cache, e: &Entry) -> Option<state::Installed> {
+    let media = e.emu.media_dir.as_deref()?;
+    let file = match &e.status {
+        Status::HasAudio(p) => Some(p),
+        _ => e.existing.as_ref(),
+    }?;
+    let was = cache.installed(media, &e.game.name)?;
+    (state::stamp(file) == Some(was.file)).then_some(was)
+}
+
 /// Forgets the music chosen for a table: from the next recording on it's
 /// found by itself. The audio it has stays, remembered as from its ROM or
 /// its sources as they are now (so it doesn't count as changed).
@@ -463,9 +477,9 @@ pub fn forget_choice(cache: &Cache, e: &Entry, opts: &Options) -> Result<()> {
     cache.set_pin(media, &e.game.name, None)?;
     // Only audio this tool installed (still the file it wrote) is
     // remembered again: a file put there by hand since stays the user's.
+    let was = cache.installed(media, &e.game.name);
     let ours = |found: &Path| {
-        cache
-            .installed(media, &e.game.name)
+        was.as_ref()
             .is_some_and(|was| state::stamp(found) == Some(was.file))
     };
     if let Some(found) = popper::existing_audio(media, &e.game.name).filter(|f| ours(f)) {
@@ -473,7 +487,8 @@ pub fn forget_choice(cache: &Cache, e: &Entry, opts: &Options) -> Result<()> {
         e.pin = None;
         let id = source_id(&e, opts);
         if !id.is_empty() {
-            cache.set_installed(media, &e.game.name, &id, &found);
+            let what = was.map(|w| w.what).unwrap_or_default();
+            cache.set_installed(media, &e.game.name, &id, &what, &found);
         }
     }
     Ok(())
@@ -858,6 +873,8 @@ struct Look {
     /// Something couldn't be read: not a verdict.
     unread: bool,
     fingerprint: String,
+    /// What the music found is ([`sources::Found::what`]).
+    what: String,
 }
 
 struct Job {
@@ -876,14 +893,41 @@ pub struct Summary {
     pub failed: usize,
 }
 
-/// One ROM finished (for a progress display).
-pub struct Progress<'a> {
-    pub done: usize,
-    pub total: usize,
-    pub rom: &'a str,
-    /// Popper GameNames of the tables on this ROM.
-    pub games: Vec<&'a str>,
-    pub outcome: Outcome,
+/// What a run is doing, for a progress display. A table is known by its
+/// emulator id and Popper GameName.
+pub enum Event<'a> {
+    /// The recordings to run (cached clips go in before them).
+    Planned { total: usize },
+    /// A recording started: of a ROM, or a look through tables' own files.
+    Started {
+        rom: &'a str,
+        games: Vec<(i64, &'a str)>,
+    },
+    /// It finished.
+    Finished {
+        done: usize,
+        total: usize,
+        rom: &'a str,
+        games: Vec<(i64, &'a str)>,
+        outcome: Outcome,
+        secs: f64,
+    },
+    /// A table got audio, from `what` (see [`state::Installed::what`]).
+    Installed {
+        game: (i64, &'a str),
+        what: &'a str,
+        chosen: bool,
+    },
+}
+
+/// What a ROM recording is called in [`Event::Installed`] and the manifest.
+pub const ROM_RECORDING: &str = "ROM recording";
+
+fn games(entries: &[Entry]) -> Vec<(i64, &str)> {
+    entries
+        .iter()
+        .map(|e| (e.emu.id, e.game.name.as_str()))
+        .collect()
 }
 
 pub struct Runner<'a> {
@@ -895,7 +939,7 @@ pub struct Runner<'a> {
     pub parallel: usize,
     /// Set to stop: no new recordings start, running ones are killed.
     pub cancel: Option<&'a AtomicBool>,
-    pub on_progress: Option<&'a (dyn Fn(Progress) + Sync)>,
+    pub on_progress: Option<&'a (dyn Fn(Event) + Sync)>,
     /// Where replaced Audio media goes this run (made when first needed);
     /// held while a table's audio is swapped, so the restore list is
     /// written by one thread at a time.
@@ -930,7 +974,14 @@ impl Runner<'_> {
             match &e.status {
                 Status::Cached(clip) => {
                     let clip = clip.clone();
-                    self.install_all(&clip, std::slice::from_ref(&e), &summary);
+                    let what = state::clip_what(&clip).unwrap_or_else(|| {
+                        if e.from_table() {
+                            "music from the table's files".into()
+                        } else {
+                            ROM_RECORDING.into()
+                        }
+                    });
+                    self.install_all(&clip, std::slice::from_ref(&e), &what, &summary);
                 }
                 Status::Todo if e.pin.is_some() && self.pinned(&e, &summary) => {}
                 // A choice that couldn't be used doesn't replace the audio
@@ -959,6 +1010,7 @@ impl Runner<'_> {
             }
         }
         let jobs: Vec<Job> = jobs.into_values().collect();
+        self.event(Event::Planned { total: jobs.len() });
         if jobs.is_empty() {
             return summary.into_inner().unwrap_or_default();
         }
@@ -981,6 +1033,10 @@ impl Runner<'_> {
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     let Some(job) = jobs.get(i) else { break };
                     let started = Instant::now();
+                    self.event(Event::Started {
+                        rom: &job.rom,
+                        games: games(&job.entries),
+                    });
                     let outcome = self.record_one(job, &summary);
                     let n = done.fetch_add(1, Ordering::SeqCst) + 1;
                     let titles: Vec<&str> = job
@@ -995,15 +1051,14 @@ impl Runner<'_> {
                         titles.join(", "),
                         started.elapsed().as_secs_f64()
                     );
-                    if let Some(f) = self.on_progress {
-                        f(Progress {
-                            done: n,
-                            total: jobs.len(),
-                            rom: &job.rom,
-                            games: job.entries.iter().map(|e| e.game.name.as_str()).collect(),
-                            outcome,
-                        });
-                    }
+                    self.event(Event::Finished {
+                        done: n,
+                        total: jobs.len(),
+                        rom: &job.rom,
+                        games: games(&job.entries),
+                        outcome,
+                        secs: started.elapsed().as_secs_f64(),
+                    });
                 });
             }
         });
@@ -1056,7 +1111,7 @@ impl Runner<'_> {
             Ok((clip, what)) => {
                 log::info!("{}: using the {what} (chosen for it)", e.game.display);
                 summary.lock().unwrap_or_else(|e| e.into_inner()).recorded += 1;
-                self.install_all(&clip, std::slice::from_ref(e), summary);
+                self.install_all(&clip, std::slice::from_ref(e), &what, summary);
                 true
             }
             Err(err) => {
@@ -1087,7 +1142,7 @@ impl Runner<'_> {
             .set_pin(media, &e.game.name, Some(id))
             .context("couldn't remember the choice")?;
         let summary = Mutex::new(Summary::default());
-        self.install_all(&clip, std::slice::from_ref(&e), &summary);
+        self.install_all(&clip, std::slice::from_ref(&e), &what, &summary);
         if summary.into_inner().unwrap_or_default().installed == 0 {
             let _ = self.cache.set_pin(media, &e.game.name, was.as_deref());
             anyhow::bail!("couldn't install it (see the log)");
@@ -1097,6 +1152,12 @@ impl Runner<'_> {
 
     fn cancelled(&self) -> bool {
         self.cancel.is_some_and(|c| c.load(Ordering::SeqCst))
+    }
+
+    fn event(&self, ev: Event) {
+        if let Some(f) = self.on_progress {
+            f(ev);
+        }
     }
 
     fn record_one(&self, job: &Job, summary: &Mutex<Summary>) -> Outcome {
@@ -1116,12 +1177,12 @@ impl Runner<'_> {
             } else {
                 Outcome::Nothing
             };
-            let fp = look.fingerprint;
             return self.finish(
                 job,
                 outcome,
                 &tmp,
-                &fp,
+                &look.fingerprint,
+                &look.what,
                 "no music found in the table's files",
                 summary,
             );
@@ -1281,7 +1342,7 @@ impl Runner<'_> {
         } else {
             "PinMAME couldn't start the ROM"
         };
-        self.finish(job, outcome, &tmp, &fp, reason, summary)
+        self.finish(job, outcome, &tmp, &fp, ROM_RECORDING, reason, summary)
     }
 
     /// Looks for the music in the tables' own files; on success it's in
@@ -1291,6 +1352,7 @@ impl Runner<'_> {
             found: false,
             unread: false,
             fingerprint: String::new(),
+            what: String::new(),
         };
         for e in &job.entries {
             if self.cancelled() {
@@ -1325,6 +1387,7 @@ impl Runner<'_> {
             }
             log::info!("{}: using the {}", e.game.display, found.what);
             look.found = true;
+            look.what = found.what;
             break;
         }
         let _ = std::fs::remove_dir_all(tmp.join("sources"));
@@ -1345,9 +1408,9 @@ impl Runner<'_> {
             zip: None,
             entries: vec![e.clone()],
         };
-        let found = self.music_from_table(&one, &tmp).found;
+        let look = self.music_from_table(&one, &tmp);
         let mut ok = false;
-        if found {
+        if look.found {
             let stem = self
                 .cache
                 .clip_stem(&key, self.opts.seconds, &self.opts.finish);
@@ -1358,8 +1421,9 @@ impl Runner<'_> {
                 self.ffmpeg.as_deref(),
             ) {
                 Ok(clip) => {
+                    state::set_clip_what(&clip, &look.what);
                     summary.lock().unwrap_or_else(|e| e.into_inner()).recorded += 1;
-                    self.install_all(&clip, std::slice::from_ref(e), summary);
+                    self.install_all(&clip, std::slice::from_ref(e), &look.what, summary);
                     ok = true;
                 }
                 Err(err) => log::warn!("{}: encoding failed: {err:#}", e.game.display),
@@ -1370,12 +1434,14 @@ impl Runner<'_> {
     }
 
     /// Encodes and installs a recording, or remembers that there was none.
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
         job: &Job,
         outcome: Outcome,
         tmp: &Path,
         fp: &str,
+        what: &str,
         reason: &str,
         summary: &Mutex<Summary>,
     ) -> Outcome {
@@ -1390,8 +1456,9 @@ impl Runner<'_> {
                 match encode::encode(&wav_out, &stem, self.opts.format, self.ffmpeg.as_deref()) {
                     Ok(clip) => {
                         self.cache.clear_verdict(&job.rom);
+                        state::set_clip_what(&clip, what);
                         summary.lock().unwrap_or_else(|e| e.into_inner()).recorded += 1;
-                        self.install_all(&clip, &job.entries, summary);
+                        self.install_all(&clip, &job.entries, what, summary);
                     }
                     Err(e) => {
                         log::warn!("{}: encoding failed: {e:#}", job.rom);
@@ -1634,7 +1701,7 @@ impl Runner<'_> {
         })
     }
 
-    fn install_all(&self, clip: &Path, entries: &[Entry], summary: &Mutex<Summary>) {
+    fn install_all(&self, clip: &Path, entries: &[Entry], what: &str, summary: &Mutex<Summary>) {
         for e in entries {
             let Some(media) = e.emu.media_dir.as_deref() else {
                 continue;
@@ -1664,9 +1731,15 @@ impl Runner<'_> {
             match installed {
                 Ok(dest) => {
                     log::info!("{}: wrote {}", e.game.display, dest.display());
+                    let source = source_id(e, self.opts);
                     self.cache
-                        .set_installed(media, &e.game.name, &source_id(e, self.opts), &dest);
+                        .set_installed(media, &e.game.name, &source, what, &dest);
                     summary.lock().unwrap_or_else(|e| e.into_inner()).installed += 1;
+                    self.event(Event::Installed {
+                        game: (e.emu.id, &e.game.name),
+                        what,
+                        chosen: e.pin.is_some(),
+                    });
                 }
                 Err(err) => log::warn!("{}: {err:#}", e.game.display),
             }
