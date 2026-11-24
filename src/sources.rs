@@ -97,6 +97,7 @@ pub fn find(
     t: &Table,
     ffmpeg: Option<&Path>,
     seconds: u32,
+    finish: &capture::Finish,
     tmp: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Search {
@@ -141,6 +142,7 @@ pub fn find(
             pcm.rate,
             Some(0),
             seconds,
+            finish,
         ) else {
             log::info!("  {}: no music in it", c.what);
             continue;
@@ -1502,7 +1504,7 @@ End Sub
             vpx_dirs: &dirs,
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false)
+        let f = find(&t, None, 20, &capture::Finish::default(), &dir.path().join("tmp"), &|| false)
             .found
             .unwrap();
         assert!(f.what.contains("script music"), "{}", f.what);
@@ -1570,7 +1572,7 @@ End Sub
             vpx_dirs: &[],
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false)
+        let f = find(&t, None, 20, &capture::Finish::default(), &dir.path().join("tmp"), &|| false)
             .found
             .unwrap();
         assert!(f.what.contains("TableLoop"), "{}", f.what);

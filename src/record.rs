@@ -65,6 +65,8 @@ impl Entry {
 
 pub struct Options {
     pub seconds: u32,
+    /// Levelling and fades of each clip.
+    pub finish: capture::Finish,
     pub format: Format,
     pub force: bool,
     pub retry: bool,
@@ -272,9 +274,9 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
         // The table's own music, kept when its ROM gave none.
         let own = table
             .as_deref()
-            .and_then(|t| cache.clip(&state::table_key(t), opts.seconds, opts.format.ext()));
+            .and_then(|t| cache.clip(&state::table_key(t), opts.seconds, &opts.finish, opts.format.ext()));
         if let Some(clip) = cache
-            .clip(&rom, opts.seconds, opts.format.ext())
+            .clip(&rom, opts.seconds, &opts.finish, opts.format.ext())
             .or(own)
             .filter(|_| !opts.retry)
         {
@@ -353,7 +355,7 @@ fn from_table(entry: &mut Entry, script: Option<&str>, cache: &Cache, opts: &Opt
     };
     let key = state::table_key(&t);
     entry.status = if let Some(clip) = cache
-        .clip(&key, opts.seconds, opts.format.ext())
+        .clip(&key, opts.seconds, &opts.finish, opts.format.ext())
         .filter(|_| !opts.retry)
     {
         Status::Cached(clip)
@@ -422,6 +424,7 @@ pub struct WorkerArgs {
     pub scratch: PathBuf,
     pub out: PathBuf,
     pub seconds: u32,
+    pub finish: capture::Finish,
     pub dll: PathBuf,
     pub rom_dirs: Vec<PathBuf>,
     pub trough: Vec<i32>,
@@ -523,6 +526,7 @@ pub fn worker_main(a: &WorkerArgs) -> i32 {
         run.rate,
         run.start_sample,
         a.seconds,
+        &a.finish,
     ) {
         Some(clip) => {
             let pcm = wav::Pcm {
@@ -982,6 +986,7 @@ impl Runner<'_> {
                 &table,
                 self.ffmpeg.as_deref(),
                 self.opts.seconds,
+                &self.opts.finish,
                 &tmp.join("sources"),
                 &|| self.cancelled(),
             );
@@ -1019,7 +1024,7 @@ impl Runner<'_> {
         let found = self.music_from_table(&one, &tmp).found;
         let mut ok = false;
         if found {
-            let stem = self.cache.clip_stem(&key, self.opts.seconds);
+            let stem = self.cache.clip_stem(&key, self.opts.seconds, &self.opts.finish);
             match encode::encode(
                 &tmp.join("clip.wav"),
                 &stem,
@@ -1053,7 +1058,7 @@ impl Runner<'_> {
             Outcome::Recorded => {
                 drop(s);
                 let wav_out = tmp.join("clip.wav");
-                let stem = self.cache.clip_stem(&job.rom, self.opts.seconds);
+                let stem = self.cache.clip_stem(&job.rom, self.opts.seconds, &self.opts.finish);
                 match encode::encode(&wav_out, &stem, self.opts.format, self.ffmpeg.as_deref()) {
                     Ok(clip) => {
                         self.cache.clear_verdict(&job.rom);
@@ -1157,6 +1162,12 @@ impl Runner<'_> {
             .arg(tmp.join("clip.wav"))
             .arg("--seconds")
             .arg(self.opts.seconds.to_string())
+            .arg("--fade-in")
+            .arg(self.opts.finish.fade_in.to_string())
+            .arg("--fade-out")
+            .arg(self.opts.finish.fade_out.to_string())
+            .arg("--lufs")
+            .arg(self.opts.finish.lufs.map_or("off".to_string(), |l| l.to_string()))
             .arg("--dll")
             .arg(self.dll.as_deref().context("libpinmame not found")?);
         if no_escape {
@@ -1341,6 +1352,7 @@ mod tests {
     fn opts(roms: &Path) -> Options {
         Options {
             seconds: 30,
+            finish: capture::Finish::default(),
             format: Format::Mp3,
             force: false,
             retry: false,
@@ -1407,7 +1419,7 @@ mod tests {
 
         // A clip recorded earlier for the ROM is reused.
         std::fs::write(
-            cache.clip_stem("afm_113b", 30).with_extension("mp3"),
+            cache.clip_stem("afm_113b", 30, &capture::Finish::default()).with_extension("mp3"),
             [7u8; 2048],
         )
         .unwrap();

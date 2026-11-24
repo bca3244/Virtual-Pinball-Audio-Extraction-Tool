@@ -60,9 +60,19 @@ struct Common {
     /// Output format (scan uses it to find clips already recorded).
     #[arg(long, value_enum, default_value_t = encode::Format::Mp3)]
     format: encode::Format,
-    /// Clip length in seconds (5 to 60).
+    /// Clip length in seconds (5 to 120).
     #[arg(long, default_value_t = capture::DEFAULT_SECONDS)]
     seconds: u32,
+    /// Seconds of fade-in at the start of each clip (0 to 10).
+    #[arg(long, default_value_t = 0.0)]
+    fade_in: f64,
+    /// Seconds of fade-out at the end of each clip (0 to 10).
+    #[arg(long, default_value_t = 1.0)]
+    fade_out: f64,
+    /// Loudness to level each clip to, in LUFS (-40 to -6), or "off" to
+    /// normalise by peak instead.
+    #[arg(long, default_value = "-16", value_parser = capture::Finish::parse_lufs)]
+    lufs: Option<f64>,
     /// Replace existing Audio media (same file name and format).
     #[arg(long)]
     force: bool,
@@ -84,6 +94,12 @@ impl Common {
     fn options(&self) -> record::Options {
         record::Options {
             seconds: capture::clamp_seconds(self.seconds),
+            finish: capture::Finish {
+                fade_in: self.fade_in,
+                fade_out: self.fade_out,
+                lufs: self.lufs,
+            }
+            .clamped(),
             format: self.format,
             force: self.force,
             retry: self.retry,

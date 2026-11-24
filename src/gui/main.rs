@@ -151,6 +151,11 @@ struct Settings {
     seconds: u32,
     format: Format,
     replace: bool,
+    fade_in: f64,
+    fade_out: f64,
+    /// Level to a loudness target (else by peak).
+    level: bool,
+    lufs: f64,
 }
 
 impl Settings {
@@ -161,6 +166,10 @@ impl Settings {
             seconds: capture::DEFAULT_SECONDS,
             format: Format::Mp3,
             replace: false,
+            fade_in: 0.0,
+            fade_out: 1.0,
+            level: true,
+            lufs: capture::DEFAULT_LUFS,
         };
         let Ok(text) = std::fs::read_to_string(cache.join("gui.txt")) else {
             return s;
@@ -182,6 +191,10 @@ impl Settings {
                     }
                 }
                 "replace" => s.replace = v == "1",
+                "fade_in" => s.fade_in = v.parse().unwrap_or(s.fade_in),
+                "fade_out" => s.fade_out = v.parse().unwrap_or(s.fade_out),
+                "level" => s.level = v != "0",
+                "lufs" => s.lufs = v.parse().unwrap_or(s.lufs),
                 _ => {}
             }
         }
@@ -195,14 +208,27 @@ impl Settings {
                 .unwrap_or_default()
         };
         let text = format!(
-            "popper={}\ndll={}\nseconds={}\nformat={}\nreplace={}\n",
+            "popper={}\ndll={}\nseconds={}\nformat={}\nreplace={}\nfade_in={}\nfade_out={}\nlevel={}\nlufs={}\n",
             p(&self.popper),
             p(&self.dll),
             self.seconds,
             self.format.ext(),
-            self.replace as u8
+            self.replace as u8,
+            self.fade_in,
+            self.fade_out,
+            self.level as u8,
+            self.lufs
         );
         let _ = std::fs::write(cache.join("gui.txt"), text);
+    }
+
+    fn finish(&self) -> capture::Finish {
+        capture::Finish {
+            fade_in: self.fade_in,
+            fade_out: self.fade_out,
+            lufs: self.level.then_some(self.lufs),
+        }
+        .clamped()
     }
 }
 
@@ -331,6 +357,7 @@ impl App {
     fn options(&self, force: bool, retry: bool) -> record::Options {
         record::Options {
             seconds: self.settings.seconds,
+            finish: self.settings.finish(),
             format: self.settings.format,
             force,
             retry,
@@ -689,6 +716,51 @@ impl App {
                 "Recordings run in real time, about one CPU core each. Going past your \
                  core count makes them fall behind and the music comes out wrong.",
             );
+            if changed {
+                self.settings.save(&self.cache);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut changed = false;
+            ui.label("Fade in:");
+            changed |= ui
+                .add_enabled(
+                    !busy,
+                    egui::DragValue::new(&mut self.settings.fade_in)
+                        .range(0.0..=capture::MAX_FADE)
+                        .speed(0.1)
+                        .suffix(" s"),
+                )
+                .changed();
+            ui.label("Fade out:");
+            changed |= ui
+                .add_enabled(
+                    !busy,
+                    egui::DragValue::new(&mut self.settings.fade_out)
+                        .range(0.0..=capture::MAX_FADE)
+                        .speed(0.1)
+                        .suffix(" s"),
+                )
+                .changed();
+            changed |= ui
+                .add_enabled(
+                    !busy,
+                    egui::Checkbox::new(&mut self.settings.level, "Even loudness"),
+                )
+                .on_hover_text(
+                    "Level every clip to the same loudness (EBU R128) with a limiter, \
+                     instead of only by its loudest peak",
+                )
+                .changed();
+            changed |= ui
+                .add_enabled(
+                    !busy && self.settings.level,
+                    egui::DragValue::new(&mut self.settings.lufs)
+                        .range(-40.0..=-6.0)
+                        .speed(0.5)
+                        .suffix(" LUFS"),
+                )
+                .changed();
             if changed {
                 self.settings.save(&self.cache);
             }

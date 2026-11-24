@@ -2,6 +2,12 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.2.0-beta.1
+
+- Every clip is levelled to the same loudness (EBU R128 integrated loudness, -16 LUFS by default) with a look-ahead limiter keeping peaks under -1 dBFS, so quiet tables like Apollo 13 or Goldeneye play about as loud as the rest. `--lufs off` (or unticking "Even loudness" in the GUI) keeps the old peak normalisation.
+- Fade-in and fade-out lengths can be set (`--fade-in`, `--fade-out`, or in the GUI; defaults 0 and 1 s), and clips can be up to 120 s long.
+- Cached clips are kept per length, loudness and fades, so changing a setting records fresh ones. Audio already in Popper changes only when it's re-recorded (Replace).
+
 ## 0.1.0
 
 First full release. On the cabinet it gave 136 of 137 tables their music: ROM recordings (with retries from the cabinet's nvram, Start pressed twice, without the script's start switches, and without the service key), and for tables whose ROM gives none, altsound, music the script plays, sounds stored in the table, and PuP pack music including music videos. The GUI lists every table with its ROM and lets you play, record and remove Audio media. Changes since beta.23: none.

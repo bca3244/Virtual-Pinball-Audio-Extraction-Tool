@@ -47,10 +47,10 @@ impl Cache {
     /// `clips\<rom>-<secs>s-v<n>` (no extension: the encoder adds it).
     /// The version keeps clips from an older recorder (which could save
     /// an idle sound board's static as music) from ever being reused.
-    pub fn clip_stem(&self, rom: &str, seconds: u32) -> PathBuf {
+    pub fn clip_stem(&self, rom: &str, seconds: u32, finish: &crate::capture::Finish) -> PathBuf {
         self.dir
             .join("clips")
-            .join(format!("{rom}-{seconds}s-v{CLIP_VERSION}"))
+            .join(format!("{rom}-{seconds}s-{}-v{CLIP_VERSION}", finish.tag()))
     }
 
     /// Forgets every cached clip of this ROM at this length, in any format
@@ -63,7 +63,7 @@ impl Cache {
         for e in dir.flatten() {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
             let rest = name.strip_prefix(&prefix);
-            if rest.is_some_and(|r| r.starts_with('.') || r.starts_with("-v")) {
+            if rest.is_some_and(|r| r.starts_with('.') || r.starts_with('-')) {
                 if let Err(err) = std::fs::remove_file(e.path()) {
                     log::warn!("couldn't delete {}: {err}", e.path().display());
                 }
@@ -73,8 +73,14 @@ impl Cache {
 
     /// A clip of this ROM at this length in exactly this format. Files
     /// under 1 KB are leftovers of a failed encode, never a clip.
-    pub fn clip(&self, rom: &str, seconds: u32, ext: &str) -> Option<PathBuf> {
-        let p = self.clip_stem(rom, seconds).with_extension(ext);
+    pub fn clip(
+        &self,
+        rom: &str,
+        seconds: u32,
+        finish: &crate::capture::Finish,
+        ext: &str,
+    ) -> Option<PathBuf> {
+        let p = self.clip_stem(rom, seconds, finish).with_extension(ext);
         std::fs::metadata(&p)
             .is_ok_and(|m| m.is_file() && m.len() >= 1024)
             .then_some(p)
@@ -142,7 +148,7 @@ const RECORDER_VERSION: u32 = 7;
 /// Bumped when clips recorded before it can't be trusted (v2: static
 /// from an idle sound board is no longer taken for music; v3: a short
 /// start jingle is no longer taken for the music).
-const CLIP_VERSION: u32 = 3;
+const CLIP_VERSION: u32 = 4;
 
 /// The cache name for music taken from a table's own files (no ROM, or a
 /// ROM zip missing): `vpx-<file stem>-<hash of its path>`.
@@ -237,9 +243,9 @@ mod tests {
         let clips = dir.path().join("clips");
         // A clip from before the static guard: never reused.
         std::fs::write(clips.join("diner_l4-30s.ogg"), [0u8; 2048]).unwrap();
-        assert!(c.clip("diner_l4", 30, "ogg").is_none());
+        assert!(c.clip("diner_l4", 30, &crate::capture::Finish::default(), "ogg").is_none());
         std::fs::write(
-            c.clip_stem("diner_l4", 30).with_extension("mp3"),
+            c.clip_stem("diner_l4", 30, &crate::capture::Finish::default()).with_extension("mp3"),
             [0u8; 2048],
         )
         .unwrap();
@@ -259,24 +265,24 @@ mod tests {
     fn clip_lookup_wants_the_format_and_a_real_file() {
         let dir = tempfile::tempdir().unwrap();
         let c = Cache::open(Some(dir.path())).unwrap();
-        assert!(c.clip("afm", 30, "mp3").is_none());
-        std::fs::write(c.clip_stem("afm", 30).with_extension("wav"), [0u8; 2048]).unwrap();
+        assert!(c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").is_none());
+        std::fs::write(c.clip_stem("afm", 30, &crate::capture::Finish::default()).with_extension("wav"), [0u8; 2048]).unwrap();
         assert!(
-            c.clip("afm", 30, "mp3").is_none(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").is_none(),
             "a WAV doesn't stand in for an MP3"
         );
-        std::fs::write(c.clip_stem("afm", 30).with_extension("mp3"), b"x").unwrap();
+        std::fs::write(c.clip_stem("afm", 30, &crate::capture::Finish::default()).with_extension("mp3"), b"x").unwrap();
         assert!(
-            c.clip("afm", 30, "mp3").is_none(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").is_none(),
             "an empty leftover isn't a clip"
         );
-        std::fs::write(c.clip_stem("afm", 30).with_extension("mp3"), [0u8; 2048]).unwrap();
+        std::fs::write(c.clip_stem("afm", 30, &crate::capture::Finish::default()).with_extension("mp3"), [0u8; 2048]).unwrap();
         assert_eq!(
-            c.clip("afm", 30, "mp3").unwrap().extension().unwrap(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").unwrap().extension().unwrap(),
             "mp3"
         );
         assert_eq!(
-            c.clip("afm", 30, "wav").unwrap().extension().unwrap(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "wav").unwrap().extension().unwrap(),
             "wav"
         );
     }

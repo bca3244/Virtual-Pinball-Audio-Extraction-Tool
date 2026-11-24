@@ -30,6 +30,13 @@ struct WorkerCli {
     out: PathBuf,
     #[arg(long)]
     seconds: u32,
+    #[arg(long, default_value_t = 0.0)]
+    fade_in: f64,
+    #[arg(long, default_value_t = 1.0)]
+    fade_out: f64,
+    /// Loudness target, or "off" for peak normalisation.
+    #[arg(long, default_value = "-16", value_parser = capture::Finish::parse_lufs)]
+    lufs: Option<f64>,
     #[arg(long)]
     dll: PathBuf,
     #[arg(long = "rom-dir")]
@@ -90,6 +97,12 @@ pub fn run_worker_if_requested() {
         scratch: w.scratch,
         out: w.out,
         seconds: capture::clamp_seconds(w.seconds),
+        finish: capture::Finish {
+            fade_in: w.fade_in,
+            fade_out: w.fade_out,
+            lufs: w.lufs,
+        }
+        .clamped(),
         dll: w.dll,
         rom_dirs: w.rom_dirs,
         trough: w.trough,
