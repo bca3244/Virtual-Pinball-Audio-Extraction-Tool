@@ -880,6 +880,23 @@ impl Runner<'_> {
                 outcome = Outcome::Recorded;
             }
         }
+        // Each table's own music (its PuP pack, say: The Beatles plays all
+        // its music from one, over a ROM that stays silent), kept per
+        // table, since many PuP tables share one ROM.
+        let mut rest = job.entries.clone();
+        if outcome == Outcome::Nothing && !self.cancelled() {
+            rest.retain(|e| !self.own_music(e, summary));
+            if rest.is_empty() {
+                let _ = std::fs::remove_file(&best);
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Outcome::Recorded;
+            }
+        }
+        let job = &Job {
+            rom: job.rom.clone(),
+            zip: job.zip.clone(),
+            entries: rest,
+        };
         if outcome != Outcome::Recorded && !self.cancelled() && best_len.get() > 0.0 {
             // Nothing longer anywhere: the jingle is better than no audio.
             let _ = std::fs::create_dir_all(&tmp);
@@ -945,6 +962,42 @@ impl Runner<'_> {
         }
         let _ = std::fs::remove_dir_all(tmp.join("sources"));
         look
+    }
+
+    /// Music from one table's own files, cached under the table and
+    /// installed for it alone. Whether it got some.
+    fn own_music(&self, e: &Entry, summary: &Mutex<Summary>) -> bool {
+        let Some(t) = e.table.as_deref().filter(|t| t.is_file()) else {
+            return false;
+        };
+        let key = state::table_key(t);
+        let tmp = work_dir().join(format!("vp-audio-extract-{key}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let one = Job {
+            rom: key.clone(),
+            zip: None,
+            entries: vec![e.clone()],
+        };
+        let found = self.music_from_table(&one, &tmp, false).found;
+        let mut ok = false;
+        if found {
+            let stem = self.cache.clip_stem(&key, self.opts.seconds);
+            match encode::encode(
+                &tmp.join("clip.wav"),
+                &stem,
+                self.opts.format,
+                self.ffmpeg.as_deref(),
+            ) {
+                Ok(clip) => {
+                    summary.lock().unwrap_or_else(|e| e.into_inner()).recorded += 1;
+                    self.install_all(&clip, std::slice::from_ref(e), summary);
+                    ok = true;
+                }
+                Err(err) => log::warn!("{}: encoding failed: {err:#}", e.game.display),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        ok
     }
 
     /// Encodes and installs a recording, or remembers that there was none.

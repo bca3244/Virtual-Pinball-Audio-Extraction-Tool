@@ -2,6 +2,11 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.15
+
+- PinMAME runs with "Skip Pinball Startup Test" on, as VPinMAME does by default. Theatre of Magic's ROM failed its own check ("INCORRECT U22") and never started a game without it.
+- When a ROM gives no music, each table on it also gets the music in its own files (its PuP pack, a script or embedded music track), kept for that table alone since many PuP tables share one ROM. The Beatles plays its music from its PuP pack this way.
+
 ## 0.1.0-beta.14
 
 - A script mechanism without a length is no longer handed to PinMAME, which divides by it and crashed at once (Red & Ted's Road Show).
