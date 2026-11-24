@@ -231,23 +231,24 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             out.push(entry);
             continue;
         };
-        if !opts.force {
-            if let Some(found) = popper::existing_audio(media, &game.name) {
-                entry.rom = game.rom.clone();
-                entry.status = Status::HasAudio(found);
-                out.push(entry);
-                continue;
-            }
-        }
         let script = table.as_deref().filter(|t| t.is_file()).and_then(|t| {
             vpx::read_script(t)
                 .map_err(|e| log::debug!("{}: {e:#}", t.display()))
                 .ok()
         });
+        // Popper's ROM field is often empty: the script names it then
+        // (also for tables that already have audio, so the list shows it).
         entry.rom = game
             .rom
             .clone()
             .or_else(|| script.as_deref().and_then(vpx::rom_name));
+        if !opts.force {
+            if let Some(found) = popper::existing_audio(media, &game.name) {
+                entry.status = Status::HasAudio(found);
+                out.push(entry);
+                continue;
+            }
+        }
         let Some(rom) = entry.rom.clone() else {
             entry.status = Status::NoRom;
             from_table(&mut entry, script.as_deref(), cache, opts);

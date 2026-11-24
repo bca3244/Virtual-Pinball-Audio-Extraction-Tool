@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.23
+
+- The ROM column also shows the ROM for tables that already have audio: their script is read for it when Popper's ROM field is empty (most tables), as it already was for tables without audio.
+
 ## 0.1.0-beta.22
 
 - A table whose Popper ROM field is empty and whose script names its ROM only through the controller (`Controller.GameName = "shrkysht"`, or `.GameName = "..."` in a `With Controller` block) is now recorded from that ROM. Sharkey's Shootout was taken for a table without a ROM.
