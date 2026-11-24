@@ -154,6 +154,11 @@ struct App {
     roms: (usize, usize),
     /// A look through tables' files failed this run (no ffmpeg?).
     table_failed: bool,
+    /// How many music sources each table's files hold (for Music…),
+    /// found in the background after each scan; kept across scans.
+    choices: Arc<Mutex<HashMap<Key, usize>>>,
+    /// Bumped each scan, so an older count stops.
+    choices_gen: Arc<AtomicUsize>,
     /// Tables in the run going on.
     run_tables: usize,
     /// Closing was asked for while recording: asking whether to stop.
@@ -197,6 +202,8 @@ impl App {
             took: Vec::new(),
             roms: (0, 0),
             table_failed: false,
+            choices: Default::default(),
+            choices_gen: Default::default(),
             run_tables: 0,
             ask_close: false,
             close_when_done: false,
@@ -315,6 +322,8 @@ impl App {
             result.clone(),
             events.clone(),
         );
+        // Not while recording: the scan after it counts again.
+        self.choices_gen.fetch_add(1, Ordering::SeqCst);
         self.live = keys.iter().map(|k| (k.clone(), Live::Queued)).collect();
         self.running.clear();
         self.took.clear();
@@ -615,6 +624,7 @@ impl App {
                     log::info!("Popper: {}", dir.display());
                 }
                 self.popper_dir = Some(dir);
+                self.count_choices(ctx);
                 self.error = None;
                 // A folder chosen is kept once it reads.
                 self.settings.save(&self.cache);
@@ -650,6 +660,44 @@ impl App {
                 self.rescan(ctx);
             }
         }
+    }
+
+    /// Counts each pickable table's music sources in the background (it
+    /// opens every table file), so Music… is only offered with a choice.
+    fn count_choices(&self, ctx: &egui::Context) {
+        let gen = self.choices_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let entries: Vec<Entry> = self
+            .rows
+            .iter()
+            .filter(|r| r.can_pick)
+            .map(|r| r.entry.clone())
+            .collect();
+        let (counts, current, opts, ctx) = (
+            self.choices.clone(),
+            self.choices_gen.clone(),
+            self.options(false, false),
+            ctx.clone(),
+        );
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let (total, mut with) = (entries.len(), 0);
+            for e in entries {
+                if current.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let n = record::choices(&e, &opts).len();
+                with += (n > 0) as usize;
+                counts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key(&e), n);
+                ctx.request_repaint();
+            }
+            log::info!(
+                "Looked for music in {total} table(s)' files: {with} have some to choose from ({:.0} s)",
+                started.elapsed().as_secs_f64()
+            );
+        });
     }
 
     /// The ffmpeg runs use: the one chosen, else Popper's or one on PATH.
@@ -1156,6 +1204,11 @@ impl App {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(500));
         }
+        let choices = self
+            .choices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let rows = &mut self.rows;
         TableBuilder::new(ui)
             .striped(true)
@@ -1301,13 +1354,19 @@ impl App {
                                 player.toggle(p);
                             }
                         }
-                        if r.can_pick
-                            && ui
-                                .add_enabled(!busy, egui::Button::new("Music…").small())
-                                .on_hover_text("Listen to the music found in this table's own files, and choose which to use")
-                                .clicked()
-                        {
-                            pick = Some(r.entry.clone());
+                        if r.can_pick {
+                            // Chosen by hand: open, so it can go back to Automatic.
+                            let found = choices.get(&k).copied();
+                            let offer = r.entry.pin.is_some() || found.is_some_and(|n| n > 0);
+                            let b = ui.add_enabled(!busy && offer, egui::Button::new("Music…").small());
+                            let b = match found {
+                                _ if offer => b.on_hover_text("Listen to the music found in this table's own files, and choose which to use"),
+                                None => b.on_disabled_hover_text("Still looking through this table's files for music…"),
+                                Some(_) => b.on_disabled_hover_text("No music files were found with this table, so there's nothing to choose: it uses its ROM recording"),
+                            };
+                            if b.clicked() {
+                                pick = Some(r.entry.clone());
+                            }
                         }
                         let mut text = text;
                         if let Some(n) = r.entry.note.as_deref().filter(|_| !r.entry.replace) {

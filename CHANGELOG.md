@@ -2,6 +2,14 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.1
+
+- *Music…* is offered only for tables whose files hold music to choose from (or whose music was already chosen by hand, to go back to Automatic). The list looks through the table files in the background after it loads (about 45 s for 137 tables), and the log says how many have a choice; hovering a greyed-out button says why. The look pauses while recording.
+
+## 0.3.1-beta.1
+
+- *Music…* is offered only for tables whose files hold music to choose from (or whose music was already chosen by hand, to go back to Automatic). The list looks through the table files in the background after it loads; hovering a greyed-out button says why.
+
 ## 0.3.0
 
 A reworked window. Chips under the list show one kind of table at a time, and the column headers sort. The options moved into *Settings…*, which also shows the libpinmame and ffmpeg found. During a run each table shows what it's doing, and the progress bar says how long is left. A *Source* column says where each table's audio came from, and a banner sums up each run. Closing mid-run asks first. Keyboard shortcuts: Ctrl+F, Esc, Ctrl+A, Shift-click and Space. Changes since beta.3, from cabinet testing and the final review:
