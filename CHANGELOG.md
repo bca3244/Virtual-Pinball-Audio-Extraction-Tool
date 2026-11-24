@@ -2,9 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
-## Unreleased
+## 0.1.0-beta.16
 
 - Both exes have an app icon in the Rusty Popper wheel style (copper ring, chrome note), and the GUI window uses it in the title bar and Alt-Tab.
+- The GUI's "At once" setting goes up to one recording per logical CPU core instead of stopping at 8. The CLI's `--parallel` was never capped.
 
 ## 0.1.0-beta.15
 

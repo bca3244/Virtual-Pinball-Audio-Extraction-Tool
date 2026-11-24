@@ -659,6 +659,15 @@ pub fn default_parallel() -> usize {
     (n / 2).saturating_sub(1).clamp(1, 6)
 }
 
+/// Most recordings the GUI allows at once: one per logical core, since each
+/// needs about a core to keep up in real time.
+pub fn max_parallel() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .max(1)
+}
+
 impl Runner<'_> {
     pub fn run(&self, entries: Vec<Entry>) -> Summary {
         let summary = Mutex::new(Summary::default());

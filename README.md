@@ -56,7 +56,7 @@ vp-audio-extract record --seconds 20 --dry-run
 vp-audio-extract record --retry
 ```
 
-Close VPX while it records, because each recording keeps one CPU core busy in real time. It picks how many to run at once by itself (half your cores less one, at most 6), and `--parallel N` overrides that.
+Close VPX while it records, because each recording keeps one CPU core busy in real time. It picks how many to run at once by itself (half your cores less one, at most 6), and `--parallel N` (or "At once" in the GUI, up to one per logical core) overrides that.
 
 | Option | |
 |---|---|

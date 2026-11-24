@@ -681,7 +681,14 @@ impl App {
                 .on_hover_text("Re-record selected tables that already have Audio media")
                 .changed();
             ui.label("At once:");
-            ui.add_enabled(!busy, egui::DragValue::new(&mut self.parallel).range(1..=8));
+            ui.add_enabled(
+                !busy,
+                egui::DragValue::new(&mut self.parallel).range(1..=record::max_parallel()),
+            )
+            .on_hover_text(
+                "Recordings run in real time, about one CPU core each. Going past your \
+                 core count makes them fall behind and the music comes out wrong.",
+            );
             if changed {
                 self.settings.save(&self.cache);
             }
