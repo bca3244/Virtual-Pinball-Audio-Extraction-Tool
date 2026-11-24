@@ -2,6 +2,11 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.19
+
+- A ROM that stays silent after Start is tried once more without the switches read from its script (trough, mechanism rests, init states), which can keep a game from starting when one is wrong for the ROM. Theatre of Magic starts and plays its music this way.
+- `--show-display` prints DMD frames at full resolution, so their text can be read.
+
 ## 0.1.0-beta.18
 
 - The worker's `--show-display` diagnostic also prints DMD frames (as text, about once a second while they change) and which solenoids fired every 2 s, to see why a game doesn't start.
