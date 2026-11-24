@@ -2,6 +2,15 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.2.0
+
+Every clip at an even loudness (EBU R128, -16 LUFS, true peak under -1 dBTP), with fades and lengths up to 120 s. Tables whose ROM or table changed since their audio was made can be recorded again (`--changed`, or in the GUI). Each table's music can be chosen by hand in the GUI (*Music…*). The GUI shows results in a banner and only acts on the rows shown. Changes since beta.4, from the final review:
+- Replacing audio sets aside only `Game.<ext>`; numbered tracks you added (`Game01.mp3`) stay in Popper.
+- *Automatic* in the music window doesn't claim a file you put there by hand.
+- Moving the tables, PuP or altsound folders no longer makes table-sourced audio count as changed.
+- A chosen music file that can't be used at record time keeps the audio it gave, rather than re-recording it every run.
+- Restore puts a file back where it was, even when its name was reused in the batch.
+
 ## 0.2.0-beta.4
 
 - **Choose a table's music by hand:** the GUI's *Music…* button lists the music found in the table's files, altsound and PuP pack. ▶ plays each one as it would be installed, and *Use* installs it (the old audio is kept for Restore) and keeps it for that table when it's recorded again. *Automatic* goes back to the ROM recording or the best source.

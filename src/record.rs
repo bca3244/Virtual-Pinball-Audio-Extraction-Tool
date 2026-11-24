@@ -382,7 +382,14 @@ pub fn source_id(e: &Entry, opts: &Options) -> String {
     let script = vpx::read_script(t).ok();
     let dirs = vpx_dirs(&e.emu, opts.vpx_dir.as_deref());
     let found = source_table(e, t, script.as_deref(), &dirs, opts);
-    let h: String = Sha1::digest(sources::fingerprint(&found).as_bytes())
+    // The sources used by themselves, by name and size (no paths: a moved
+    // tables or PuP folder is the same music).
+    let ids: Vec<String> = sources::list(&found)
+        .into_iter()
+        .filter(|c| c.usual)
+        .map(|c| c.id)
+        .collect();
+    let h: String = Sha1::digest(ids.join(";").as_bytes())
         .iter()
         .take(10)
         .map(|b| format!("{b:02x}"))
@@ -454,7 +461,14 @@ pub fn forget_choice(cache: &Cache, e: &Entry, opts: &Options) -> Result<()> {
         .as_deref()
         .context("its emulator has no media folder in Popper")?;
     cache.set_pin(media, &e.game.name, None)?;
-    if let Some(found) = popper::existing_audio(media, &e.game.name) {
+    // Only audio this tool installed (still the file it wrote) is
+    // remembered again: a file put there by hand since stays the user's.
+    let ours = |found: &Path| {
+        cache
+            .installed(media, &e.game.name)
+            .is_some_and(|was| state::stamp(found) == Some(was.file))
+    };
+    if let Some(found) = popper::existing_audio(media, &e.game.name).filter(|f| ours(f)) {
         let mut e = e.clone();
         e.pin = None;
         let id = source_id(&e, opts);
@@ -919,6 +933,9 @@ impl Runner<'_> {
                     self.install_all(&clip, std::slice::from_ref(&e), &summary);
                 }
                 Status::Todo if e.pin.is_some() && self.pinned(&e, &summary) => {}
+                // A choice that couldn't be used doesn't replace the audio
+                // it gave (unless everything is being replaced).
+                Status::Todo if e.pin.is_some() && e.replace && !self.opts.force => {}
                 Status::Todo => {
                     // A choice that couldn't be used: what's installed
                     // instead is from the ROM or the sources found.
@@ -1630,7 +1647,8 @@ impl Runner<'_> {
                 let dir = batch
                     .get_or_insert_with(|| backup::new_batch(&self.cache.dir))
                     .clone();
-                match backup::set_aside(media, &e.game.name, &dir) {
+                // Only `Game.<ext>`: numbered tracks added by hand stay.
+                match backup::set_aside_plain(media, &e.game.name, &dir) {
                     Err(err) => Err(err.context("couldn't set the old audio aside")),
                     Ok(moved) => {
                         let r = popper::install(clip, media, &e.game.name, true);

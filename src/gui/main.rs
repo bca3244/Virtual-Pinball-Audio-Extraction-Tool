@@ -1209,7 +1209,7 @@ impl App {
         let modal = egui::Modal::new(egui::Id::unique("picker")).show(ctx, |ui| {
             ui.set_width(width);
             ui.heading(format!("Music for {}", pk.entry.game.display));
-            ui.label("Found in the table's files, its altsound and its PuP pack, best first. The play button plays it as it would be installed. Use installs it now (the old audio is kept for Restore…) and keeps it for this table from then on.");
+            ui.label("Found in the table's files, its altsound and its PuP pack, best first. The play button plays it as it would be installed. Use installs it now and keeps it for this table from then on (the old audio is kept: Remove the new one, then Restore…, to go back).");
             let st = pk.state.lock().unwrap_or_else(|e| e.into_inner());
             let working = st.working.is_some();
             ui.add_space(6.0);
@@ -1515,7 +1515,7 @@ impl App {
                 _ => {
                     ui.heading(format!("Replace audio on {replacing} table(s)?"));
                     ui.label(format!(
-                        "Those tables already have Audio media (some because their ROM or table changed since it was made). It will be replaced by a new recording, and the old files kept in {} for Restore….",
+                        "Those tables already have Audio media (some because their ROM or table changed since it was made). It will be replaced by a new recording. The old files are kept in {}: to go back, Remove the new audio, then Restore….",
                         backup_dir.display()
                     ));
                     ui.add(egui::Label::new(egui::RichText::new(&replace_names).weak()).wrap());
