@@ -5,313 +5,81 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod applog;
+mod picker;
 mod player;
+mod settings;
+mod view;
+mod widgets;
+
+use applog::{init_log, log_lines, LOG};
+use picker::Picker;
+use settings::Settings;
+use view::{
+    after, eta_secs, eta_text, has_audio, installed_kind, key, range_between, replaces, row_clip,
+    run_summary, sort_rows, source_kind, to_record, Chip, Key, Live, SortBy,
+};
+use widgets::{ago, path_label, play_button};
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use vp_audio_extract::encode::Format;
 use vp_audio_extract::record::{self, Entry, Status};
-use vp_audio_extract::{backup, capture, encode, popper, sources, state, wav};
-
-/// A small play (triangle) or stop (square) button, drawn rather than
-/// taken from a font glyph, which the default fonts may lack.
-fn play_button(ui: &mut egui::Ui, on: bool, enabled: bool) -> egui::Response {
-    let size = egui::vec2(20.0, 18.0);
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(size, sense);
-    if ui.is_rect_visible(rect) {
-        let v = if enabled {
-            ui.style().interact(&resp)
-        } else {
-            &ui.visuals().widgets.noninteractive
-        };
-        let p = ui.painter();
-        p.rect(
-            rect,
-            v.corner_radius,
-            v.weak_bg_fill,
-            v.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let c = rect.center();
-        let color = v.fg_stroke.color;
-        if on {
-            p.rect_filled(
-                egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0)),
-                1.0,
-                color,
-            );
-        } else {
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    c + egui::vec2(-3.5, -5.0),
-                    c + egui::vec2(5.0, 0.0),
-                    c + egui::vec2(-3.5, 5.0),
-                ],
-                color,
-                egui::Stroke::NONE,
-            ));
-        }
-    }
-    resp
-}
-
-// ---- logging into the window ---------------------------------------------
-
-const LOG_LINES: usize = 1000;
-
-struct GuiLog {
-    lines: Mutex<VecDeque<String>>,
-    file: Mutex<Option<std::fs::File>>,
-    ctx: OnceLock<egui::Context>,
-}
-
-static LOG: OnceLock<GuiLog> = OnceLock::new();
-
-impl log::Log for GuiLog {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        // Only this tool's own messages: egui logs while it holds its
-        // context lock, and asking it to repaint from there would deadlock.
-        m.level() <= log::Level::Info && m.target().starts_with("vp_audio_extract")
-    }
-    fn log(&self, r: &log::Record) {
-        if !self.enabled(r.metadata()) {
-            return;
-        }
-        let line = match r.level() {
-            log::Level::Info => r.args().to_string(),
-            l => format!("{l}: {}", r.args()),
-        };
-        if let Ok(mut f) = self.file.lock() {
-            if let Some(f) = f.as_mut() {
-                use std::io::Write;
-                let _ = writeln!(f, "{} {line}", chrono_now());
-            }
-        }
-        if let Ok(mut lines) = self.lines.lock() {
-            lines.push_back(line);
-            while lines.len() > LOG_LINES {
-                lines.pop_front();
-            }
-        }
-        if let Some(ctx) = self.ctx.get() {
-            ctx.request_repaint();
-        }
-    }
-    fn flush(&self) {}
-}
-
-/// Seconds since the epoch: enough to order log lines.
-fn chrono_now() -> String {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("[{}]", t.as_secs())
-}
-
-fn log_lines() -> Vec<String> {
-    LOG.get()
-        .and_then(|l| l.lines.lock().ok().map(|v| v.iter().cloned().collect()))
-        .unwrap_or_default()
-}
-
-fn init_log(cache: Option<&Path>) {
-    let file = cache.and_then(|d| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(d.join("vp-audio-extract.log"))
-            .ok()
-    });
-    let gl = LOG.get_or_init(|| GuiLog {
-        lines: Mutex::new(VecDeque::new()),
-        file: Mutex::new(file),
-        ctx: OnceLock::new(),
-    });
-    let _ = log::set_logger(gl);
-    log::set_max_level(log::LevelFilter::Info);
-}
-
-// ---- settings ---------------------------------------------------------------
-
-/// The few choices worth keeping between runs, in `gui.txt` in the cache
-/// folder (`key=value` lines).
-#[derive(Clone)]
-struct Settings {
-    popper: Option<PathBuf>,
-    dll: Option<PathBuf>,
-    seconds: u32,
-    format: Format,
-    replace: bool,
-    fade_in: f64,
-    fade_out: f64,
-    /// Level to a loudness target (else by peak).
-    level: bool,
-    lufs: f64,
-    /// Recordings at once (None: the default for this PC).
-    parallel: Option<usize>,
-}
-
-impl Settings {
-    fn load(cache: &Path) -> Settings {
-        let mut s = Settings {
-            popper: None,
-            dll: None,
-            seconds: capture::DEFAULT_SECONDS,
-            format: Format::Mp3,
-            replace: false,
-            fade_in: 0.0,
-            fade_out: 1.0,
-            level: true,
-            lufs: capture::DEFAULT_LUFS,
-            parallel: None,
-        };
-        let Ok(text) = std::fs::read_to_string(cache.join("gui.txt")) else {
-            return s;
-        };
-        for line in text.lines() {
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            let v = v.trim();
-            match k.trim() {
-                "popper" if !v.is_empty() => s.popper = Some(PathBuf::from(v)),
-                "dll" if !v.is_empty() => s.dll = Some(PathBuf::from(v)),
-                "seconds" => s.seconds = v.parse().map(capture::clamp_seconds).unwrap_or(s.seconds),
-                "format" => {
-                    s.format = match v {
-                        "ogg" => Format::Ogg,
-                        "wav" => Format::Wav,
-                        _ => Format::Mp3,
-                    }
-                }
-                // "replace" isn't kept: a tick from last month mustn't turn
-                // Select all + Record into re-recording everything.
-                "parallel" => s.parallel = v.parse().ok().filter(|&n| n >= 1),
-                "fade_in" => s.fade_in = v.parse().unwrap_or(s.fade_in),
-                "fade_out" => s.fade_out = v.parse().unwrap_or(s.fade_out),
-                "level" => s.level = v != "0",
-                "lufs" => s.lufs = v.parse().unwrap_or(s.lufs),
-                _ => {}
-            }
-        }
-        s
-    }
-
-    fn save(&self, cache: &Path) {
-        let p = |o: &Option<PathBuf>| {
-            o.as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        };
-        let text = format!(
-            "popper={}\ndll={}\nseconds={}\nformat={}\nparallel={}\nfade_in={}\nfade_out={}\nlevel={}\nlufs={}\n",
-            p(&self.popper),
-            p(&self.dll),
-            self.seconds,
-            self.format.ext(),
-            self.parallel.map(|n| n.to_string()).unwrap_or_default(),
-            self.fade_in,
-            self.fade_out,
-            self.level as u8,
-            self.lufs
-        );
-        let _ = std::fs::write(cache.join("gui.txt"), text);
-    }
-
-    fn finish(&self) -> capture::Finish {
-        capture::Finish {
-            fade_in: self.fade_in,
-            fade_out: self.fade_out,
-            lufs: self.level.then_some(self.lufs),
-        }
-        .clamped()
-    }
-}
-
-/// A path shown short (its last two parts), in full on hover.
-fn path_label(ui: &mut egui::Ui, path: Option<&Path>, none: &str) {
-    match path {
-        Some(p) => {
-            let parts: Vec<_> = p.components().rev().take(2).collect();
-            let short: PathBuf = parts.into_iter().rev().collect();
-            let text = if short.as_os_str().len() < p.as_os_str().len() {
-                format!("…{}{}", std::path::MAIN_SEPARATOR, short.display())
-            } else {
-                p.display().to_string()
-            };
-            ui.monospace(text).on_hover_text(p.display().to_string());
-        }
-        None => {
-            ui.monospace(none);
-        }
-    }
-}
-
-/// "just now", "5 min ago", "3 h ago", "2 days ago".
-fn ago(now: u64, then: u64) -> String {
-    let s = now.saturating_sub(then);
-    match s {
-        0..60 => "just now".into(),
-        60..3600 => format!("{} min ago", s / 60),
-        3600..86400 => format!("{} h ago", s / 3600),
-        _ => format!("{} days ago", s / 86400),
-    }
-}
+use vp_audio_extract::{backup, capture, encode, popper, state};
 
 // ---- the app ------------------------------------------------------------------
-
-/// A table is known by its emulator and Popper GameName (display names can repeat).
-type Key = (i64, String);
-
-fn key(e: &Entry) -> Key {
-    (e.emu.id, e.game.name.clone())
-}
-
-/// The "Choose music" window for one table: its sources are listed, and
-/// previews made, in the background.
-struct Picker {
-    entry: Entry,
-    opts: record::Options,
-    ffmpeg: Option<PathBuf>,
-    state: Arc<Mutex<PickState>>,
-    /// This window's previews (its own folder: a closed window's preview
-    /// still being made can't overwrite them).
-    preview_dir: PathBuf,
-    /// Set when the window closes: previews being made stop.
-    closed: Arc<AtomicBool>,
-    /// Audio replaced from this window goes into one Restore batch.
-    batch: Arc<Mutex<Option<PathBuf>>>,
-}
-
-#[derive(Default)]
-struct PickState {
-    choices: Option<Vec<sources::Choice>>,
-    /// What's being done in the background ("Preparing a preview…").
-    working: Option<String>,
-    /// Finished previews (WAV), by choice id.
-    previews: HashMap<String, PathBuf>,
-    /// A preview to play once it's ready.
-    autoplay: Option<String>,
-    /// What happened, and whether it went wrong.
-    message: Option<(bool, String)>,
-    /// The choice in use.
-    pin: Option<String>,
-}
 
 struct Row {
     entry: Entry,
     selected: bool,
     /// It has a table file to choose music from (found once per scan).
     can_pick: bool,
+    /// What this tool installed for it, while that's still its audio.
+    installed: Option<state::Installed>,
+}
+
+/// What a recording run reports, for the rows and the progress bar.
+enum RunEvent {
+    /// Recordings, and how many of them are of ROMs.
+    Planned(usize),
+    Started(String, Vec<Key>, bool),
+    /// ROM, tables, outcome, seconds it took, whether it was a ROM recording.
+    Finished(String, Vec<Key>, record::Outcome, f64, bool),
+    Installed(Key, String, bool),
+    Skipped(Key, bool),
+}
+
+impl RunEvent {
+    fn from(ev: record::Event) -> RunEvent {
+        let keys = |g: Vec<(i64, &str)>| g.into_iter().map(|(e, n)| (e, n.to_string())).collect();
+        match ev {
+            record::Event::Planned { roms, .. } => RunEvent::Planned(roms),
+            record::Event::Started {
+                rom,
+                games,
+                rom_recording,
+            } => RunEvent::Started(rom.into(), keys(games), rom_recording),
+            record::Event::Finished {
+                rom,
+                games,
+                outcome,
+                secs,
+                rom_recording,
+                ..
+            } => RunEvent::Finished(rom.into(), keys(games), outcome, secs, rom_recording),
+            record::Event::Installed { game, what, chosen } => {
+                RunEvent::Installed((game.0, game.1.to_string()), what.into(), chosen)
+            }
+            record::Event::Skipped { game, failed } => {
+                RunEvent::Skipped((game.0, game.1.to_string()), failed)
+            }
+        }
+    }
 }
 
 /// Work running in the background.
@@ -321,12 +89,20 @@ struct Job {
     total: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
     result: Arc<Mutex<Option<JobResult>>>,
+    events: Arc<Mutex<Vec<RunEvent>>>,
 }
 
 enum JobResult {
-    Scanned(anyhow::Result<(PathBuf, Vec<Entry>)>),
+    Scanned(anyhow::Result<Scan>),
     /// How it went, and whether it failed.
     Recorded(bool, String),
+}
+
+struct Scan {
+    dir: PathBuf,
+    entries: Vec<Entry>,
+    emus: Vec<popper::Emulator>,
+    installed: HashMap<Key, state::Installed>,
 }
 
 #[derive(PartialEq)]
@@ -356,28 +132,34 @@ struct App {
     /// Something changed a table's audio in the background: list the
     /// tables again as soon as nothing else is running.
     pending_rescan: Arc<AtomicBool>,
-}
-
-fn has_audio(e: &Entry) -> bool {
-    matches!(e.status, Status::HasAudio(_)) || e.existing.is_some()
-}
-
-/// Whether recording it replaces audio it has (always after asking).
-fn replaces(e: &Entry, replace_ticked: bool) -> bool {
-    recordable(e) && has_audio(e) && (replace_ticked || e.replace)
-}
-
-/// Whether Record records it.
-fn to_record(e: &Entry, replace_ticked: bool) -> bool {
-    recordable(e) && (!has_audio(e) || replaces(e, replace_ticked))
-}
-
-/// Tables that could get audio recorded (or copied from a cached clip).
-fn recordable(e: &Entry) -> bool {
-    matches!(
-        e.status,
-        Status::Todo | Status::Cached(_) | Status::Verdict(_) | Status::HasAudio(_)
-    )
+    settings_open: bool,
+    /// Popper's emulators, from the last scan (to find libpinmame).
+    emus: Vec<popper::Emulator>,
+    /// The libpinmame recordings would use, found again when it changes.
+    dll_found: Option<PathBuf>,
+    chip: Chip,
+    sort: (SortBy, bool),
+    /// The row last clicked: the end of a Shift-click range, and what
+    /// Space plays.
+    last_clicked: Option<Key>,
+    focus_filter: bool,
+    /// The tables of the run going on (or just done), until the list is
+    /// read again.
+    live: HashMap<Key, Live>,
+    /// Recordings running, by ROM, and how long finished ROM recordings
+    /// took (looks through table files take seconds: left out of the ETA).
+    running: HashMap<String, (Instant, bool)>,
+    took: Vec<f64>,
+    /// ROM recordings in the run, and finished.
+    roms: (usize, usize),
+    /// A look through tables' files failed this run (no ffmpeg?).
+    table_failed: bool,
+    /// Tables in the run going on.
+    run_tables: usize,
+    /// Closing was asked for while recording: asking whether to stop.
+    ask_close: bool,
+    /// Close once the run has stopped.
+    close_when_done: bool,
 }
 
 impl App {
@@ -403,6 +185,21 @@ impl App {
             picker: None,
             notice: None,
             pending_rescan: Arc::new(AtomicBool::new(false)),
+            settings_open: false,
+            emus: Vec::new(),
+            dll_found: None,
+            chip: Chip::All,
+            sort: (SortBy::Title, true),
+            last_clicked: None,
+            focus_filter: false,
+            live: HashMap::new(),
+            running: HashMap::new(),
+            took: Vec::new(),
+            roms: (0, 0),
+            table_failed: false,
+            run_tables: 0,
+            ask_close: false,
+            close_when_done: false,
         };
         app.parallel = app
             .settings
@@ -424,6 +221,7 @@ impl App {
             format: self.settings.format,
             force,
             retry,
+            reclip: false,
             include_hidden: true,
             games: Vec::new(),
             extra_rom_dirs: Vec::new(),
@@ -450,7 +248,18 @@ impl App {
                 let dir = popper::find(popper.as_deref())?;
                 let db = popper::Db::open(&dir)?;
                 let cache = state::Cache::open(Some(&cache))?;
-                Ok((dir, record::plan(&db, &cache, &opts)?))
+                let emus = db.emulators()?;
+                let entries = record::plan(&db, &cache, &opts)?;
+                let installed = entries
+                    .iter()
+                    .filter_map(|e| Some((key(e), record::installed_info(&cache, e)?)))
+                    .collect();
+                Ok(Scan {
+                    dir,
+                    entries,
+                    emus,
+                    installed,
+                })
             })();
             *r.lock().unwrap_or_else(|e| e.into_inner()) = Some(JobResult::Scanned(scanned));
             ctx.request_repaint();
@@ -461,6 +270,7 @@ impl App {
             total: Arc::new(AtomicUsize::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             result,
+            events: Default::default(),
         });
     }
 
@@ -497,10 +307,24 @@ impl App {
         let total = Arc::new(AtomicUsize::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
-        let (d, t, c, r) = (done.clone(), total.clone(), cancel.clone(), result.clone());
+        let events: Arc<Mutex<Vec<RunEvent>>> = Default::default();
+        let (d, t, c, r, ev) = (
+            done.clone(),
+            total.clone(),
+            cancel.clone(),
+            result.clone(),
+            events.clone(),
+        );
+        self.live = keys.iter().map(|k| (k.clone(), Live::Queued)).collect();
+        self.running.clear();
+        self.took.clear();
+        self.roms = (0, 0);
+        self.table_failed = false;
+        self.run_tables = keys.len();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let summary = (|| -> anyhow::Result<String> {
+            // A panic still ends the run (or the window could never close).
+            let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<String> {
                 let db = popper::Db::open(&popper_dir)?;
                 let cache = state::Cache::open(Some(&cache_dir))?;
                 let entries: Vec<Entry> = record::plan(&db, &cache, &opts)?
@@ -518,21 +342,19 @@ impl App {
                     None if roms_to_record => anyhow::bail!("libpinmame not found: choose it with \"libpinmame…\" (VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll)"),
                     None => {}
                 }
-                let ffmpeg = encode::find_ffmpeg(None, Some(&popper_dir));
-                let roms: HashSet<&str> = entries
-                    .iter()
-                    .filter(|e| matches!(e.status, Status::Todo) && e.pin.is_none())
-                    .filter_map(|e| {
-                        if e.from_table() {
-                            e.source_key.as_deref()
-                        } else {
-                            e.rom.as_deref()
-                        }
-                    })
-                    .collect();
-                t.store(roms.len(), Ordering::SeqCst);
-                let progress = |p: record::Progress| {
-                    d.store(p.done, Ordering::SeqCst);
+                let ffmpeg = find_ffmpeg(settings.ffmpeg.as_deref(), Some(&popper_dir));
+                if ffmpeg.is_none() {
+                    log::warn!("ffmpeg not found: PuP, altsound and table music can't be read (set it in Settings…)");
+                }
+                let progress = |p: record::Event| {
+                    match &p {
+                        record::Event::Planned { total, .. } => t.store(*total, Ordering::SeqCst),
+                        record::Event::Finished { done, .. } => d.store(*done, Ordering::SeqCst),
+                        _ => {}
+                    }
+                    ev.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(RunEvent::from(p));
                     ctx.request_repaint();
                 };
                 let runner = record::Runner {
@@ -550,7 +372,8 @@ impl App {
                     "Done: {} table(s) got audio, {} ROM(s) recorded, {} gave no music or would not start, {} failed",
                     s.installed, s.recorded, s.nothing, s.failed
                 ))
-            })();
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("it stopped unexpectedly (see the log)")));
             let (failed, msg) = match summary {
                 Ok(m) => (false, m),
                 Err(e) => (true, format!("Recording failed: {e:#}")),
@@ -569,6 +392,7 @@ impl App {
             total,
             cancel,
             result,
+            events,
         });
     }
 
@@ -668,14 +492,109 @@ impl App {
         }
     }
 
+    fn recording(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.what == "Recording")
+    }
+
+    /// Whether a row's clip can be played now: not while the run may be
+    /// replacing it (its row is in the run, or it's a cached clip).
+    fn can_play(live: &HashMap<Key, Live>, recording: bool, e: &Entry) -> bool {
+        !recording || !(live.contains_key(&key(e)) || matches!(e.status, Status::Cached(_)))
+    }
+
+    /// Takes in what the run reported since the last frame.
+    fn poll_events(&mut self) {
+        let Some(job) = &self.job else { return };
+        let events = std::mem::take(&mut *job.events.lock().unwrap_or_else(|e| e.into_inner()));
+        for ev in events {
+            match ev {
+                RunEvent::Planned(roms) => self.roms = (roms, 0),
+                RunEvent::Started(rom, games, rom_recording) => {
+                    let now = Instant::now();
+                    self.running.insert(rom, (now, rom_recording));
+                    for g in games {
+                        self.live.insert(g, Live::Recording(now));
+                    }
+                }
+                RunEvent::Finished(rom, games, outcome, secs, rom_recording) => {
+                    self.running.remove(&rom);
+                    self.table_failed |= !rom_recording && outcome == record::Outcome::Failed;
+                    if rom_recording {
+                        self.roms.1 += 1;
+                        // Cut short or broken: says nothing of how long one takes.
+                        if outcome != record::Outcome::Failed {
+                            self.took.push(secs);
+                        }
+                    }
+                    for g in games {
+                        if let Some(l) = after(self.live.get(&g), outcome) {
+                            self.live.insert(g, l);
+                        }
+                    }
+                }
+                RunEvent::Installed(g, what, chosen) => {
+                    self.live.insert(g, Live::Got(what, chosen));
+                }
+                RunEvent::Skipped(g, false) => {
+                    self.live.remove(&g);
+                }
+                RunEvent::Skipped(g, true) => {
+                    self.live.insert(g, Live::Finished(record::Outcome::Failed));
+                }
+            }
+        }
+    }
+
+    /// The banner after a run, from what each table came to.
+    fn run_banner(&self, cancelled: bool) -> String {
+        fn title<'a>(rows: &'a [Row], k: &'a Key) -> &'a str {
+            rows.iter()
+                .find(|r| &key(&r.entry) == k)
+                .map_or(k.1.as_str(), |r| r.entry.game.display.as_str())
+        }
+        let title = |k: &'_ Key| -> String { title(&self.rows, k).to_string() };
+        let mut got = Vec::new();
+        let mut none: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        let mut keys: Vec<&Key> = self.live.keys().collect();
+        keys.sort_by_key(|k| title(k).to_lowercase());
+        for k in keys {
+            match &self.live[k] {
+                Live::Got(what, chosen) => got.push(source_kind("", what, *chosen)),
+                Live::Finished(record::Outcome::Nothing | record::Outcome::NotStarted) => {
+                    none.push(title(k))
+                }
+                Live::Finished(_) => failed.push(title(k)),
+                // Not reached: cancelled before it started.
+                Live::Queued | Live::Recording(_) => {}
+            }
+        }
+        let none: Vec<&str> = none.iter().map(String::as_str).collect();
+        let failed: Vec<&str> = failed.iter().map(String::as_str).collect();
+        run_summary(&got, &none, &failed, cancelled)
+    }
+
     fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
-        let Some(result) = job.result.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        // The result first: every event is pushed before it.
+        let result = job.result.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.poll_events();
+        let Some(job) = &self.job else { return };
+        let Some(result) = result else {
             return;
         };
+        let cancelled = job.cancel.load(Ordering::SeqCst);
         self.job = None;
         match result {
-            JobResult::Scanned(Ok((dir, entries))) => {
+            JobResult::Scanned(Ok(Scan {
+                dir,
+                entries,
+                emus,
+                mut installed,
+            })) => {
+                self.live.clear();
+                self.emus = emus;
+                self.find_dll();
                 let was: HashSet<Key> = self
                     .rows
                     .iter()
@@ -688,6 +607,7 @@ impl App {
                         selected: was.contains(&key(&entry)),
                         can_pick: entry.table.as_deref().is_some_and(Path::is_file)
                             && entry.emu.media_dir.is_some(),
+                        installed: installed.remove(&key(&entry)),
                         entry,
                     })
                     .collect();
@@ -707,16 +627,75 @@ impl App {
                 self.settings.popper = Settings::load(&self.cache).popper;
             }
             JobResult::Recorded(failed, msg) => {
+                let mut msg = if failed {
+                    msg
+                } else {
+                    self.run_banner(cancelled)
+                };
+                if self.table_failed && !cancelled && self.ffmpeg().is_none() {
+                    msg.push_str(" ffmpeg wasn't found, so music from PuP packs, altsound and table files couldn't be read: set it in Settings….");
+                }
+                let failed = failed
+                    || self.live.values().any(|l| {
+                        matches!(l, Live::Finished(record::Outcome::Failed)) && !cancelled
+                    });
                 self.notice = Some((failed, msg));
                 if failed {
                     self.show_log = true;
+                }
+                if self.close_when_done {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
                 }
                 self.rescan(ctx);
             }
         }
     }
 
+    /// The ffmpeg runs use: the one chosen, else Popper's or one on PATH.
+    fn ffmpeg(&self) -> Option<PathBuf> {
+        find_ffmpeg(self.settings.ffmpeg.as_deref(), self.popper_dir.as_deref())
+    }
+
+    /// Finds libpinmame again (after a scan, or when it's chosen).
+    fn find_dll(&mut self) {
+        self.dll_found = record::find_pinmame(self.settings.dll.as_deref(), &self.emus, None);
+    }
+
+    /// Whether any table would be recorded from its ROM (libpinmame is
+    /// needed only then).
+    fn needs_dll(&self) -> bool {
+        self.rows.iter().any(|r| r.entry.rom_zip.is_some())
+    }
+
+    /// What's wrong with libpinmame, if anything.
+    fn dll_problem(&self) -> Option<String> {
+        if let Some(p) = &self.settings.dll {
+            if !p.is_file() {
+                return Some(format!(
+                    "The chosen libpinmame isn't there: {}",
+                    p.display()
+                ));
+            }
+            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            if name.is_some_and(|n| n.starts_with("vpinmame")) {
+                return Some(
+                    "That's VPinMAME, the COM server VPX tables use, not libpinmame. VPX 10.8.1+ ships libpinmame as plugins\\pinmame\\pinmame64.dll.".into(),
+                );
+            }
+        }
+        if self.dll_found.is_none() {
+            return Some(
+                "libpinmame not found. VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll; otherwise choose a libpinmame build in Settings….".into(),
+            );
+        }
+        None
+    }
+
     fn visible(&self, e: &Entry) -> bool {
+        if !self.chip.matches(e) {
+            return false;
+        }
         let f = self.filter.trim().to_lowercase();
         f.is_empty()
             || e.game.display.to_lowercase().contains(&f)
@@ -735,37 +714,7 @@ impl App {
                 .add_enabled(!busy, egui::Button::new("Choose…"))
                 .clicked()
             {
-                if let Some(d) = rfd::FileDialog::new()
-                    .set_title("Popper's PinUPSystem folder")
-                    .pick_folder()
-                {
-                    // Saved once it reads (see poll_job).
-                    self.settings.popper = Some(d);
-                    self.rescan(ui.ctx());
-                }
-            }
-            ui.separator();
-            ui.label("libpinmame:");
-            path_label(ui, self.settings.dll.as_deref(), "automatic");
-            if ui
-                .add_enabled(!busy, egui::Button::new("libpinmame…"))
-                .clicked()
-            {
-                if let Some(f) = rfd::FileDialog::new()
-                    .add_filter("libpinmame", &["dll", "so", "dylib"])
-                    .pick_file()
-                {
-                    self.settings.dll = Some(f);
-                    self.settings.save(&self.cache);
-                }
-            }
-            if self.settings.dll.is_some()
-                && ui
-                    .add_enabled(!busy, egui::Button::new("Automatic"))
-                    .clicked()
-            {
-                self.settings.dll = None;
-                self.settings.save(&self.cache);
+                self.choose_popper(ui.ctx());
             }
             ui.separator();
             if ui.add_enabled(!busy, egui::Button::new("Rescan")).clicked() {
@@ -778,122 +727,252 @@ impl App {
             {
                 self.open_restore();
             }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Clip length:");
-            let mut changed = ui
-                .add_enabled(
-                    !busy,
-                    egui::Slider::new(
-                        &mut self.settings.seconds,
-                        capture::MIN_SECONDS..=capture::MAX_SECONDS,
-                    )
-                    .suffix(" s"),
-                )
-                .changed();
-            ui.label("Format:");
-            ui.add_enabled_ui(!busy, |ui| {
-                egui::ComboBox::from_id_salt("format")
-                    .selected_text(self.settings.format.ext())
-                    .show_ui(ui, |ui| {
-                        for f in [Format::Mp3, Format::Ogg, Format::Wav] {
-                            changed |= ui
-                                .selectable_value(&mut self.settings.format, f, f.ext())
-                                .changed();
-                        }
-                    });
-            });
-            ui.add_enabled(
-                !busy,
-                egui::Checkbox::new(&mut self.settings.replace, "Replace existing audio"),
-            )
-            .on_hover_text(
-                "Re-record selected tables that already have Audio media (asks first; \
-                     not remembered next time)",
-            );
-            ui.label("At once:");
             if ui
-                .add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.parallel).range(1..=record::max_parallel()),
-                )
-                .on_hover_text(
-                    "Recordings run in real time, about one CPU core each. Going past your \
-                     core count makes them fall behind and the music comes out wrong.",
-                )
-                .changed()
+                .add_enabled(!busy, egui::Button::new("Settings…"))
+                .on_hover_text("libpinmame, clip length, format, loudness and fades")
+                .clicked()
             {
-                self.settings.parallel = Some(self.parallel);
-                changed = true;
+                self.settings_open = true;
             }
-            if changed {
-                self.settings.save(&self.cache);
+            ui.separator();
+            let s = &self.settings;
+            ui.weak(format!(
+                "{} s {} · {}",
+                s.seconds,
+                s.format.ext(),
+                if s.level {
+                    format!("{} LUFS", s.lufs)
+                } else {
+                    "peak".into()
+                }
+            ));
+            if self.needs_dll() {
+                if let Some(p) = self.dll_problem() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 70), "libpinmame not found")
+                        .on_hover_text(p);
+                }
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            let mut changed = false;
-            ui.label("Fade in:");
-            changed |= ui
-                .add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.settings.fade_in)
-                        .range(0.0..=capture::MAX_FADE)
-                        .speed(0.1)
+    }
+
+    fn choose_popper(&mut self, ctx: &egui::Context) {
+        if let Some(d) = rfd::FileDialog::new()
+            .set_title("Popper's PinUPSystem folder")
+            .pick_folder()
+        {
+            // Saved once it reads (see poll_job).
+            self.settings.popper = Some(d);
+            self.rescan(ctx);
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let busy = self.busy();
+        let mut changed = false;
+        let mut dll_changed = false;
+        let width = (ctx.content_rect().width() - 48.0).clamp(280.0, 560.0);
+        let modal = egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
+            ui.set_width(width);
+            ui.heading("Settings");
+            ui.add_space(4.0);
+            ui.strong("libpinmame");
+            ui.horizontal_wrapped(|ui| {
+                path_label(
+                    ui,
+                    self.dll_found.as_deref().or(self.settings.dll.as_deref()),
+                    "not found",
+                );
+                if self.settings.dll.is_none() {
+                    ui.weak("(found by itself)");
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Choose…"))
+                    .clicked()
+                {
+                    if let Some(f) = rfd::FileDialog::new()
+                        .set_title("libpinmame (e.g. VPX's plugins\\pinmame\\pinmame64.dll)")
+                        .add_filter("libpinmame", &["dll", "so", "dylib"])
+                        .pick_file()
+                    {
+                        self.settings.dll = Some(f);
+                        dll_changed = true;
+                    }
+                }
+                if self.settings.dll.is_some()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Automatic"))
+                        .clicked()
+                {
+                    self.settings.dll = None;
+                    dll_changed = true;
+                }
+            });
+            if let Some(p) = self.dll_problem() {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 70), p);
+            }
+            ui.add_space(4.0);
+            ui.strong("ffmpeg");
+            let ffmpeg = self.ffmpeg();
+            ui.horizontal_wrapped(|ui| {
+                path_label(ui, ffmpeg.as_deref(), "not found");
+                if ffmpeg.is_some() && ffmpeg != self.settings.ffmpeg {
+                    ui.weak("(found by itself)");
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Choose…"))
+                    .clicked()
+                {
+                    if let Some(f) = rfd::FileDialog::new()
+                        .set_title("ffmpeg (Popper ships one in its Recordings folder)")
+                        .add_filter("ffmpeg", &["exe"])
+                        .pick_file()
+                    {
+                        self.settings.ffmpeg = Some(f);
+                        changed = true;
+                    }
+                }
+                if self.settings.ffmpeg.is_some()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Automatic"))
+                        .clicked()
+                {
+                    self.settings.ffmpeg = None;
+                    changed = true;
+                }
+            });
+            if ffmpeg.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 70),
+                    "ffmpeg not found: music from PuP packs, altsound and table files can't be read, and clips are encoded without it. Popper ships one in its Recordings folder; or choose an ffmpeg.exe.",
+                );
+            }
+            ui.separator();
+            ui.strong("Clips");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Clip length:");
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::Slider::new(
+                            &mut self.settings.seconds,
+                            capture::MIN_SECONDS..=capture::MAX_SECONDS,
+                        )
                         .suffix(" s"),
-                )
-                .on_hover_text(
-                    "Seconds the music takes to rise at the start of each clip (0: none)",
-                )
-                .changed();
-            ui.label("Fade out:");
-            changed |= ui
-                .add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.settings.fade_out)
-                        .range(0.0..=capture::MAX_FADE)
-                        .speed(0.1)
-                        .suffix(" s"),
-                )
-                .on_hover_text("Seconds the music takes to fade away at the end of each clip")
-                .changed();
-            changed |= ui
-                .add_enabled(
-                    !busy,
-                    egui::Checkbox::new(&mut self.settings.level, "Even loudness"),
-                )
-                .on_hover_text(
-                    "Level every clip to the same loudness (EBU R128) with a limiter, \
+                    )
+                    .changed();
+                ui.label("Format:");
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("format")
+                        .selected_text(self.settings.format.ext())
+                        .show_ui(ui, |ui| {
+                            for f in [Format::Mp3, Format::Ogg, Format::Wav] {
+                                changed |= ui
+                                    .selectable_value(&mut self.settings.format, f, f.ext())
+                                    .changed();
+                            }
+                        });
+                });
+                ui.label("At once:");
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut self.parallel).range(1..=record::max_parallel()),
+                    )
+                    .on_hover_text(
+                        "Recordings run in real time, about one CPU core each. Going past your \
+                     core count makes them fall behind and the music comes out wrong.",
+                    )
+                    .changed()
+                {
+                    self.settings.parallel = Some(self.parallel);
+                    changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Fade in:");
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut self.settings.fade_in)
+                            .range(0.0..=capture::MAX_FADE)
+                            .speed(0.1)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text(
+                        "Seconds the music takes to rise at the start of each clip (0: none)",
+                    )
+                    .changed();
+                ui.label("Fade out:");
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut self.settings.fade_out)
+                            .range(0.0..=capture::MAX_FADE)
+                            .speed(0.1)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text("Seconds the music takes to fade away at the end of each clip")
+                    .changed();
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::Checkbox::new(&mut self.settings.level, "Even loudness"),
+                    )
+                    .on_hover_text(
+                        "Level every clip to the same loudness (EBU R128) with a limiter, \
                      instead of only by its loudest peak",
-                )
-                .changed();
-            changed |= ui
-                .add_enabled(
-                    !busy && self.settings.level,
-                    egui::DragValue::new(&mut self.settings.lufs)
-                        .range(-40.0..=-6.0)
-                        .speed(0.5)
-                        .suffix(" LUFS"),
-                )
-                .on_hover_text(
-                    "How loud every clip is made. -16 is typical for music players; \
+                    )
+                    .changed();
+                changed |= ui
+                    .add_enabled(
+                        !busy && self.settings.level,
+                        egui::DragValue::new(&mut self.settings.lufs)
+                            .range(-40.0..=-6.0)
+                            .speed(0.5)
+                            .suffix(" LUFS"),
+                    )
+                    .on_hover_text(
+                        "How loud every clip is made. -16 is typical for music players; \
                      closer to 0 is louder, -23 is broadcast level.",
-                )
-                .changed();
-            if changed {
-                self.settings.save(&self.cache);
+                    )
+                    .changed();
+            });
+            ui.add_space(6.0);
+            if ui.button("Close").clicked() {
+                self.settings_open = false;
             }
         });
+        if modal.should_close() {
+            self.settings_open = false;
+        }
+        if dll_changed {
+            self.find_dll();
+            changed = true;
+        }
+        if changed {
+            self.settings.save(&self.cache);
+        }
     }
 
     fn selection_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("table or ROM")
-                    .desired_width(180.0),
-            );
+            let f = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("table or ROM (Ctrl+F)")
+                        .desired_width(180.0),
+                );
+            if std::mem::take(&mut self.focus_filter) {
+                f.request_focus();
+            }
+            if !self.filter.is_empty() && ui.small_button("✕").on_hover_text("Clear the filter").clicked() {
+                self.filter.clear();
+            }
             ui.separator();
             if ui
                 .add_enabled(!busy, egui::Button::new("Select all"))
@@ -942,6 +1021,14 @@ impl App {
                 ui.label(format!("{n} selected"));
             }
             ui.separator();
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut self.settings.replace, "Replace existing audio"),
+            )
+            .on_hover_text(
+                "Re-record selected tables that already have Audio media (asks first; \
+                 not remembered next time)",
+            );
             if ui
                 .add_enabled(
                     !busy && to_record > 0,
@@ -976,10 +1063,40 @@ impl App {
                 job.total.load(Ordering::SeqCst),
             );
             if t > 0 {
+                let now = Instant::now();
+                let running: Vec<f64> = self
+                    .running
+                    .values()
+                    .filter(|(_, rom_recording)| *rom_recording)
+                    .map(|(s, _)| now.duration_since(*s).as_secs_f64())
+                    .collect();
+                let running = if running.is_empty() {
+                    0.0
+                } else {
+                    running.iter().sum::<f64>() / running.len() as f64
+                };
+                let mut text = format!(
+                    "{} {} of {t} (for {} table{})",
+                    job.what,
+                    (d + 1).min(t),
+                    self.run_tables,
+                    if self.run_tables == 1 { "" } else { "s" }
+                );
+                // Until one has finished: about the length of a recording.
+                let guess = [capture::run_seconds(self.settings.seconds) + 5.0];
+                let took = if self.took.is_empty() {
+                    &guess[..]
+                } else {
+                    &self.took[..]
+                };
+                let left = self.roms.0.saturating_sub(self.roms.1);
+                if let Some(eta) = eta_secs(took, left, running, self.parallel) {
+                    text = format!("{text} · {}", eta_text(eta));
+                }
                 ui.add(
                     egui::ProgressBar::new(d as f32 / t as f32)
-                        .text(format!("{}: {d} of {t} ROM(s)", job.what))
-                        .desired_width(360.0),
+                        .text(text)
+                        .desired_width(460.0),
                 );
             } else {
                 ui.spinner();
@@ -998,15 +1115,38 @@ impl App {
         });
     }
 
-    fn table(&mut self, ui: &mut egui::Ui) {
-        if let Some(e) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 70), e);
-            return;
-        }
-        let shown: Vec<usize> = (0..self.rows.len())
+    /// The rows shown, in order (filter, chip and sort applied).
+    fn shown(&self) -> Vec<usize> {
+        let mut shown: Vec<usize> = (0..self.rows.len())
             .filter(|&i| self.visible(&self.rows[i].entry))
             .collect();
+        let entries: Vec<&Entry> = self.rows.iter().map(|r| &r.entry).collect();
+        sort_rows(&entries, &mut shown, self.sort.0, self.sort.1);
+        shown
+    }
+
+    fn table(&mut self, ui: &mut egui::Ui) {
+        if let Some(e) = self.error.clone() {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 70), e);
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Choose Popper folder…"))
+                .on_hover_text("Popper's PinUPSystem folder, the one with PUPDatabase.db")
+                .clicked()
+            {
+                self.choose_popper(ui.ctx());
+            }
+            return;
+        }
+        let shown = self.shown();
+        let shown_keys: Vec<Key> = shown.iter().map(|&i| key(&self.rows[i].entry)).collect();
+        let mut sort = self.sort;
+        let last = self.last_clicked.clone();
+        let mut clicked: Option<(Key, bool)> = None;
+        let shift = ui.input(|i| i.modifiers.shift);
         let busy = self.busy();
+        let recording = self.recording();
+        let live = &self.live;
         let height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let mut pick: Option<Entry> = None;
         let player = &mut self.player;
@@ -1024,24 +1164,49 @@ impl App {
             .column(Column::exact(24.0))
             .column(Column::initial(320.0).at_least(120.0).clip(true))
             .column(Column::initial(100.0).at_least(60.0))
+            .column(Column::initial(70.0).at_least(50.0))
             .column(Column::remainder().clip(true))
             .header(height, |mut h| {
                 h.col(|_| {});
+                let mut head = |h: &mut egui_extras::TableRow, label: &str, by: SortBy| {
+                    h.col(|ui| {
+                        let arrow = match sort {
+                            (b, true) if b == by => " ↑",
+                            (b, false) if b == by => " ↓",
+                            _ => "",
+                        };
+                        if ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(format!("{label}{arrow}")).strong())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Sort by this column (click again to reverse)")
+                            .clicked()
+                        {
+                            sort = if sort.0 == by { (by, !sort.1) } else { (by, true) };
+                        }
+                    });
+                };
+                head(&mut h, "Table", SortBy::Title);
+                head(&mut h, "ROM", SortBy::Rom);
                 h.col(|ui| {
-                    ui.strong("Table");
+                    ui.strong("Source")
+                        .on_hover_text("Where the audio this tool made came from");
                 });
-                h.col(|ui| {
-                    ui.strong("ROM");
-                });
-                h.col(|ui| {
-                    ui.strong("Audio");
-                });
+                head(&mut h, "Audio", SortBy::Status);
             })
             .body(|body| {
                 body.rows(height, shown.len(), |mut row| {
                     let r = &mut rows[shown[row.index()]];
+                    let k = key(&r.entry);
+                    row.set_selected(last.as_ref() == Some(&k));
                     row.col(|ui| {
-                        ui.add_enabled(!busy, egui::Checkbox::without_text(&mut r.selected));
+                        if ui
+                            .add_enabled(!busy, egui::Checkbox::without_text(&mut r.selected))
+                            .clicked()
+                        {
+                            clicked = Some((k.clone(), shift));
+                        }
                     });
                     row.col(|ui| {
                         let l = ui.add(
@@ -1051,11 +1216,41 @@ impl App {
                         );
                         if l.clicked() && !busy {
                             r.selected = !r.selected;
+                            clicked = Some((k.clone(), shift));
                         }
-                        l.on_hover_text(&r.entry.game.name);
+                        l.on_hover_text(format!(
+                            "{}\nGameName: {}\nShift-click selects a range; Space plays the highlighted row",
+                            r.entry.game.display, r.entry.game.name
+                        ));
                     });
                     row.col(|ui| {
                         ui.monospace(r.entry.rom.as_deref().unwrap_or("–"));
+                    });
+                    let state = live.get(&k);
+                    row.col(|ui| {
+                        let got = match state {
+                            Some(Live::Got(what, chosen)) => {
+                                Some((source_kind("", what, *chosen), what.clone()))
+                            }
+                            _ => None,
+                        };
+                        match got.or_else(|| {
+                            r.installed.as_ref().map(|i| {
+                                let what = if i.what.is_empty() {
+                                    "made by this tool before it noted where from".to_string()
+                                } else {
+                                    i.what.clone()
+                                };
+                                (installed_kind(i), what)
+                            })
+                        }) {
+                            Some((kind, what)) => {
+                                ui.label(kind).on_hover_text(what);
+                            }
+                            None => {
+                                ui.weak("–").on_hover_text("Not made by this tool, or no audio");
+                            }
+                        }
                     });
                     row.col(|ui| {
                         let (color, text) = match &r.entry.status {
@@ -1090,15 +1285,10 @@ impl App {
                             ),
                             s => (ui.visuals().weak_text_color(), record::describe(s)),
                         };
-                        let clip = match &r.entry.status {
-                            Status::HasAudio(p) => Some(p),
-                            _ if r.entry.existing.is_some() => r.entry.existing.as_ref(),
-                            Status::Cached(p) => Some(p),
-                            _ => None,
-                        };
-                        if let Some(p) = clip {
+                        if let Some(p) = row_clip(&r.entry) {
                             let on = playing.as_deref() == Some(p.as_path());
-                            let b = play_button(ui, on, !busy || on).on_hover_text(if on {
+                            let ok = App::can_play(live, recording, &r.entry);
+                            let b = play_button(ui, on, ok || on).on_hover_text(if on {
                                 "Stop"
                             } else if r.entry.existing.is_none()
                                 && matches!(r.entry.status, Status::Cached(_))
@@ -1126,12 +1316,103 @@ impl App {
                         if r.entry.pin.is_some() && !matches!(r.entry.status, Status::Todo) {
                             text.push_str(" · music chosen by hand");
                         }
+                        let green = egui::Color32::from_rgb(90, 180, 100);
+                        let (color, text) = match state {
+                            None => (color, text),
+                            Some(Live::Queued) => (color, "waiting to record…".to_string()),
+                            Some(Live::Recording(since)) => {
+                                ui.spinner();
+                                let t = since.elapsed().as_secs();
+                                (color, format!("recording… {}:{:02}", t / 60, t % 60))
+                            }
+                            Some(Live::Got(what, _)) => (green, format!("got audio: {what}")),
+                            Some(Live::Finished(o)) => (
+                                egui::Color32::from_rgb(220, 80, 70),
+                                match o {
+                                    record::Outcome::Nothing => "no music",
+                                    record::Outcome::NotStarted => "PinMAME couldn't start the ROM",
+                                    record::Outcome::Failed if recording => "stopped or failed",
+                                    _ => "failed (see the log)",
+                                }
+                                .to_string(),
+                            ),
+                        };
                         ui.add(egui::Label::new(egui::RichText::new(text).color(color)).truncate());
                     });
                 });
             });
+        self.sort = sort;
+        if let Some((k, shift)) = clicked {
+            // Shift: every row between the last one clicked and this one
+            // takes this one's tick.
+            if let (true, Some(from)) = (shift, self.last_clicked.clone()) {
+                let on = self
+                    .rows
+                    .iter()
+                    .find(|r| key(&r.entry) == k)
+                    .is_some_and(|r| r.selected);
+                let range: HashSet<Key> =
+                    range_between(&shown_keys, &from, &k).into_iter().collect();
+                for r in &mut self.rows {
+                    if range.contains(&key(&r.entry)) {
+                        r.selected = on;
+                    }
+                }
+            }
+            self.last_clicked = Some(k);
+        }
         if let Some(e) = pick {
             self.open_picker(e);
+        }
+    }
+
+    /// Keyboard shortcuts for the main window (not while a dialog is open
+    /// or a text box has the keyboard).
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let dialog = self.confirm != Confirm::None
+            || self.restore_open
+            || self.picker.is_some()
+            || self.settings_open
+            || self.ask_close;
+        if dialog {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.focus_filter = true;
+        }
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if !self.filter.is_empty() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.filter.clear();
+        }
+        if !self.busy() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+        {
+            let shown: HashSet<usize> = self.shown().into_iter().collect();
+            for (i, r) in self.rows.iter_mut().enumerate() {
+                if shown.contains(&i) {
+                    r.selected = true;
+                }
+            }
+        }
+        // Space presses a focused button or checkbox instead.
+        if ctx.memory(|m| m.focused().is_none())
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
+            let recording = self.recording();
+            let clip = self.last_clicked.as_ref().and_then(|k| {
+                self.rows
+                    .iter()
+                    .find(|r| &key(&r.entry) == k)
+                    .and_then(|r| {
+                        let ok = App::can_play(&self.live, recording, &r.entry);
+                        row_clip(&r.entry).map(|p| (p.clone(), ok))
+                    })
+            });
+            let playing = self.player.playing().map(Path::to_path_buf);
+            if let Some((p, _)) = clip.filter(|(p, ok)| *ok || playing.as_ref() == Some(p)) {
+                self.player.toggle(&p);
+            }
         }
     }
 
@@ -1156,322 +1437,47 @@ impl App {
         }
     }
 
-    fn open_picker(&mut self, entry: Entry) {
-        self.player.stop();
-        // Previews from earlier windows (the player has let go of them; one
-        // still being made fails harmlessly).
-        let root = self.cache.join("preview");
-        let _ = std::fs::remove_dir_all(&root);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let opts = self.options(false, false);
-        let ffmpeg = encode::find_ffmpeg(None, self.popper_dir.as_deref());
-        let state = Arc::new(Mutex::new(PickState {
-            pin: entry.pin.clone(),
-            ..PickState::default()
-        }));
-        let (st, e, o) = (state.clone(), entry.clone(), opts.clone());
-        std::thread::spawn(move || {
-            let list = record::choices(&e, &o);
-            st.lock().unwrap_or_else(|e| e.into_inner()).choices = Some(list);
-        });
-        self.picker = Some(Picker {
-            entry,
-            opts,
-            ffmpeg,
-            state,
-            preview_dir: root.join(nonce.to_string()),
-            closed: Arc::new(AtomicBool::new(false)),
-            batch: Arc::new(Mutex::new(None)),
-        });
-    }
-
-    fn picker_window(&mut self, ctx: &egui::Context) {
-        let Some(pk) = &self.picker else { return };
-        let mut close = false;
-        let mut preview: Option<String> = None;
-        let mut use_it: Option<String> = None;
-        let mut automatic = false;
-        let mut play: Option<PathBuf> = None;
-        let playing = self.player.playing().map(Path::to_path_buf);
-        {
-            let mut st = pk.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(id) = st.autoplay.clone() {
-                if let Some(p) = st.previews.get(&id) {
-                    play = Some(p.clone());
-                    st.autoplay = None;
-                }
-            }
-        }
-        let width = (ctx.content_rect().width() - 48.0).clamp(280.0, 640.0);
-        let modal = egui::Modal::new(egui::Id::unique("picker")).show(ctx, |ui| {
-            ui.set_width(width);
-            ui.heading(format!("Music for {}", pk.entry.game.display));
-            ui.label("Found in the table's files, its altsound and its PuP pack, best first. The play button plays it as it would be installed. Use installs it now and keeps it for this table from then on (the old audio is kept: Remove the new one, then Restore…, to go back).");
-            let st = pk.state.lock().unwrap_or_else(|e| e.into_inner());
-            let working = st.working.is_some();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let auto = st.pin.is_none();
-                if ui
-                    .add_enabled(
-                        !working && !auto,
-                        egui::Button::new(if auto { "In use" } else { "Use" }),
-                    )
-                    .on_hover_text(
-                        "Forget the choice: the next recording finds the music by itself \
-                         (the audio it has now stays)",
-                    )
-                    .clicked()
-                {
-                    automatic = true;
-                }
-                ui.label("Automatic: the ROM recording, or the best source below");
-            });
-            ui.separator();
-            match &st.choices {
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Looking through the table's files…");
-                    });
-                }
-                Some(list) if list.is_empty() => {
-                    ui.label("No music files were found with this table.");
-                }
-                Some(list) => {
-                    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                        for c in list {
-                            ui.horizontal(|ui| {
-                                let ready = st.previews.get(&c.id);
-                                let on = ready
-                                    .is_some_and(|p| playing.as_deref() == Some(p.as_path()));
-                                let making = working
-                                    && ready.is_none()
-                                    && st.autoplay.as_deref() == Some(c.id.as_str());
-                                if making {
-                                    ui.spinner();
-                                } else if play_button(ui, on, !working || on)
-                                    .on_hover_text(if on {
-                                        "Stop"
-                                    } else {
-                                        "Play it as it would be installed"
-                                    })
-                                    .clicked()
-                                {
-                                    preview = Some(c.id.clone());
-                                }
-                                let chosen = st.pin.as_deref() == Some(c.id.as_str());
-                                if ui
-                                    .add_enabled(
-                                        !working && !chosen,
-                                        egui::Button::new(if chosen { "In use" } else { "Use" }),
-                                    )
-                                    .clicked()
-                                {
-                                    use_it = Some(c.id.clone());
-                                }
-                                let mut text = format!(
-                                    "{} ({:.1} MB)",
-                                    c.what,
-                                    c.size as f64 / 1_048_576.0
-                                );
-                                if !c.usual {
-                                    text.push_str(
-                                        " · not used automatically (the ROM recording comes first)",
-                                    );
-                                }
-                                let rt = egui::RichText::new(text);
-                                ui.add(
-                                    egui::Label::new(if c.usual { rt } else { rt.weak() })
-                                        .truncate(),
-                                )
-                                .on_hover_text(&c.id);
-                            });
-                        }
-                    });
-                }
-            }
-            if let Some(w) = &st.working {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(w);
-                });
-            }
-            if let Some((failed, m)) = &st.message {
-                let color = if *failed {
-                    egui::Color32::from_rgb(220, 80, 70)
-                } else {
-                    egui::Color32::from_rgb(90, 180, 100)
-                };
-                ui.add(egui::Label::new(egui::RichText::new(m).color(color)).wrap());
-            }
-            ui.add_space(6.0);
-            if ui
-                .add_enabled(!working, egui::Button::new("Close"))
-                .clicked()
-            {
-                close = true;
-            }
-        });
-        // Not while it's installing: what it did must reach the list.
-        let working = pk
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .working
-            .is_some();
-        if modal.should_close() && !working {
-            close = true;
-        }
-        if let Some(p) = play {
-            self.player.toggle(&p);
-        }
-        if let Some(id) = preview {
-            self.picker_preview(&id);
-        }
-        if let Some(id) = use_it {
-            self.picker_use(&id);
-        }
-        if automatic {
-            self.picker_automatic();
-        }
-        if close {
-            self.player.stop();
-            if let Some(pk) = self.picker.take() {
-                pk.closed.store(true, Ordering::SeqCst);
-            }
-        }
-    }
-
-    fn picker_preview(&mut self, id: &str) {
-        let Some(pk) = &self.picker else { return };
-        let ready = pk
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .previews
-            .get(id)
-            .cloned();
-        if let Some(p) = ready {
-            self.player.toggle(&p);
+    /// Asked to close while recording.
+    fn close_window(&mut self, ctx: &egui::Context) {
+        if !self.ask_close {
             return;
         }
-        self.player.stop();
-        let n = pk
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .previews
-            .len();
-        let out = pk.preview_dir.join(format!("{n}.wav"));
-        let (st, e, o, f, id, closed) = (
-            pk.state.clone(),
-            pk.entry.clone(),
-            pk.opts.clone(),
-            pk.ffmpeg.clone(),
-            id.to_string(),
-            pk.closed.clone(),
-        );
-        {
-            let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
-            s.working = Some("Preparing a preview…".into());
-            s.autoplay = Some(id.clone());
+        if !self.recording() {
+            self.ask_close = false;
+            return;
         }
-        std::thread::spawn(move || {
-            let tmp = out.with_extension("work");
-            let _ = std::fs::remove_dir_all(&tmp);
-            let stop = || closed.load(Ordering::SeqCst);
-            let r = record::take_choice(&e, &o, f.as_deref(), &id, &tmp, &stop).and_then(|found| {
-                if stop() {
-                    anyhow::bail!("closed");
+        let mut stop = false;
+        let mut keep = false;
+        let modal = egui::Modal::new(egui::Id::unique("close")).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Stop recording and close?");
+            ui.label("The recordings running are stopped and nothing more starts. Tables that already got audio keep it. The window closes once they've stopped.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Stop and close").clicked() {
+                    stop = true;
                 }
-                wav::write(&out, &found.pcm).map(|()| found.what)
+                let k = ui.button("Keep recording");
+                if ui.memory(|m| m.focused().is_none()) {
+                    k.request_focus();
+                }
+                if k.clicked() {
+                    keep = true;
+                }
             });
-            let _ = std::fs::remove_dir_all(&tmp);
-            let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
-            s.working = None;
-            match r {
-                Ok(_) => {
-                    s.previews.insert(id, out);
-                    s.message = None;
-                }
-                Err(err) => {
-                    s.autoplay = None;
-                    s.message = Some((true, format!("Can't use that one: {err:#}")));
-                }
-            }
         });
-    }
-
-    fn picker_use(&mut self, id: &str) {
-        let Some(pk) = &self.picker else { return };
-        // A playing file is held open: it couldn't be replaced.
-        self.player.stop();
-        let (st, e, o, f, id, batch) = (
-            pk.state.clone(),
-            pk.entry.clone(),
-            pk.opts.clone(),
-            pk.ffmpeg.clone(),
-            id.to_string(),
-            pk.batch.clone(),
-        );
-        let cache_dir = self.cache.clone();
-        let rescan = self.pending_rescan.clone();
-        st.lock().unwrap_or_else(|e| e.into_inner()).working = Some("Installing it…".into());
-        std::thread::spawn(move || {
-            let r = state::Cache::open(Some(&cache_dir)).and_then(|cache| {
-                let runner = record::Runner {
-                    cache: &cache,
-                    opts: &o,
-                    dll: None,
-                    ffmpeg: f,
-                    parallel: 1,
-                    cancel: None,
-                    on_progress: None,
-                    batch: Mutex::new(batch.lock().unwrap_or_else(|e| e.into_inner()).clone()),
-                };
-                let r = runner.use_choice(&e, &id);
-                *batch.lock().unwrap_or_else(|e| e.into_inner()) =
-                    runner.batch.into_inner().unwrap_or_else(|e| e.into_inner());
-                r
-            });
-            let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
-            s.working = None;
-            s.message = Some(match r {
-                Ok(what) => {
-                    log::info!("{}: now uses the {what}", e.game.display);
-                    s.pin = Some(id.clone());
-                    (
-                        false,
-                        format!("Installed the {what}. It stays this table's music from now on."),
-                    )
-                }
-                Err(err) => (true, format!("Couldn't use it: {err:#}")),
-            });
-            rescan.store(true, Ordering::SeqCst);
-        });
-    }
-
-    fn picker_automatic(&mut self) {
-        let Some(pk) = &mut self.picker else { return };
-        let mut st = pk.state.lock().unwrap_or_else(|e| e.into_inner());
-        match state::Cache::open(Some(&self.cache))
-            .and_then(|c| record::forget_choice(&c, &pk.entry, &pk.opts))
-        {
-            Ok(()) => {
-                st.pin = None;
-                st.message = Some((
-                    false,
-                    "Its music is found by itself again from the next recording on (the audio \
-                     it has now stays)."
-                        .into(),
-                ));
-                self.pending_rescan.store(true, Ordering::SeqCst);
+        if modal.should_close() {
+            keep = true;
+        }
+        if stop {
+            if let Some(job) = &self.job {
+                job.cancel.store(true, Ordering::SeqCst);
             }
-            Err(err) => st.message = Some((true, format!("Couldn't forget the choice: {err:#}"))),
+            log::info!("Closing: stopping the recordings first");
+            self.close_when_done = true;
+            self.ask_close = false;
+        } else if keep {
+            self.ask_close = false;
         }
     }
 
@@ -1527,7 +1533,12 @@ impl App {
                 if ui.button(egui::RichText::new(label).color(egui::Color32::from_rgb(220, 80, 70))).clicked() {
                     go = true;
                 }
-                if ui.button("Cancel").clicked() {
+                let cancel = ui.button("Cancel");
+                // Enter or Space presses Cancel, not the red button.
+                if ui.memory(|m| m.focused().is_none()) {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
                     close = true;
                 }
             });
@@ -1557,6 +1568,17 @@ impl eframe::App for App {
         if self.busy() || self.picker.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        // Asked again after "Stop and close": it closes now.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.recording()
+            && !self.close_when_done
+        {
+            // Recordings are child processes writing into Popper's media:
+            // they're stopped first.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.ask_close = true;
+        }
+        self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
@@ -1572,14 +1594,25 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.toggle_value(&mut self.show_log, "Log");
-                    let counts =
-                        |f: fn(&Entry) -> bool| self.rows.iter().filter(|r| f(&r.entry)).count();
-                    ui.label(format!(
-                        "{} tables · {} with audio · {} can be recorded",
-                        self.rows.len(),
-                        counts(has_audio),
-                        counts(|e| matches!(e.status, Status::Todo | Status::Cached(_)))
-                    ));
+                    ui.separator();
+                    for c in Chip::ALL {
+                        let n = self.rows.iter().filter(|r| c.matches(&r.entry)).count();
+                        if c != Chip::All && n == 0 && self.chip != c {
+                            continue;
+                        }
+                        if ui
+                            .selectable_label(self.chip == c, format!("{} {n}", c.label()))
+                            .on_hover_text(c.hover())
+                            .clicked()
+                        {
+                            self.chip = c;
+                        }
+                    }
+                    let shown = self.rows.iter().filter(|r| self.visible(&r.entry)).count();
+                    if shown < self.rows.len() {
+                        ui.separator();
+                        ui.weak(format!("showing {shown} of {}", self.rows.len()));
+                    }
                 });
                 if self.show_log {
                     egui::ScrollArea::vertical()
@@ -1596,7 +1629,14 @@ impl eframe::App for App {
         self.dialogs(&ctx);
         self.restore_window(&ctx);
         self.picker_window(&ctx);
+        self.settings_window(&ctx);
+        self.close_window(&ctx);
     }
+}
+
+/// The ffmpeg chosen, or (when it's gone) Popper's or one on PATH.
+fn find_ffmpeg(chosen: Option<&Path>, popper: Option<&Path>) -> Option<PathBuf> {
+    encode::find_ffmpeg(chosen, popper).or_else(|| encode::find_ffmpeg(None, popper))
 }
 
 /// The app icon (copper-ring note wheel) for the title bar and Alt-Tab.

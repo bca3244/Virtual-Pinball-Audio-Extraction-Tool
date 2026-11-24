@@ -129,9 +129,27 @@ impl Cache {
 pub struct Installed {
     /// [`record`]'s source id when it was installed.
     pub source: String,
+    /// What the music is (\"ROM recording\", \"PuP pack music …\"); empty in
+    /// manifests from before 0.3.
+    pub what: String,
     /// Size and modified time of the file installed: a file replaced by
     /// hand since is left alone.
     pub file: (u64, u64),
+}
+
+/// What a cached clip is of, from the file beside it.
+pub fn clip_what(clip: &Path) -> Option<String> {
+    let t = std::fs::read_to_string(clip.with_extension("what")).ok()?;
+    let t = t.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Remembers what a cached clip is of (removed with it by
+/// [`Cache::remove_clips`]).
+pub fn set_clip_what(clip: &Path, what: &str) {
+    if !what.is_empty() {
+        let _ = std::fs::write(clip.with_extension("what"), what.replace(['\r', '\n'], " "));
+    }
 }
 
 /// Size and modified time (seconds) of a file.
@@ -166,12 +184,20 @@ impl Cache {
         };
         Some(Installed {
             source: get("source")?,
+            what: get("what").unwrap_or_default(),
             file: (get("size")?.parse().ok()?, get("mtime")?.parse().ok()?),
         })
     }
 
     /// Remembers that `file` was installed for `game` from `source`.
-    pub fn set_installed(&self, media_dir: &Path, game: &str, source: &str, file: &Path) {
+    pub fn set_installed(
+        &self,
+        media_dir: &Path,
+        game: &str,
+        source: &str,
+        what: &str,
+        file: &Path,
+    ) {
         let Some((size, mtime)) = stamp(file) else {
             return;
         };
@@ -181,9 +207,10 @@ impl Cache {
         if let Err(e) = std::fs::write(
             &p,
             format!(
-                "game={}\nsource={}\nsize={size}\nmtime={mtime}\n",
+                "game={}\nsource={}\nwhat={}\nsize={size}\nmtime={mtime}\n",
                 line(game),
-                line(source)
+                line(source),
+                line(what)
             ),
         ) {
             log::warn!("{game}: couldn't remember what was installed: {e}");
@@ -498,5 +525,30 @@ mod tests {
         c.set_pin(m1, "Tron", None).unwrap();
         c.set_pin(m1, "Tron", None).unwrap();
         assert_eq!(c.pin(m1, "Tron"), None);
+    }
+
+    #[test]
+    fn manifest_keeps_what_and_reads_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(Some(dir.path())).unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let f = media.join("Tron.mp3");
+        std::fs::write(&f, [1u8; 2048]).unwrap();
+        c.set_installed(&media, "Tron", "rom:1:2", "PuP pack music\nx.mp4", &f);
+        let got = c.installed(&media, "Tron").unwrap();
+        assert_eq!(got.what, "PuP pack music x.mp4");
+        assert_eq!(got.source, "rom:1:2");
+        assert_eq!(Some(got.file), stamp(&f));
+        // Written by 0.2: no what= line.
+        let p = c.installed_file(&media, "Tron");
+        std::fs::write(&p, "game=Tron\nsource=rom:1:2\nsize=1\nmtime=2\n").unwrap();
+        let old = c.installed(&media, "Tron").unwrap();
+        assert_eq!((old.what.as_str(), old.file), ("", (1, 2)));
+
+        let clip = dir.path().join("tron-30s-v5.mp3");
+        assert_eq!(clip_what(&clip), None);
+        set_clip_what(&clip, "altsound music a.ogg");
+        assert_eq!(clip_what(&clip).as_deref(), Some("altsound music a.ogg"));
     }
 }

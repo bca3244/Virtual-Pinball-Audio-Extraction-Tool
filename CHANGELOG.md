@@ -2,6 +2,44 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.0
+
+A reworked window. Chips under the list show one kind of table at a time, and the column headers sort. The options moved into *Settings…*, which also shows the libpinmame and ffmpeg found. During a run each table shows what it's doing, and the progress bar says how long is left. A *Source* column says where each table's audio came from, and a banner sums up each run. Closing mid-run asks first. Keyboard shortcuts: Ctrl+F, Esc, Ctrl+A, Shift-click and Space. Changes since beta.3, from cabinet testing and the final review:
+- ffmpeg can be chosen in *Settings…*, which says when none is found. Without it, music from PuP packs, altsound and table files can't be read, and the banner after a run now says so. A chosen ffmpeg that has gone missing falls back to Popper's.
+- A PuP pack folder named in two cases (`Matrix`, `matrix`) is looked through once.
+
+## 0.3.0-beta.3
+
+Fixes from review:
+- *Record* installs a clip recorded earlier with the same settings at once, as the list says, instead of recording it again (`--retry` on the command line still records again).
+- The time left counts only ROM recordings, and guesses before the first one finishes; looks through table files no longer make it far too low.
+- The window can always be closed: a second close after *Stop and close* closes at once, and a run that breaks down ends instead of holding the window open.
+- Tables left out of a run (or whose audio couldn't be written) no longer stay on "waiting to record…"; after Cancel, chosen music isn't encoded any more.
+- ROMs that really gave no music count as that in the banner after a Cancel, not as failures.
+- Source shows PuP or altsound only for music from those, not for any path containing the word.
+- Space presses a focused button or checkbox rather than playing.
+
+## 0.3.0-beta.2
+
+GUI:
+- Each table in a run shows what it's doing: waiting, recording (with the time so far), got audio (and from what), no music or failed. The progress bar counts recordings and tables and says about how long is left.
+- A *Source* column says where audio this tool made came from (ROM, PuP, altsound, table, chosen), with the file on hover. Audio from before this version shows its kind once it's made again.
+- The banner after a run sums it up: "12 tables got audio (9 ROM, 2 PuP, 1 altsound); 2 gave no music: …".
+- Closing the window while recording asks first, then stops the recordings and closes once they have stopped.
+- Play buttons stay usable during a run, except on the tables in it.
+
+The manifest in `data\installed\` notes what each table's audio is (`what=`); older files still read.
+
+## 0.3.0-beta.1
+
+GUI:
+- Chips under the list show one kind of table at a time (*Has audio*, *Missing*, *Changed*, *No music last time*, *Can't record*), with counts and "showing X of Y".
+- Click a column header to sort by title, ROM or status.
+- The options moved into *Settings…*; the toolbar keeps the Popper folder, Rescan, Restore… and a short summary of the settings. *Replace existing audio* sits next to Record.
+- The toolbar warns when libpinmame can't be found (or the chosen file is VPinMAME's), and Settings shows the DLL it found.
+- When Popper can't be read, the list says why and offers *Choose Popper folder…*.
+- Keyboard: Ctrl+F filter, Esc clears it, Ctrl+A ticks the rows shown, Shift-click ticks a range, Space plays or stops the last row clicked. Confirm dialogs focus Cancel.
+
 ## 0.2.0
 
 Every clip at an even loudness (EBU R128, -16 LUFS, true peak under -1 dBTP), with fades and lengths up to 120 s. Tables whose ROM or table changed since their audio was made can be recorded again (`--changed`, or in the GUI). Each table's music can be chosen by hand in the GUI (*Music…*). The GUI shows results in a banner and only acts on the rows shown. Changes since beta.4, from the final review:
