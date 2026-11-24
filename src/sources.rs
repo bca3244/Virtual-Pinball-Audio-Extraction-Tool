@@ -566,11 +566,11 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             };
             let rom_own = t.rom.is_some_and(|r| r.eq_ignore_ascii_case(&pack));
             // A music folder says what's in it: no name filter.
-            for f in pup_music(&dir) {
+            for (f, base) in pup_music(&dir) {
                 let s = size(&f);
                 push(Candidate {
                     what: format!("PuP pack music {}", f.display()),
-                    score: 80
+                    score: base
                         + music_bonus(
                             f.file_name()
                                 .map(|n| n.to_string_lossy())
@@ -813,8 +813,13 @@ fn altsound_music(dir: &Path) -> Vec<PathBuf> {
 
 /// Audio in a PuP pack's music folders (their names say music, bgm or
 /// song), up to two levels down.
-fn pup_music(pack: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+fn pup_music(pack: &Path) -> Vec<(PathBuf, i32)> {
+    let mut out: Vec<(PathBuf, i32)> = Vec::new();
+    let mut add = |p: PathBuf, score: i32| {
+        if !out.iter().any(|(q, _)| *q == p) {
+            out.push((p, score));
+        }
+    };
     // audiobg/audioattract: the background and attract playlists of
     // many packs (audiocallouts and the like are speech).
     let is_music = |n: &str| {
@@ -831,13 +836,128 @@ fn pup_music(pack: &Path) -> Vec<PathBuf> {
         .iter()
         .any(|w| n.contains(w))
     };
-    let Ok(rd) = std::fs::read_dir(pack) else {
+    if let Ok(rd) = std::fs::read_dir(pack) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() && is_music(&name) && !is_callout(&name) {
+                for f in media_files(&p, 1) {
+                    let score = if is_audio(&f) { 80 } else { PUP_VIDEO };
+                    add(f, score);
+                }
+            }
+        }
+    }
+    // The playlists the pack's triggers send to a music screen
+    // (screens.pup: "Music", "MusicVideos", or Active MusicOnly), such as
+    // music videos whose sound is the table's soundtrack.
+    for folder in pup_music_playlists(pack) {
+        if is_callout(&folder) {
+            continue;
+        }
+        if let Some(dir) = resolve(pack, &folder).filter(|d| d.is_dir()) {
+            for f in media_files(&dir, 0) {
+                add(f, PUP_VIDEO);
+            }
+        }
+    }
+    out
+}
+
+/// Score of a PuP file found through a music screen or a video in a music
+/// folder: below a pack's audio music folders, ordered by size among
+/// themselves (sound effects on a music screen are small).
+const PUP_VIDEO: i32 = 78;
+
+const VIDEO_EXT: &[&str] = &["mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "f4v"];
+
+fn is_video(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| VIDEO_EXT.iter().any(|a| e.eq_ignore_ascii_case(a)))
+}
+
+/// Audio and video files (whose sound ffmpeg can take).
+fn media_files(dir: &Path, depth: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() && is_music(&e.file_name().to_string_lossy()) {
-            out.extend(audio_files(&p, 1));
+        if p.is_dir() {
+            if depth > 0 {
+                out.extend(media_files(&p, depth - 1));
+            }
+        } else if is_audio(&p) || is_video(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// One CSV line's fields, honouring double quotes.
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => out.push(std::mem::take(&mut cur).trim().to_string()),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur.trim().to_string());
+    out
+}
+
+/// A PuP .pup file as rows of named columns (upper-cased names).
+fn pup_table(pack: &Path, file: &str) -> Vec<std::collections::HashMap<String, String>> {
+    let Some(text) = child_ci(pack, file).and_then(|p| std::fs::read(p).ok()) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&text);
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let cols: Vec<String> = csv_fields(header.trim_start_matches('\u{feff}'))
+        .into_iter()
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    lines
+        .map(|l| cols.iter().cloned().zip(csv_fields(l)).collect())
+        .collect()
+}
+
+/// Playlist folders that active triggers play on a music screen.
+fn pup_music_playlists(pack: &Path) -> Vec<String> {
+    let get = |r: &std::collections::HashMap<String, String>, k: &str| {
+        r.get(k).cloned().unwrap_or_default()
+    };
+    let screens: Vec<String> = pup_table(pack, "screens.pup")
+        .iter()
+        .filter(|r| {
+            get(r, "SCREENDES").to_ascii_lowercase().contains("music")
+                || get(r, "ACTIVE").eq_ignore_ascii_case("musiconly")
+        })
+        .map(|r| get(r, "SCREENNUM"))
+        .filter(|n| !n.is_empty())
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    for r in pup_table(pack, "triggers.pup") {
+        if get(&r, "ACTIVE") == "0" || !screens.contains(&get(&r, "SCREENNUM")) {
+            continue;
+        }
+        let list = get(&r, "PLAYLIST");
+        if !list.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&list)) {
+            out.push(list);
         }
     }
     out
@@ -1215,9 +1335,46 @@ End Sub
             std::fs::create_dir_all(dir.path().join(f)).unwrap();
             std::fs::write(dir.path().join(f).join(n), b"x").unwrap();
         }
-        let mut m: Vec<String> = pup_music(dir.path()).iter().map(|p| file_name(p)).collect();
+        let mut m: Vec<String> = pup_music(dir.path()).iter().map(|(p, _)| file_name(p)).collect();
         m.sort();
         assert_eq!(m, ["a.mp3", "b.mp3", "d.mp3"]);
+    }
+
+    #[test]
+    fn pup_music_screen_videos() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for (f, n) in [
+            ("Band1", "Faint.mp4"),
+            ("Favorite", "InTheEnd.mp4"),
+            ("TopperCallOut", "Yeah.mp4"),
+            ("TopperBands", "Clip.mp4"),
+            ("Sounds", "thunder3.wav"),
+        ] {
+            std::fs::create_dir_all(d.join(f)).unwrap();
+            std::fs::write(d.join(f).join(n), b"x").unwrap();
+        }
+        std::fs::write(
+            d.join("screens.pup"),
+            "ScreenNum,ScreenDes,PlayList,PlayFile,Loopit,Active,Priority,CustomPos\n\
+             0,Topper,,,0,ForceOn,,\"2,33.9,83.8,32,15.9\"\n\
+             4,Music,,,0,MusicOnly,,\n\
+             12,MusicVideos,,,0,ForceBack,,\"2,6.6,10.9,87.1,79.6\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("triggers.pup"),
+            "ID,Active,Descript,Trigger,ScreenNum,PlayList,PlayFile,Volume\n\
+             9,1,case0,E800,12,Band1,,\n\
+             24,1,\"case, fav\",E813,12,Favorite,,\n\
+             30,1,callout,E900,0,TopperCallOut,,\n\
+             31,0,off,E901,12,TopperBands,,\n\
+             94,1,BallLost,E817,4,Sounds,thunder3.wav,100\n",
+        )
+        .unwrap();
+        let mut m: Vec<String> = pup_music(d).iter().map(|(p, _)| file_name(p)).collect();
+        m.sort();
+        assert_eq!(m, ["Faint.mp4", "InTheEnd.mp4", "thunder3.wav"]);
     }
 
     #[test]

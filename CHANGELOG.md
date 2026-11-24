@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.17
+
+- A PuP pack's music is also found through the playlists its `triggers.pup` plays on a music screen (`screens.pup`: Music, MusicVideos or MusicOnly), and the sound of music videos (mp4 and the like) counts. Linkin Park and Nine Inch Nails keep their songs as music videos this way.
+
 ## 0.1.0-beta.16
 
 - Both exes have an app icon in the Rusty Popper wheel style (copper ring, chrome note), and the GUI window uses it in the title bar and Alt-Tab.
