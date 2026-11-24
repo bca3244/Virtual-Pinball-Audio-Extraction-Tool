@@ -996,6 +996,12 @@ impl eframe::App for App {
     }
 }
 
+/// The app icon (copper-ring note wheel) for the title bar and Alt-Tab.
+fn window_icon() -> egui::IconData {
+    static PNG: &[u8] = include_bytes!("../../assets/vp-audio-extract-256.png");
+    eframe::icon_data::from_png_bytes(PNG).unwrap_or_default()
+}
+
 fn main() -> eframe::Result {
     vp_audio_extract::run_worker_if_requested();
     let cache = state::Cache::open(None)
@@ -1005,7 +1011,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VP Audio Extract")
-            .with_inner_size([1000.0, 700.0]),
+            .with_inner_size([1000.0, 700.0])
+            .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -1013,4 +1020,14 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, cache)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn window_icon_decodes() {
+        let icon = super::window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 }

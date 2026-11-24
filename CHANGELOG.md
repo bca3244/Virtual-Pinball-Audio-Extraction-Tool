@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## Unreleased
+
+- Both exes have an app icon in the Rusty Popper wheel style (copper ring, chrome note), and the GUI window uses it in the title bar and Alt-Tab.
+
 ## 0.1.0-beta.15
 
 - PinMAME runs with "Skip Pinball Startup Test" on, as VPinMAME does by default. Theatre of Magic's ROM failed its own check ("INCORRECT U22") and never started a game without it.
