@@ -282,7 +282,13 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             .verdict(
                 &rom,
                 opts.seconds,
-                &state::fingerprint(&zip, find_nvram(&rom, &entry.rom_dirs).as_deref()),
+                &rom_fingerprint(
+                    &zip,
+                    find_nvram(&rom, &entry.rom_dirs).as_deref(),
+                    &entry,
+                    script.as_deref(),
+                    opts,
+                ),
             )
             .filter(|_| !opts.retry)
         {
@@ -311,6 +317,25 @@ fn source_table<'a>(
         vpx_dirs: dirs,
         popper_dir: opts.popper_dir.as_deref(),
     }
+}
+
+/// What a ROM's "no music" verdict holds for: its zip, its nvram and the
+/// music that belongs to it beside the table (altsound, a PuP pack named
+/// after it), so adding one of those tries the ROM again.
+fn rom_fingerprint(
+    zip: &Path,
+    nvram: Option<&Path>,
+    e: &Entry,
+    script: Option<&str>,
+    opts: &Options,
+) -> String {
+    let base = state::fingerprint(zip, nvram);
+    let Some(table) = e.table.as_deref().filter(|t| t.is_file()) else {
+        return base;
+    };
+    let dirs = vpx_dirs(&e.emu, opts.vpx_dir.as_deref());
+    let t = source_table(e, table, script, &dirs, opts, true);
+    format!("{base}+{}", sources::fingerprint(&t))
 }
 
 /// What a "nothing in the table's files" verdict holds for: the table
@@ -786,7 +811,13 @@ impl Runner<'_> {
             );
         };
         let nvram = find_nvram(&job.rom, &job.entries[0].rom_dirs);
-        let fp = state::fingerprint(zip, nvram.as_deref());
+        let first = &job.entries[0];
+        let first_script = first
+            .table
+            .as_deref()
+            .filter(|t| t.is_file())
+            .and_then(|t| vpx::read_script(t).ok());
+        let fp = rom_fingerprint(zip, nvram.as_deref(), first, first_script.as_deref(), self.opts);
         // A recording much shorter than the clip is a start jingle, not the
         // music (a blank nvram leaves Attack from Mars' volume near zero
         // after it): kept as a fallback while the other ways are tried.
