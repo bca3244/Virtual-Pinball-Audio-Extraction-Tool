@@ -579,6 +579,9 @@ pub fn run(
     let set_mech = unsafe { lib.get::<SetMechFn>(b"PinmameSetMech\0") }
         .ok()
         .map(|s| *s);
+    let set_cheat = unsafe { lib.get::<SetIntFn>(b"PinmameSetCheat\0") }
+        .ok()
+        .map(|s| *s);
     let mechs = MECHS.get().cloned().unwrap_or_default();
     let get_game = unsafe { lib.get::<GetGameFn>(b"PinmameGetGame\0") }
         .ok()
@@ -640,6 +643,12 @@ pub fn run(
 
     unsafe {
         set_handle_keyboard(1);
+        // VPinMAME's "Skip Pinball Startup Test" (on by default): WPC
+        // skips its ROM checksum, which Theatre of Magic's tom_14hb fails
+        // ("INCORRECT U22") and then never starts a game.
+        if let Some(f) = set_cheat {
+            f(1);
+        }
         // PinMAME takes the script's mechanisms only with its own off.
         let default = match SCRIPT_MECHANICS.get() {
             Some(&n) if n > 0 => n,
