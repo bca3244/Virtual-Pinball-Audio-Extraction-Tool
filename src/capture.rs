@@ -70,7 +70,7 @@ pub const LEAD_IN: f64 = 3.0;
 pub const TAIL: f64 = 1.0;
 
 pub const MIN_SECONDS: u32 = 5;
-pub const MAX_SECONDS: u32 = 60;
+pub const MAX_SECONDS: u32 = 120;
 pub const DEFAULT_SECONDS: u32 = 30;
 
 pub fn clamp_seconds(s: u32) -> u32 {
@@ -394,13 +394,21 @@ fn noisy(loud: &Loudness, first: usize, last: usize) -> bool {
 }
 
 /// How a finished clip sounds: seconds of real sound in it (100 ms blocks
-/// above the quiet level, and above -30 dB of its loudest block, since the
-/// clip is normalised), and whether most of those are static.
+/// above the quiet level, and above -30 dB of its loudest block), and
+/// whether most of those are static.
 pub fn assess(samples: &[i16], channels: u32, rate: u32) -> (f64, bool) {
     let mut l = Loudness::new(channels, rate, Some(0));
     l.update(samples);
     let peak = l.rms.iter().cloned().fold(0.0, f64::max);
-    let floor = QUIET.max(peak * 0.03);
+    // The quiet level as it would be after peak normalisation (0.8 FS, at
+    // most 32x), whatever levelling the clip had.
+    let top = samples.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0) as f64;
+    let norm = if top > 0.0 {
+        (0.8 * i16::MAX as f64 / top).min(32.0)
+    } else {
+        1.0
+    };
+    let floor = (QUIET / norm).max(peak * 0.03);
     let loud: Vec<usize> = (0..l.rms.len()).filter(|&i| l.rms[i] > floor).collect();
     let noisy = loud.iter().filter(|&&i| l.zcr[i] > NOISY_ZCR).count();
     (
@@ -409,17 +417,100 @@ pub fn assess(samples: &[i16], channels: u32, rate: u32) -> (f64, bool) {
     )
 }
 
+/// How a finished clip is levelled and faded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Finish {
+    /// Seconds of fade-in at the start.
+    pub fade_in: f64,
+    /// Seconds of fade-out at the end.
+    pub fade_out: f64,
+    /// Integrated loudness (LUFS) to level to, with a limiter; None for
+    /// plain peak normalisation (0.8 FS).
+    pub lufs: Option<f64>,
+}
+
+impl Default for Finish {
+    fn default() -> Self {
+        Finish {
+            fade_in: 0.0,
+            fade_out: 1.0,
+            lufs: Some(DEFAULT_LUFS),
+        }
+    }
+}
+
+pub const DEFAULT_LUFS: f64 = -16.0;
+/// Longest fade either way.
+pub const MAX_FADE: f64 = 10.0;
+
+impl Finish {
+    /// Within bounds: fades 0 to [`MAX_FADE`] s, loudness -40 to -6 LUFS.
+    pub fn clamped(self) -> Finish {
+        let fade = |f: f64| {
+            if f.is_finite() {
+                f.clamp(0.0, MAX_FADE)
+            } else {
+                0.0
+            }
+        };
+        Finish {
+            fade_in: fade(self.fade_in),
+            fade_out: fade(self.fade_out),
+            lufs: self
+                .lufs
+                .filter(|l| l.is_finite())
+                .map(|l| l.clamp(-40.0, -6.0)),
+        }
+    }
+
+    /// Part of a cached clip's name, so other settings never reuse it.
+    pub fn tag(&self) -> String {
+        let level = match self.lufs {
+            Some(l) => format!("l{:.0}", -l * 10.0),
+            None => "peak".to_string(),
+        };
+        format!(
+            "i{:.0}-o{:.0}-{level}",
+            self.fade_in * 10.0,
+            self.fade_out * 10.0
+        )
+    }
+
+    /// `--lufs` as given: a number, or "off"/"peak" for peak normalisation.
+    pub fn parse_lufs(s: &str) -> Result<Option<f64>, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "peak" | "none" => Ok(None),
+            v => v
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("{s:?} isn't a loudness (like -16) or \"off\"")),
+        }
+    }
+
+    /// [`Finish::parse_lufs`] for clap, which can't take an `Option` field
+    /// as a value of its own (it reads it as "the option may be left out").
+    pub fn parse_lufs_arg(s: &str) -> Result<Lufs, String> {
+        Self::parse_lufs(s).map(Lufs)
+    }
+}
+
+/// A `--lufs` value: a target loudness, or `None` for peak normalisation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lufs(pub Option<f64>);
+
+impl Finish {}
+
 /// From the music after Start (the coin chimes before it, and a short Start
 /// sound, are dropped), cut at the first 3 s of silence after it and at
-/// `seconds`, normalised to 0.8 FS (at most 32x gain) and faded out over the
-/// last second. `start_sample` is as for [`Loudness::new`]. None when there's
-/// no music (no 2 s of sound).
+/// `seconds`, then levelled and faded as `finish` says. `start_sample` is as
+/// for [`Loudness::new`]. None when there's no music (no 2 s of sound).
 pub fn clip(
     samples: &[i16],
     channels: u32,
     rate: u32,
     start_sample: Option<u64>,
     seconds: u32,
+    finish: &Finish,
 ) -> Option<Vec<i16>> {
     let mut loud = Loudness::new(channels, rate, start_sample);
     loud.update(samples);
@@ -431,8 +522,13 @@ pub fn clip(
         .min(loud.sample_of(last + 3))
         .min(start + clamp_seconds(seconds) as usize * rate * channels);
     let mut cut = samples[start..end].to_vec();
-    // Without the sound board's constant offset (older WPC boards sit at a
-    // level well off zero even when quiet), which would eat the headroom.
+    remove_dc(&mut cut, channels);
+    Some(finish_clip(&cut, channels, rate, finish))
+}
+
+/// Without the sound board's constant offset (older WPC boards sit at a
+/// level well off zero even when quiet), which would eat the headroom.
+fn remove_dc(cut: &mut [i16], channels: usize) {
     for ch in 0..channels {
         let n = cut.len() / channels;
         if n == 0 {
@@ -451,30 +547,254 @@ pub fn clip(
                 .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
         }
     }
+}
 
-    let peak = cut.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
-    let gain = if peak > 0 {
-        (0.8 * i16::MAX as f64 / peak as f64).min(32.0)
-    } else {
-        1.0
-    };
-    let fade = cut.len().min(rate * channels);
-    let len = cut.len();
-    for (i, s) in cut.iter_mut().enumerate() {
-        let left = len - i;
-        let g = if left < fade {
-            gain * left as f64 / fade as f64
-        } else {
-            gain
-        };
-        *s = (*s as f64 * g).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+/// Most gain levelling gives (+48 dB): some Sega boards play at about
+/// -60 dBFS in libpinmame, and need +46 dB to reach -16 LUFS.
+const MAX_GAIN: f64 = 256.0;
+/// Peak mode's own gain limit (+30 dB), as before.
+const MAX_PEAK_GAIN: f64 = 32.0;
+/// The limiter's ceiling: -1 dBFS, sample peak.
+const CEILING: f64 = 0.891 * i16::MAX as f64;
+/// The true (inter-sample) peak allowed before encoding: -2 dBTP, which
+/// leaves room for an MP3 encoder's overshoot under -1 dBTP.
+const TRUE_PEAK: f64 = 0.794;
+
+/// Integrated loudness (EBU R128 / BS.1770, gated) of interleaved samples,
+/// None when too short or silent.
+/// The true peak (4x oversampled, BS.1770) of interleaved samples, as a
+/// fraction of full scale.
+pub fn true_peak(samples: &[i16], channels: usize, rate: usize) -> Option<f64> {
+    let mut m =
+        ebur128::EbuR128::new(channels as u32, rate as u32, ebur128::Mode::TRUE_PEAK).ok()?;
+    m.add_frames_i16(samples).ok()?;
+    (0..channels as u32)
+        .map(|c| m.true_peak(c).ok())
+        .try_fold(0.0f64, |a, p| Some(a.max(p?)))
+}
+
+pub fn integrated_lufs(samples: &[i16], channels: usize, rate: usize) -> Option<f64> {
+    let mut m = ebur128::EbuR128::new(channels as u32, rate as u32, ebur128::Mode::I).ok()?;
+    m.add_frames_i16(samples).ok()?;
+    m.loudness_global()
+        .ok()
+        .filter(|l| l.is_finite() && *l > -70.0)
+}
+
+/// Levels a cut clip (to `lufs` through a limiter, or by its peak) and
+/// fades it in and out.
+pub fn finish_clip(cut: &[i16], channels: usize, rate: usize, finish: &Finish) -> Vec<i16> {
+    let channels = channels.max(1);
+    let peak = cut.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0) as f64;
+    let mut x: Vec<f64> = cut.iter().map(|&s| s as f64).collect();
+    if peak > 0.0 {
+        match finish
+            .lufs
+            .and_then(|t| Some((t, integrated_lufs(cut, channels, rate)?)))
+        {
+            Some((target, measured)) => {
+                // The limiter takes some loudness off: measured again and
+                // made up for, a couple of times, within the gain limit.
+                // Then a true peak over TRUE_PEAK lowers the ceiling and
+                // it's done again.
+                let orig = x.clone();
+                let quant = |x: &[f64]| -> Vec<i16> {
+                    x.iter()
+                        .map(|&v| v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+                        .collect()
+                };
+                let mut ceiling = CEILING;
+                for _ in 0..4 {
+                    let mut gain = 10f64.powf((target - measured) / 20.0).min(MAX_GAIN);
+                    for _ in 0..3 {
+                        x = orig.iter().map(|v| v * gain).collect();
+                        limit(&mut x, channels, rate, ceiling);
+                        let Some(now) = integrated_lufs(&quant(&x), channels, rate) else {
+                            break;
+                        };
+                        let short = target - now;
+                        if short < 0.5 || gain >= MAX_GAIN {
+                            break;
+                        }
+                        gain = (gain * 10f64.powf(short / 20.0)).min(MAX_GAIN);
+                    }
+                    match true_peak(&quant(&x), channels, rate) {
+                        Some(tp) if tp > TRUE_PEAK => {
+                            // From the highest sample actually reached (it
+                            // may be under the ceiling already).
+                            let top = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                            ceiling = ceiling.min(top) * TRUE_PEAK / tp * 0.99;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            None => {
+                let gain = (0.8 * i16::MAX as f64 / peak).min(MAX_PEAK_GAIN);
+                for v in x.iter_mut() {
+                    *v *= gain;
+                }
+            }
+        }
     }
-    Some(cut)
+    let frames = x.len() / channels;
+    let fade_in = ((finish.fade_in * rate as f64) as usize).min(frames);
+    let fade_out = ((finish.fade_out * rate as f64) as usize).min(frames);
+    x.chunks_mut(channels).enumerate().for_each(|(i, f)| {
+        let mut g = 1.0;
+        if i < fade_in {
+            g *= i as f64 / fade_in as f64;
+        }
+        let left = frames - i;
+        if left < fade_out {
+            g *= left as f64 / fade_out as f64;
+        }
+        for v in f.iter_mut() {
+            *v *= g;
+        }
+    });
+    x.iter()
+        .map(|&v| v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+        .collect()
+}
+
+/// A look-ahead peak limiter to `ceiling` (at most [`CEILING`]): the gain each frame needs is
+/// held over 5 ms either side and smoothed over 5 ms, so it's already down
+/// when a peak arrives, then recovers over about 100 ms.
+fn limit(x: &mut [f64], channels: usize, rate: usize, ceiling: f64) {
+    let frames = x.len() / channels;
+    if frames == 0 {
+        return;
+    }
+    let need: Vec<f64> = x
+        .chunks(channels)
+        .map(|f| {
+            let p = f.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            if p > ceiling {
+                ceiling / p
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    if need.iter().all(|&g| g >= 1.0) {
+        return;
+    }
+    let look = (rate / 200).max(1); // 5 ms
+                                    // Smallest need within ±look (a monotonic queue).
+    let mut held = vec![1.0; frames];
+    let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut next = 0;
+    for (i, h) in held.iter_mut().enumerate() {
+        let hi = (i + look).min(frames - 1);
+        while next <= hi {
+            while q.back().is_some_and(|&b| need[b] >= need[next]) {
+                q.pop_back();
+            }
+            q.push_back(next);
+            next += 1;
+        }
+        while q.front().is_some_and(|&f| f + look < i) {
+            q.pop_front();
+        }
+        *h = q.front().map(|&f| need[f]).unwrap_or(1.0);
+    }
+    // Averaged over ±look/2: every value averaged at a peak is held at or
+    // below what that peak needs, so the peak still fits.
+    let half = (look / 2).max(1);
+    let mut sum = vec![0.0; frames + 1];
+    for i in 0..frames {
+        sum[i + 1] = sum[i] + held[i];
+    }
+    let release = 1.0 - (-1.0 / (0.1 * rate as f64)).exp();
+    let mut env = 1.0f64;
+    for i in 0..frames {
+        let (a, b) = (i.saturating_sub(half), (i + half + 1).min(frames));
+        let avg = (sum[b] - sum[a]) / (b - a) as f64;
+        env = if avg < env {
+            avg
+        } else {
+            env + (avg - env) * release
+        };
+        let g = env.min(need[i]);
+        for v in &mut x[i * channels..(i + 1) * channels] {
+            *v *= g;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PEAK: Finish = Finish {
+        fade_in: 0.0,
+        fade_out: 1.0,
+        lufs: None,
+    };
+
+    #[test]
+    fn levels_to_the_loudness_target_under_the_ceiling() {
+        let rate = 44100usize;
+        // A quiet tone with rare loud clicks: peak mode can't lift it.
+        let mut s: Vec<i16> = (0..rate * 20)
+            .map(|i| {
+                ((i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 300.0) as i16
+            })
+            .collect();
+        for k in (0..s.len()).step_by(rate) {
+            s[k] = 30000;
+        }
+        let f = Finish {
+            fade_in: 0.0,
+            fade_out: 0.0,
+            lufs: Some(-16.0),
+        };
+        let out = finish_clip(&s, 1, rate, &f);
+        let l = integrated_lufs(&out, 1, rate).unwrap();
+        assert!((l - -16.0).abs() < 1.5, "{l}");
+        let top = out.iter().map(|&v| (v as i32).abs()).max().unwrap() as f64;
+        assert!(top <= CEILING + 1.0, "{top}");
+
+        // About -60 dBFS (a Sega board in libpinmame) still gets there.
+        let quiet: Vec<i16> = (0..rate * 20)
+            .map(|i| ((i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 40.0) as i16)
+            .collect();
+        let out = finish_clip(&quiet, 1, rate, &f);
+        let l = integrated_lufs(&out, 1, rate).unwrap();
+        assert!((l - -16.0).abs() < 1.5, "{l}");
+
+        // Peaks between samples (a quarter-rate tone sampled off its crests)
+        // are held under the true-peak limit too.
+        let tp: Vec<i16> = (0..rate * 20)
+            .map(|i| {
+                let ph = i as f64 * std::f64::consts::FRAC_PI_2 + std::f64::consts::FRAC_PI_4;
+                (ph.sin() * 2000.0 * (1.0 + (i / rate % 3) as f64)) as i16
+            })
+            .collect();
+        let out = finish_clip(&tp, 1, rate, &f);
+        let peak = true_peak(&out, 1, rate).unwrap();
+        assert!(peak <= TRUE_PEAK * 1.01, "{peak}");
+    }
+
+    #[test]
+    fn fades_both_ends() {
+        let rate = 1000usize;
+        let s = vec![1000i16; rate * 10];
+        let f = Finish {
+            fade_in: 2.0,
+            fade_out: 1.0,
+            lufs: None,
+        };
+        let out = finish_clip(&s, 1, rate, &f);
+        assert_eq!(out[0], 0);
+        assert!(out[rate] < out[3 * rate] / 2 + 10);
+        assert!(*out.last().unwrap() < 100);
+        assert_eq!(f.tag(), "i20-o10-peak");
+        assert_eq!(Finish::default().tag(), "i0-o10-l160");
+        assert_eq!(Finish::parse_lufs("off"), Ok(None));
+        assert_eq!(Finish::parse_lufs("-14"), Ok(Some(-14.0)));
+    }
 
     fn tone(seconds: f64, rate: usize, channels: usize, amp: f64) -> Vec<i16> {
         let n = (seconds * rate as f64) as usize;
@@ -521,7 +841,7 @@ mod tests {
         s.extend(vec![0i16; rate * 4]); // the machine thinking
         let music_at = s.len();
         s.extend(tone(12.0, rate, 1, 2000.0));
-        let c = clip(&s, 1, rate as u32, Some(0), 30).unwrap();
+        let c = clip(&s, 1, rate as u32, Some(0), 30, &PEAK).unwrap();
         let secs = c.len() as f64 / rate as f64;
         assert!((11.5..12.5).contains(&secs), "{secs}");
         let mut l = Loudness::new(1, rate as u32, Some(0));
@@ -556,12 +876,12 @@ mod tests {
                 ((x >> 16) as i16 as i32 / 40) as i16
             })
             .collect();
-        assert!(clip(&noise, 1, rate as u32, Some(0), 30).is_none());
+        assert!(clip(&noise, 1, rate as u32, Some(0), 30, &PEAK).is_none());
         // Static first, then music: the music is kept.
         let mut s = noise.clone();
         s.extend(vec![0i16; rate * 4]);
         s.extend(tone(10.0, rate, 1, 2000.0));
-        let c = clip(&s, 1, rate as u32, Some(0), 30).unwrap();
+        let c = clip(&s, 1, rate as u32, Some(0), 30, &PEAK).unwrap();
         assert!((9.5..10.5).contains(&(c.len() as f64 / rate as f64)));
     }
 
@@ -572,7 +892,7 @@ mod tests {
             .iter()
             .map(|&v| v + 3200)
             .collect();
-        let c = clip(&s, 1, rate as u32, Some(0), 30).unwrap();
+        let c = clip(&s, 1, rate as u32, Some(0), 30, &PEAK).unwrap();
         let mean = c.iter().map(|&v| v as f64).sum::<f64>() / c.len() as f64;
         assert!(mean.abs() < 300.0, "{mean}");
         let peak = c.iter().map(|&v| (v as i32).abs()).max().unwrap();
@@ -605,13 +925,13 @@ mod tests {
     #[test]
     fn different_offsets_per_channel_are_not_loudness() {
         let s: Vec<i16> = (0..22050 * 20).flat_map(|_| [300i16, -900]).collect();
-        assert!(clip(&s, 2, 22050, Some(0), 30).is_none());
+        assert!(clip(&s, 2, 22050, Some(0), 30, &PEAK).is_none());
     }
 
     #[test]
     fn dc_offset_is_not_loudness() {
         let s = vec![400i16; 22050 * 20];
-        assert!(clip(&s, 1, 22050, Some(0), 30).is_none());
+        assert!(clip(&s, 1, 22050, Some(0), 30, &PEAK).is_none());
     }
 
     #[test]
@@ -622,13 +942,13 @@ mod tests {
             s.extend(tone(0.8, rate, 1, 3000.0));
             s.extend(vec![0i16; rate * 4]);
         }
-        assert!(clip(&s, 1, rate as u32, Some(0), 30).is_none());
+        assert!(clip(&s, 1, rate as u32, Some(0), 30, &PEAK).is_none());
     }
 
     #[test]
     fn silence_gives_nothing() {
         let s = vec![0i16; 44100 * 2 * 40];
-        assert!(clip(&s, 2, 44100, Some(0), 30).is_none());
+        assert!(clip(&s, 2, 44100, Some(0), 30, &PEAK).is_none());
     }
 
     #[test]
@@ -638,7 +958,7 @@ mod tests {
         s.extend(tone(10.0, rate, 2, 1000.0)); // 10 s of music
         s.extend(vec![0i16; rate * 2 * 5]); // then 5 s of silence
         s.extend(tone(5.0, rate, 2, 1000.0)); // a later sound, past the silence
-        let c = clip(&s, 2, rate as u32, Some(0), 30).unwrap();
+        let c = clip(&s, 2, rate as u32, Some(0), 30, &PEAK).unwrap();
         let secs = c.len() as f64 / (rate * 2) as f64;
         assert!((10.0..10.5).contains(&secs), "{secs}");
         let peak = c.iter().map(|&v| (v as i32).abs()).max().unwrap();
@@ -667,13 +987,13 @@ mod tests {
     fn clip_is_capped_at_its_length() {
         let rate = 22050;
         let s = tone(40.0, rate, 1, 3000.0);
-        let c = clip(&s, 1, rate as u32, Some(0), 10).unwrap();
+        let c = clip(&s, 1, rate as u32, Some(0), 10, &PEAK).unwrap();
         assert_eq!(c.len(), 10 * rate);
     }
 
     #[test]
     fn start_beyond_the_end_is_none() {
         let s = tone(1.0, 22050, 1, 3000.0);
-        assert!(clip(&s, 1, 22050, Some(10_000_000), 10).is_none());
+        assert!(clip(&s, 1, 22050, Some(10_000_000), 10, &PEAK).is_none());
     }
 }

@@ -2,6 +2,47 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.2.0
+
+Every clip at an even loudness (EBU R128, -16 LUFS, true peak under -1 dBTP), with fades and lengths up to 120 s. Tables whose ROM or table changed since their audio was made can be recorded again (`--changed`, or in the GUI). Each table's music can be chosen by hand in the GUI (*Music…*). The GUI shows results in a banner and only acts on the rows shown. Changes since beta.4, from the final review:
+- Replacing audio sets aside only `Game.<ext>`; numbered tracks you added (`Game01.mp3`) stay in Popper.
+- *Automatic* in the music window doesn't claim a file you put there by hand.
+- Moving the tables, PuP or altsound folders no longer makes table-sourced audio count as changed.
+- A chosen music file that can't be used at record time keeps the audio it gave, rather than re-recording it every run.
+- Restore puts a file back where it was, even when its name was reused in the batch.
+
+## 0.2.0-beta.4
+
+- **Choose a table's music by hand:** the GUI's *Music…* button lists the music found in the table's files, altsound and PuP pack. ▶ plays each one as it would be installed, and *Use* installs it (the old audio is kept for Restore) and keeps it for that table when it's recorded again. *Automatic* goes back to the ROM recording or the best source.
+- Very quiet ROMs (Apollo 13, Goldeneye: Sega boards at about -60 dBFS) are now levelled too: levelling may add up to +48 dB (was +30).
+- The true peak (between samples) is held under -2 dBTP before encoding, so MP3s stay under -1 dBTP. Before, a few came out at 0 dBTP.
+- GUI:
+  - results and errors of Record, Remove and Restore show in a banner, not only in the log;
+  - rows hidden by the filter aren't acted on, and the confirm dialogs name the tables;
+  - *Select missing or changed* skips ROMs that gave no music last time;
+  - *Replace existing audio* isn't remembered between launches, and *At once* is;
+  - a Popper folder that doesn't read isn't saved;
+  - Cancel shows that it's cancelling;
+  - the ROM filter ignores case;
+  - hover help for fades and loudness.
+- Clips cached by earlier betas are recorded again (new levelling).
+
+## 0.2.0-beta.3
+
+- Tables whose ROM zip or table files changed since this tool made their audio can be recorded again: `record --changed`, or in the GUI they show as "changed since its audio was made", *Select missing or changed* picks them, and Record asks before replacing. Audio you replaced by hand, or that this tool didn't make, is left alone. A ROM zip that has gone missing, or a changed ROM that now gives no music, keeps the old recording.
+- Audio that gets replaced (Replace, `--force`, or a changed table) is moved to `data\removed\<time>\` first, so *Restore* (or `restore`) can put it back, and it's put back at once if the new file can't be written.
+- A clip cached before its ROM zip was last changed is recorded again rather than reused.
+
+## 0.2.0-beta.2
+
+- Fixed: beta.1's `record` and `scan` crashed at startup (the new `--lufs` option was declared and read as different types). `--lufs -16` with a space also works now, as well as `--lufs=-16`.
+
+## 0.2.0-beta.1
+
+- Every clip is levelled to the same loudness (EBU R128 integrated loudness, -16 LUFS by default) with a look-ahead limiter keeping peaks under -1 dBFS, so quiet tables like Apollo 13 or Goldeneye play about as loud as the rest. `--lufs off` (or unticking "Even loudness" in the GUI) keeps the old peak normalisation.
+- Fade-in and fade-out lengths can be set (`--fade-in`, `--fade-out`, or in the GUI; defaults 0 and 1 s), and clips can be up to 120 s long.
+- Cached clips are kept per length, loudness and fades, so changing a setting records fresh ones. Audio already in Popper changes only when it's re-recorded (Replace).
+
 ## 0.1.0
 
 First full release. On the cabinet it gave 136 of 137 tables their music: ROM recordings (with retries from the cabinet's nvram, Start pressed twice, without the script's start switches, and without the service key), and for tables whose ROM gives none, altsound, music the script plays, sounds stored in the table, and PuP pack music including music videos. The GUI lists every table with its ROM and lets you play, record and remove Audio media. Changes since beta.23: none.

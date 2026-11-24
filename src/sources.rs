@@ -97,6 +97,7 @@ pub fn find(
     t: &Table,
     ffmpeg: Option<&Path>,
     seconds: u32,
+    finish: &capture::Finish,
     tmp: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Search {
@@ -141,6 +142,7 @@ pub fn find(
             pcm.rate,
             Some(0),
             seconds,
+            finish,
         ) else {
             log::info!("  {}: no music in it", c.what);
             continue;
@@ -165,6 +167,80 @@ pub fn find(
         break;
     }
     search
+}
+
+/// One music source found with a table, for choosing by hand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    /// Stays the same while the file does: its kind, name and size (not
+    /// its place in the list, nor an index inside the .vpx).
+    pub id: String,
+    pub what: String,
+    pub size: u64,
+    /// Tried by itself (in this order); false for sources it passes over
+    /// because the ROM is recorded instead.
+    pub usual: bool,
+}
+
+fn choice_id(c: &Candidate) -> String {
+    match &c.src {
+        Src::File(p) => format!("file:{}:{}", file_name(p).to_lowercase(), c.size),
+        Src::Embedded { name, .. } => format!("vpx:{}:{}", name.to_lowercase(), c.size),
+    }
+}
+
+/// Every music source found with the table, best first.
+pub fn list(t: &Table) -> Vec<Choice> {
+    let mut seen = std::collections::HashSet::new();
+    candidates(t)
+        .into_iter()
+        .filter_map(|c| {
+            let id = choice_id(&c);
+            seen.insert(id.clone()).then(|| Choice {
+                id,
+                what: c.what.clone(),
+                size: c.size,
+                usual: !t.has_rom || c.score >= TRUSTED,
+            })
+        })
+        .collect()
+}
+
+/// The music of one source from [`list`], cut, levelled and faded like any
+/// other. It isn't held to the length and noise checks: it was chosen.
+pub fn take(
+    t: &Table,
+    id: &str,
+    ffmpeg: Option<&Path>,
+    seconds: u32,
+    finish: &capture::Finish,
+    tmp: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Found> {
+    let c = candidates(t)
+        .into_iter()
+        .find(|c| choice_id(c) == id)
+        .context("that music isn't with the table any more")?;
+    let _ = std::fs::create_dir_all(tmp);
+    let pcm = decode(t.table, &c.src, ffmpeg, tmp, cancelled)
+        .with_context(|| format!("couldn't read the {}", c.what))?;
+    let cut = capture::clip(
+        &pcm.samples,
+        pcm.channels as u32,
+        pcm.rate,
+        Some(0),
+        seconds,
+        finish,
+    )
+    .with_context(|| format!("the {} is silent", c.what))?;
+    Ok(Found {
+        pcm: wav::Pcm {
+            samples: cut,
+            channels: pcm.channels,
+            rate: pcm.rate,
+        },
+        what: c.what,
+    })
 }
 
 /// The candidates worth trying for this table, best first.
@@ -494,7 +570,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     score: 100 + music_bonus(&name) + order - if is_effect(&name) { 40 } else { 0 },
                     src: Src::File(f),
                     size: s,
-                min_len: false,
+                    min_len: false,
                 });
             }
             break;
@@ -534,7 +610,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             },
             score,
             size: e.size,
-                min_len: false,
+            min_len: false,
         });
     }
 
@@ -566,7 +642,11 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             for pf in pup_music(&dir) {
                 let f = pf.path;
                 let s = size(&f);
-                let bonus = if pf.bonus { music_bonus(&file_name(&f)) } else { 0 };
+                let bonus = if pf.bonus {
+                    music_bonus(&file_name(&f))
+                } else {
+                    0
+                };
                 push(Candidate {
                     what: format!("PuP pack music {}", f.display()),
                     score: pf.score + bonus,
@@ -827,11 +907,26 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
             }
             for f in media_files(&p, 1) {
                 if is_audio(&f) {
-                    add(PupFile { path: f, score: 80, bonus: true, min_len: false });
+                    add(PupFile {
+                        path: f,
+                        score: 80,
+                        bonus: true,
+                        min_len: false,
+                    });
                 } else if music {
-                    add(PupFile { path: f, score: PUP_VIDEO, bonus: false, min_len: false });
+                    add(PupFile {
+                        path: f,
+                        score: PUP_VIDEO,
+                        bonus: false,
+                        min_len: false,
+                    });
                 } else {
-                    add(PupFile { path: f, score: PUP_LOOSE_VIDEO, bonus: false, min_len: true });
+                    add(PupFile {
+                        path: f,
+                        score: PUP_LOOSE_VIDEO,
+                        bonus: false,
+                        min_len: true,
+                    });
                 }
             }
         }
@@ -849,9 +944,10 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
             continue;
         };
         let files = match file.as_deref() {
-            Some(f) if !f.contains("..") && !f.contains(['\\', '/', ':']) => {
-                child_ci(&dir, f).filter(|p| p.is_file()).into_iter().collect()
-            }
+            Some(f) if !f.contains("..") && !f.contains(['\\', '/', ':']) => child_ci(&dir, f)
+                .filter(|p| p.is_file())
+                .into_iter()
+                .collect(),
             Some(_) => Vec::new(),
             None => media_files(&dir, 0),
         };
@@ -860,7 +956,12 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
             if is_effect(&n) || is_callout(&n) || is_ambience(&n) {
                 continue;
             }
-            add(PupFile { path: f, score: PUP_VIDEO, bonus: false, min_len: true });
+            add(PupFile {
+                path: f,
+                score: PUP_VIDEO,
+                bonus: false,
+                min_len: true,
+            });
         }
     }
     out
@@ -870,9 +971,11 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
 /// (`TopperCallOut`, `audiocallouts`, `SFX`, `Sounds`).
 fn speech_or_effects(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["callout", "voice", "speech", "sfx", "sound", "effect", "quote"]
-        .iter()
-        .any(|w| n.contains(w))
+    [
+        "callout", "voice", "speech", "sfx", "sound", "effect", "quote",
+    ]
+    .iter()
+    .any(|w| n.contains(w))
 }
 
 /// Score of a PuP video in a music folder or a file played on a music
@@ -883,7 +986,9 @@ const PUP_VIDEO: i32 = 78;
 /// stored in the table.
 const PUP_LOOSE_VIDEO: i32 = 62;
 
-const VIDEO_EXT: &[&str] = &["mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "f4v"];
+const VIDEO_EXT: &[&str] = &[
+    "mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "f4v",
+];
 
 fn is_video(p: &Path) -> bool {
     p.extension()
@@ -1357,7 +1462,10 @@ End Sub
         std::fs::create_dir_all(dir.path().join("videoattract")).unwrap();
         std::fs::write(dir.path().join("videoattract").join("attract.mp4"), b"x").unwrap();
         let found = pup_music(dir.path());
-        let video = found.iter().find(|f| file_name(&f.path) == "attract.mp4").unwrap();
+        let video = found
+            .iter()
+            .find(|f| file_name(&f.path) == "attract.mp4")
+            .unwrap();
         assert_eq!(video.score, PUP_LOOSE_VIDEO);
         assert!(video.min_len && !video.bonus);
         let mut m: Vec<String> = found.iter().map(|f| file_name(&f.path)).collect();
@@ -1502,12 +1610,34 @@ End Sub
             vpx_dirs: &dirs,
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false)
-            .found
-            .unwrap();
+        let f = find(
+            &t,
+            None,
+            20,
+            &capture::Finish::default(),
+            &dir.path().join("tmp"),
+            &|| false,
+        )
+        .found
+        .unwrap();
         assert!(f.what.contains("script music"), "{}", f.what);
         let secs = f.pcm.samples.len() as f64 / rate as f64;
         assert!((19.0..=20.5).contains(&secs), "{secs}");
+
+        // The same, chosen by hand.
+        let choices = list(&t);
+        assert_eq!(choices.len(), 1);
+        assert!(
+            choices[0].id.starts_with("file:attract.wav:"),
+            "{}",
+            choices[0].id
+        );
+        assert!(choices[0].usual);
+        let tmp = dir.path().join("tmp2");
+        let fin = capture::Finish::default();
+        let got = take(&t, &choices[0].id, None, 20, &fin, &tmp, &|| false).unwrap();
+        assert_eq!(got.pcm.samples.len(), f.pcm.samples.len());
+        assert!(take(&t, "file:gone.wav:1", None, 20, &fin, &tmp, &|| false).is_err());
     }
 
     #[test]
@@ -1570,9 +1700,16 @@ End Sub
             vpx_dirs: &[],
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &dir.path().join("tmp"), &|| false)
-            .found
-            .unwrap();
+        let f = find(
+            &t,
+            None,
+            20,
+            &capture::Finish::default(),
+            &dir.path().join("tmp"),
+            &|| false,
+        )
+        .found
+        .unwrap();
         assert!(f.what.contains("TableLoop"), "{}", f.what);
     }
 }

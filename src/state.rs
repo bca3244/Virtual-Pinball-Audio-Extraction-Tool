@@ -47,10 +47,10 @@ impl Cache {
     /// `clips\<rom>-<secs>s-v<n>` (no extension: the encoder adds it).
     /// The version keeps clips from an older recorder (which could save
     /// an idle sound board's static as music) from ever being reused.
-    pub fn clip_stem(&self, rom: &str, seconds: u32) -> PathBuf {
+    pub fn clip_stem(&self, rom: &str, seconds: u32, finish: &crate::capture::Finish) -> PathBuf {
         self.dir
             .join("clips")
-            .join(format!("{rom}-{seconds}s-v{CLIP_VERSION}"))
+            .join(format!("{rom}-{seconds}s-{}-v{CLIP_VERSION}", finish.tag()))
     }
 
     /// Forgets every cached clip of this ROM at this length, in any format
@@ -63,7 +63,7 @@ impl Cache {
         for e in dir.flatten() {
             let name = e.file_name().to_string_lossy().to_ascii_lowercase();
             let rest = name.strip_prefix(&prefix);
-            if rest.is_some_and(|r| r.starts_with('.') || r.starts_with("-v")) {
+            if rest.is_some_and(|r| r.starts_with('.') || r.starts_with('-')) {
                 if let Err(err) = std::fs::remove_file(e.path()) {
                     log::warn!("couldn't delete {}: {err}", e.path().display());
                 }
@@ -73,8 +73,14 @@ impl Cache {
 
     /// A clip of this ROM at this length in exactly this format. Files
     /// under 1 KB are leftovers of a failed encode, never a clip.
-    pub fn clip(&self, rom: &str, seconds: u32, ext: &str) -> Option<PathBuf> {
-        let p = self.clip_stem(rom, seconds).with_extension(ext);
+    pub fn clip(
+        &self,
+        rom: &str,
+        seconds: u32,
+        finish: &crate::capture::Finish,
+        ext: &str,
+    ) -> Option<PathBuf> {
+        let p = self.clip_stem(rom, seconds, finish).with_extension(ext);
         std::fs::metadata(&p)
             .is_ok_and(|m| m.is_file() && m.len() >= 1024)
             .then_some(p)
@@ -118,6 +124,165 @@ impl Cache {
     }
 }
 
+/// What was installed for a table, to tell later whether its source changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Installed {
+    /// [`record`]'s source id when it was installed.
+    pub source: String,
+    /// Size and modified time of the file installed: a file replaced by
+    /// hand since is left alone.
+    pub file: (u64, u64),
+}
+
+/// Size and modified time (seconds) of a file.
+pub fn stamp(p: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((m.len(), mtime))
+}
+
+impl Cache {
+    /// Per table: the same GameName under two emulators is two tables.
+    fn installed_file(&self, media_dir: &Path, game: &str) -> PathBuf {
+        let h: String = Sha1::digest(format!("{}\n{game}", media_dir.display()).as_bytes())
+            .iter()
+            .take(10)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        self.dir.join("installed").join(format!("{h}.txt"))
+    }
+
+    pub fn installed(&self, media_dir: &Path, game: &str) -> Option<Installed> {
+        let text = std::fs::read_to_string(self.installed_file(media_dir, game)).ok()?;
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+                .map(str::to_string)
+        };
+        Some(Installed {
+            source: get("source")?,
+            file: (get("size")?.parse().ok()?, get("mtime")?.parse().ok()?),
+        })
+    }
+
+    /// Remembers that `file` was installed for `game` from `source`.
+    pub fn set_installed(&self, media_dir: &Path, game: &str, source: &str, file: &Path) {
+        let Some((size, mtime)) = stamp(file) else {
+            return;
+        };
+        let p = self.installed_file(media_dir, game);
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&self.dir));
+        let line = |v: &str| v.replace(['\r', '\n'], " ");
+        if let Err(e) = std::fs::write(
+            &p,
+            format!(
+                "game={}\nsource={}\nsize={size}\nmtime={mtime}\n",
+                line(game),
+                line(source)
+            ),
+        ) {
+            log::warn!("{game}: couldn't remember what was installed: {e}");
+        }
+    }
+
+    fn pin_file(&self, media_dir: &Path, game: &str) -> PathBuf {
+        let mut p = self.installed_file(media_dir, game);
+        p.set_extension("pin");
+        p
+    }
+
+    /// The music source chosen by hand for a table ([`crate::sources::Choice::id`]).
+    pub fn pin(&self, media_dir: &Path, game: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.pin_file(media_dir, game)).ok()?;
+        let id = text.lines().find_map(|l| l.strip_prefix("source="))?;
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    /// Chooses a table's music source by hand, or (None) goes back to
+    /// finding it by itself.
+    pub fn set_pin(&self, media_dir: &Path, game: &str, id: Option<&str>) -> std::io::Result<()> {
+        let p = self.pin_file(media_dir, game);
+        match id {
+            Some(id) => {
+                std::fs::create_dir_all(p.parent().unwrap_or(&self.dir))?;
+                let line = |v: &str| v.replace(['\r', '\n'], " ");
+                std::fs::write(&p, format!("game={}\nsource={}\n", line(game), line(id)))
+            }
+            None => match std::fs::remove_file(&p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Whether `file` is a copy of a clip this tool made for `key` (a ROM or
+    /// table key), with any settings or recorder version.
+    pub fn is_clip_of(&self, key: &str, file: &Path) -> bool {
+        let Ok(len) = std::fs::metadata(file).map(|m| m.len()) else {
+            return false;
+        };
+        let Ok(dir) = std::fs::read_dir(self.dir.join("clips")) else {
+            return false;
+        };
+        let key = key.to_ascii_lowercase();
+        let mut bytes: Option<Vec<u8>> = None;
+        for e in dir.flatten() {
+            let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+            let ours = name
+                .strip_prefix(&key)
+                .is_some_and(|r| r.starts_with('-') || r.starts_with('.'));
+            if !ours || e.metadata().map(|m| m.len()).ok() != Some(len) {
+                continue;
+            }
+            let mine = match &bytes {
+                Some(b) => b,
+                None => match std::fs::read(file) {
+                    Ok(b) => bytes.insert(b),
+                    Err(_) => return false,
+                },
+            };
+            if std::fs::read(e.path()).is_ok_and(|c| &c == mine) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// A file's size and modified time as `size:mtime`, for a source id (no
+/// path: the same zip found through another folder is the same zip).
+pub fn stamp_id(p: &Path) -> String {
+    stamp(p).map_or_else(String::new, |(len, t)| format!("{len}:{t}"))
+}
+
+/// Whether two source ids (`kind:size:mtime[:rest]`) name the same files.
+/// Times may differ by a FAT file system's 2 s, or by exactly an hour (FAT
+/// keeps local time, so daylight saving moves it).
+pub fn same_source(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let split = |s: &str| -> Option<(String, String, u64, String)> {
+        let mut p = s.splitn(4, ':');
+        let kind = p.next()?.to_string();
+        let size = p.next()?.to_string();
+        let t = p.next()?.parse().ok()?;
+        Some((kind, size, t, p.next().unwrap_or_default().to_string()))
+    };
+    match (split(a), split(b)) {
+        (Some((k1, s1, t1, r1)), Some((k2, s2, t2, r2))) => {
+            let d = t1.abs_diff(t2);
+            k1 == k2 && s1 == s2 && r1 == r2 && (d <= 2 || d.abs_diff(3600) <= 2)
+        }
+        _ => false,
+    }
+}
+
 fn describe(p: &Path) -> String {
     match std::fs::metadata(p) {
         Ok(m) => {
@@ -142,7 +307,7 @@ const RECORDER_VERSION: u32 = 7;
 /// Bumped when clips recorded before it can't be trusted (v2: static
 /// from an idle sound board is no longer taken for music; v3: a short
 /// start jingle is no longer taken for the music).
-const CLIP_VERSION: u32 = 3;
+const CLIP_VERSION: u32 = 5;
 
 /// The cache name for music taken from a table's own files (no ROM, or a
 /// ROM zip missing): `vpx-<file stem>-<hash of its path>`.
@@ -237,9 +402,12 @@ mod tests {
         let clips = dir.path().join("clips");
         // A clip from before the static guard: never reused.
         std::fs::write(clips.join("diner_l4-30s.ogg"), [0u8; 2048]).unwrap();
-        assert!(c.clip("diner_l4", 30, "ogg").is_none());
+        assert!(c
+            .clip("diner_l4", 30, &crate::capture::Finish::default(), "ogg")
+            .is_none());
         std::fs::write(
-            c.clip_stem("diner_l4", 30).with_extension("mp3"),
+            c.clip_stem("diner_l4", 30, &crate::capture::Finish::default())
+                .with_extension("mp3"),
             [0u8; 2048],
         )
         .unwrap();
@@ -259,25 +427,76 @@ mod tests {
     fn clip_lookup_wants_the_format_and_a_real_file() {
         let dir = tempfile::tempdir().unwrap();
         let c = Cache::open(Some(dir.path())).unwrap();
-        assert!(c.clip("afm", 30, "mp3").is_none());
-        std::fs::write(c.clip_stem("afm", 30).with_extension("wav"), [0u8; 2048]).unwrap();
+        assert!(c
+            .clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+            .is_none());
+        std::fs::write(
+            c.clip_stem("afm", 30, &crate::capture::Finish::default())
+                .with_extension("wav"),
+            [0u8; 2048],
+        )
+        .unwrap();
         assert!(
-            c.clip("afm", 30, "mp3").is_none(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+                .is_none(),
             "a WAV doesn't stand in for an MP3"
         );
-        std::fs::write(c.clip_stem("afm", 30).with_extension("mp3"), b"x").unwrap();
+        std::fs::write(
+            c.clip_stem("afm", 30, &crate::capture::Finish::default())
+                .with_extension("mp3"),
+            b"x",
+        )
+        .unwrap();
         assert!(
-            c.clip("afm", 30, "mp3").is_none(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+                .is_none(),
             "an empty leftover isn't a clip"
         );
-        std::fs::write(c.clip_stem("afm", 30).with_extension("mp3"), [0u8; 2048]).unwrap();
+        std::fs::write(
+            c.clip_stem("afm", 30, &crate::capture::Finish::default())
+                .with_extension("mp3"),
+            [0u8; 2048],
+        )
+        .unwrap();
         assert_eq!(
-            c.clip("afm", 30, "mp3").unwrap().extension().unwrap(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+                .unwrap()
+                .extension()
+                .unwrap(),
             "mp3"
         );
         assert_eq!(
-            c.clip("afm", 30, "wav").unwrap().extension().unwrap(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "wav")
+                .unwrap()
+                .extension()
+                .unwrap(),
             "wav"
         );
+    }
+
+    #[test]
+    fn source_ids_allow_fat_time_shifts() {
+        use super::same_source;
+        assert!(same_source("rom:10:1000", "rom:10:1000"));
+        assert!(same_source("rom:10:1000", "rom:10:1002"));
+        assert!(same_source("rom:10:1000", "rom:10:4600"));
+        assert!(!same_source("rom:10:1000", "rom:10:2000"));
+        assert!(!same_source("rom:10:1000", "rom:11:1000"));
+        assert!(!same_source("table:10:1000:ab", "table:10:1000:cd"));
+        assert!(!same_source("rom:10:1000", "table:10:1000"));
+    }
+
+    #[test]
+    fn pins_are_per_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cache::open(Some(dir.path())).unwrap();
+        let (m1, m2) = (Path::new("C:/media/vpx"), Path::new("C:/media/fx3"));
+        assert_eq!(c.pin(m1, "Tron"), None);
+        c.set_pin(m1, "Tron", Some("file:theme.mp3:123")).unwrap();
+        assert_eq!(c.pin(m1, "Tron").as_deref(), Some("file:theme.mp3:123"));
+        assert_eq!(c.pin(m2, "Tron"), None);
+        c.set_pin(m1, "Tron", None).unwrap();
+        c.set_pin(m1, "Tron", None).unwrap();
+        assert_eq!(c.pin(m1, "Tron"), None);
     }
 }

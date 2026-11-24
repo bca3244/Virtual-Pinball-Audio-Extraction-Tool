@@ -57,9 +57,33 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
 /// Moves all of the game's Audio media into `batch` and notes where each
 /// file came from. Returns how many files were moved.
 pub fn remove_audio(media_dir: &Path, game_name: &str, batch: &Path) -> Result<usize> {
-    let files = popper::audio_files(media_dir, game_name);
+    set_aside(media_dir, game_name, batch).map(|m| m.len())
+}
+
+/// Like [`remove_audio`], returning what was moved (for [`put_back`]). If
+/// one file can't be moved, the ones before it go back: all or nothing.
+pub fn set_aside(media_dir: &Path, game_name: &str, batch: &Path) -> Result<Vec<Item>> {
+    set_aside_files(popper::audio_files(media_dir, game_name), game_name, batch)
+}
+
+/// [`set_aside`] for the `Game.<ext>` files only (what a new recording
+/// replaces), not numbered tracks like `Game01.mp3`.
+pub fn set_aside_plain(media_dir: &Path, game_name: &str, batch: &Path) -> Result<Vec<Item>> {
+    let lower = game_name.to_lowercase();
+    let files = popper::audio_files(media_dir, game_name)
+        .into_iter()
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.to_lowercase() == lower)
+        })
+        .collect();
+    set_aside_files(files, game_name, batch)
+}
+
+fn set_aside_files(files: Vec<PathBuf>, game_name: &str, batch: &Path) -> Result<Vec<Item>> {
     if files.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     std::fs::create_dir_all(batch).with_context(|| format!("creating {}", batch.display()))?;
     let mut manifest = std::fs::OpenOptions::new()
@@ -67,38 +91,72 @@ pub fn remove_audio(media_dir: &Path, game_name: &str, batch: &Path) -> Result<u
         .append(true)
         .open(batch.join(MANIFEST))
         .context("opening the restore list")?;
-    let mut moved = 0;
+    let mut moved: Vec<Item> = Vec::new();
     for f in files {
-        let name = f
-            .file_name()
-            .context("no file name")?
-            .to_string_lossy()
-            .into_owned();
-        // Two tables in one batch can have files of the same name (the same
-        // GameName under two emulators): number the later ones.
-        let mut stored = name.clone();
-        let mut n = 2;
-        while batch.join(&stored).exists() || stored == MANIFEST {
-            stored = format!("{n}-{name}");
-            n += 1;
+        let one = (|| -> Result<Item> {
+            let name = f
+                .file_name()
+                .context("no file name")?
+                .to_string_lossy()
+                .into_owned();
+            // Two tables in one batch can have files of the same name (the
+            // same GameName under two emulators): number the later ones.
+            let mut stored = name.clone();
+            let mut n = 2;
+            while batch.join(&stored).exists() || stored == MANIFEST {
+                stored = format!("{n}-{name}");
+                n += 1;
+            }
+            move_file(&f, &batch.join(&stored))?;
+            // A file in the batch with no line in the list would be lost:
+            // put it back if the line can't be written (one write, so lines
+            // from two threads can't interleave).
+            let line = format!("{game_name}\t{stored}\t{}\n", f.display());
+            if let Err(e) = manifest
+                .write_all(line.as_bytes())
+                .and_then(|()| manifest.flush())
+            {
+                let _ = move_file(&batch.join(&stored), &f);
+                return Err(anyhow::Error::from(e).context("writing the restore list"));
+            }
+            Ok(Item {
+                game: game_name.to_string(),
+                stored: batch.join(&stored),
+                original: f.clone(),
+            })
+        })();
+        match one {
+            Ok(item) => {
+                log::info!(
+                    "{game_name}: removed {} (kept in {})",
+                    f.display(),
+                    batch.display()
+                );
+                moved.push(item);
+            }
+            Err(e) => {
+                put_back(&moved);
+                return Err(e);
+            }
         }
-        move_file(&f, &batch.join(&stored))?;
-        // A file in the batch with no line in the list would be lost: put it
-        // back if the line can't be written.
-        if let Err(e) = writeln!(manifest, "{game_name}\t{stored}\t{}", f.display())
-            .and_then(|()| manifest.flush())
-        {
-            let _ = move_file(&batch.join(&stored), &f);
-            return Err(anyhow::Error::from(e).context("writing the restore list"));
-        }
-        log::info!(
-            "{game_name}: removed {} (kept in {})",
-            f.display(),
-            batch.display()
-        );
-        moved += 1;
     }
     Ok(moved)
+}
+
+/// Moves files [`set_aside`] moved back where they were (their lines in the
+/// restore list then name nothing, and are passed over).
+pub fn put_back(items: &[Item]) {
+    for i in items {
+        match move_file(&i.stored, &i.original) {
+            Ok(()) => log::info!("{}: put {} back", i.game, i.original.display()),
+            Err(e) => log::warn!(
+                "{}: couldn't put {} back (it's in {}): {e:#}",
+                i.game,
+                i.original.display(),
+                i.stored.display()
+            ),
+        }
+    }
 }
 
 pub struct Item {
@@ -145,6 +203,13 @@ fn read_batch(dir: &Path) -> Option<Batch> {
         })
         .filter(|i| i.stored.is_file())
         .collect::<Vec<_>>();
+    // A stored name used again after a put-back has two lines: the last
+    // one is the file there now.
+    let mut items = items;
+    items.reverse();
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|i| seen.insert(i.stored.clone()));
+    items.reverse();
     (!items.is_empty()).then(|| Batch {
         dir: dir.to_path_buf(),
         time,
@@ -294,5 +359,37 @@ mod tests {
         assert_eq!(remove_audio(dir.path(), "None", &batch).unwrap(), 0);
         assert!(!batch.exists());
         assert!(list(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn set_aside_then_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        let audio = media.join("Audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        std::fs::write(audio.join("Tron.mp3"), b"old").unwrap();
+        let batch = dir.path().join("batch");
+        let moved = set_aside(&media, "Tron", &batch).unwrap();
+        assert_eq!(moved.len(), 1);
+        assert!(!audio.join("Tron.mp3").exists());
+        put_back(&moved);
+        assert_eq!(std::fs::read(audio.join("Tron.mp3")).unwrap(), b"old");
+        // The batch's line names nothing now, so it isn't listed.
+        assert!(read_batch(&batch).is_none());
+    }
+
+    #[test]
+    fn set_aside_plain_keeps_numbered_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        let audio = media.join("Audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        for f in ["Tron.mp3", "Tron.ogg", "Tron01.mp3"] {
+            std::fs::write(audio.join(f), b"x").unwrap();
+        }
+        let moved = set_aside_plain(&media, "Tron", &dir.path().join("b")).unwrap();
+        assert_eq!(moved.len(), 2);
+        assert!(audio.join("Tron01.mp3").is_file());
+        assert!(!audio.join("Tron.mp3").exists());
     }
 }

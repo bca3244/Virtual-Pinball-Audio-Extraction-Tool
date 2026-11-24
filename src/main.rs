@@ -60,15 +60,29 @@ struct Common {
     /// Output format (scan uses it to find clips already recorded).
     #[arg(long, value_enum, default_value_t = encode::Format::Mp3)]
     format: encode::Format,
-    /// Clip length in seconds (5 to 60).
+    /// Clip length in seconds (5 to 120).
     #[arg(long, default_value_t = capture::DEFAULT_SECONDS)]
     seconds: u32,
+    /// Seconds of fade-in at the start of each clip (0 to 10).
+    #[arg(long, default_value_t = 0.0)]
+    fade_in: f64,
+    /// Seconds of fade-out at the end of each clip (0 to 10).
+    #[arg(long, default_value_t = 1.0)]
+    fade_out: f64,
+    /// Loudness to level each clip to, in LUFS (-40 to -6), or "off" to
+    /// normalise by peak instead.
+    #[arg(long, default_value = "-16", allow_hyphen_values = true, value_parser = capture::Finish::parse_lufs_arg)]
+    lufs: capture::Lufs,
     /// Replace existing Audio media (same file name and format).
     #[arg(long)]
     force: bool,
     /// Try ROMs again that gave nothing before, and re-record cached clips.
     #[arg(long)]
     retry: bool,
+    /// Also re-record tables whose audio this tool made, when their ROM zip
+    /// or table files changed since (the old file is kept under data\removed).
+    #[arg(long)]
+    changed: bool,
     /// Include tables hidden in Popper.
     #[arg(long)]
     include_hidden: bool,
@@ -84,6 +98,12 @@ impl Common {
     fn options(&self) -> record::Options {
         record::Options {
             seconds: capture::clamp_seconds(self.seconds),
+            finish: capture::Finish {
+                fade_in: self.fade_in,
+                fade_out: self.fade_out,
+                lufs: self.lufs.0,
+            }
+            .clamped(),
             format: self.format,
             force: self.force,
             retry: self.retry,
@@ -92,6 +112,7 @@ impl Common {
             extra_rom_dirs: self.rom_dirs.clone(),
             vpx_dir: self.vpx.clone(),
             popper_dir: None,
+            changed: self.changed,
         }
     }
 }
@@ -212,9 +233,9 @@ fn run(cli: Cli) -> Result<()> {
             let emus = db.emulators()?;
             drop(db);
             let dll = record::find_pinmame(pinmame_dll.as_deref(), &emus, opts.vpx_dir.as_deref());
-            let roms_to_record = entries
-                .iter()
-                .any(|e| matches!(e.status, record::Status::Todo) && !e.from_table());
+            let roms_to_record = entries.iter().any(|e| {
+                matches!(e.status, record::Status::Todo) && !e.from_table() && e.pin.is_none()
+            });
             match &dll {
                 Some(d) => log::info!("libpinmame: {}", d.display()),
                 None if roms_to_record => bail!(
@@ -238,6 +259,7 @@ fn run(cli: Cli) -> Result<()> {
                 parallel: parallel.unwrap_or_else(record::default_parallel).max(1),
                 cancel: None,
                 on_progress: None,
+                batch: Default::default(),
             };
             let s = runner.run(entries);
             log::info!(
@@ -279,4 +301,28 @@ fn print_plan(entries: &[record::Entry]) {
                 | record::Status::NoMediaDir
         )),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Cmd};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn command_line_parses() {
+        Cli::command().debug_assert();
+        for (args, want) in [
+            (vec!["x", "scan"], Some(-16.0)),
+            (vec!["x", "record", "--lufs", "-20"], Some(-20.0)),
+            (vec!["x", "record", "--lufs=-12", "--changed"], Some(-12.0)),
+            (vec!["x", "record", "--lufs", "off"], None),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let opts = match cli.command {
+                Cmd::Scan(c) | Cmd::Record { common: c, .. } => c.options(),
+                Cmd::Restore { .. } => unreachable!(),
+            };
+            assert_eq!(opts.finish.lufs, want, "{args:?}");
+        }
+    }
 }
