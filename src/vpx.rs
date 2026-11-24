@@ -105,16 +105,23 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
 /// The ROM the script loads: `Const cGameName = "afm_113b"` (the
 /// convention nearly every ROM table follows).
 pub fn rom_name(script: &str) -> Option<String> {
+    // `cGameName = "x"`, else a literal handed to the controller itself
+    // (`Controller.GameName = "x"`, or `.GameName = "x"` in a With block:
+    // Sharkey's Shootout).
+    assigned_name(script, "cgamename").or_else(|| assigned_name(script, ".gamename"))
+}
+
+fn assigned_name(script: &str, key: &str) -> Option<String> {
     for raw in script.lines() {
         let line = code(raw);
         if is_comment(line) {
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        let Some(at) = lower.find("cgamename") else {
+        let Some(at) = lower.find(key) else {
             continue;
         };
-        let rest = &line[at + "cgamename".len()..];
+        let rest = &line[at + key.len()..];
         let Some(rest) = rest.trim_start().strip_prefix('=') else {
             continue;
         };
@@ -827,6 +834,17 @@ pub fn start_switches(script: &str) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rom_name_from_controller_gamename() {
+        assert_eq!(rom_name("Const cGameName = \"tz_94h\"\n").as_deref(), Some("tz_94h"));
+        let s = "Sub Table1_Init\n vpmInit Me\n With Controller\n  .GameName = cGameName\n End With\n Controller.GameName=\"shrkysht\"\nEnd Sub\n";
+        assert_eq!(rom_name(s).as_deref(), Some("shrkysht"));
+        let w = "With Controller\n .GameName = \"afm_113b\"\nEnd With\n";
+        assert_eq!(rom_name(w).as_deref(), Some("afm_113b"));
+        let both = "Controller.GameName = \"x_1\"\nConst cGameName=\"y_2\"\n";
+        assert_eq!(rom_name(both).as_deref(), Some("y_2"));
+    }
 
     #[test]
     fn mech_scope_expressions_and_init_conditions() {
