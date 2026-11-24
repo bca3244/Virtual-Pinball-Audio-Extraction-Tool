@@ -94,6 +94,8 @@ struct Candidate {
     /// It belongs to the ROM (altsound, a PuP pack named after it), not
     /// to one table.
     rom_own: bool,
+    /// Held to [`UNTRUSTED_MIN_SECONDS`] even when trusted.
+    min_len: bool,
 }
 
 /// The table's music, if any of its sources has some.
@@ -114,23 +116,28 @@ pub fn find(
         return search;
     }
     let _ = std::fs::create_dir_all(tmp);
-    let mut tries = 0;
-    for c in &cands {
-        if cancelled() || tries >= MAX_TRIES {
+    // Failures count too: a pack of videos without sound mustn't run
+    // ffmpeg on every one of them.
+    for c in cands.iter().take(MAX_TRIES) {
+        if cancelled() {
             break;
         }
         let pcm = match decode(t.table, &c.src, ffmpeg, tmp, cancelled) {
             Ok(p) => p,
             Err(e) => {
                 log::info!("  {}: couldn't read it: {e:#}", c.what);
-                search.unread = true;
+                // A video may just have no sound: that's no reason to
+                // withhold the verdict, unless ffmpeg is missing.
+                let video = matches!(&c.src, Src::File(p) if is_video(p));
+                if !video || ffmpeg.is_none() {
+                    search.unread = true;
+                }
                 continue;
             }
         };
-        tries += 1;
         let frames = pcm.samples.len() as f64 / pcm.channels.max(1) as f64;
         let len = frames / pcm.rate.max(1) as f64;
-        if c.score < TRUSTED && len < UNTRUSTED_MIN_SECONDS {
+        if (c.score < TRUSTED || c.min_len) && len < UNTRUSTED_MIN_SECONDS {
             log::info!("  {}: only {len:.0} s long, passed over", c.what);
             continue;
         }
@@ -451,6 +458,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     score: 95 + if i < 3 { 3 - i as i32 } else { 0 },
                     size: s,
                     rom_own: true,
+                    min_len: false,
                 });
             }
         }
@@ -497,6 +505,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     src: Src::File(f),
                     size: s,
                     rom_own: false,
+min_len: false,
                 });
             }
             break;
@@ -537,6 +546,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             score,
             size: e.size,
             rom_own: false,
+min_len: false,
         });
     }
 
@@ -566,20 +576,17 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             };
             let rom_own = t.rom.is_some_and(|r| r.eq_ignore_ascii_case(&pack));
             // A music folder says what's in it: no name filter.
-            for (f, base) in pup_music(&dir) {
+            for pf in pup_music(&dir) {
+                let f = pf.path;
                 let s = size(&f);
+                let bonus = if pf.bonus { music_bonus(&file_name(&f)) } else { 0 };
                 push(Candidate {
                     what: format!("PuP pack music {}", f.display()),
-                    score: base
-                        + music_bonus(
-                            f.file_name()
-                                .map(|n| n.to_string_lossy())
-                                .as_deref()
-                                .unwrap_or(""),
-                        ),
+                    score: pf.score + bonus,
                     src: Src::File(f),
                     size: s,
                     rom_own,
+                    min_len: pf.min_len,
                 });
             }
         }
@@ -599,6 +606,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                 src: Src::File(f),
                 size: s,
                 rom_own: false,
+min_len: false,
             });
         }
     }
@@ -813,61 +821,100 @@ fn altsound_music(dir: &Path) -> Vec<PathBuf> {
 
 /// Audio in a PuP pack's music folders (their names say music, bgm or
 /// song), up to two levels down.
-fn pup_music(pack: &Path) -> Vec<(PathBuf, i32)> {
-    let mut out: Vec<(PathBuf, i32)> = Vec::new();
-    let mut add = |p: PathBuf, score: i32| {
-        if !out.iter().any(|(q, _)| *q == p) {
-            out.push((p, score));
+/// A file found in a PuP pack.
+struct PupFile {
+    path: PathBuf,
+    score: i32,
+    /// Whether the music-name bonus applies (audio files named by what they are).
+    bonus: bool,
+    /// Held to the untrusted minimum length even when trusted.
+    min_len: bool,
+}
+
+fn pup_music(pack: &Path) -> Vec<PupFile> {
+    let mut out: Vec<PupFile> = Vec::new();
+    let mut add = |f: PupFile| {
+        if !out.iter().any(|o| o.path == f.path) {
+            out.push(f);
         }
     };
-    // audiobg/audioattract: the background and attract playlists of
-    // many packs (audiocallouts and the like are speech).
-    let is_music = |n: &str| {
+    let has = |n: &str, list: &[&str]| {
         let n = n.to_ascii_lowercase();
-        [
-            "music",
-            "bgm",
-            "song",
-            "soundtrack",
-            "audiobg",
-            "attract",
-            "background",
-        ]
-        .iter()
-        .any(|w| n.contains(w))
+        list.iter().any(|w| n.contains(w))
     };
+    // Folders named as music: audio in any of them, video only in plain
+    // music folders (an attract or background video's sound is as often
+    // speech or nothing).
+    const MUSIC: &[&str] = &["music", "bgm", "song", "soundtrack"];
+    const LOOSE: &[&str] = &["audiobg", "attract", "background"];
     if let Ok(rd) = std::fs::read_dir(pack) {
         for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
-            if p.is_dir() && is_music(&name) && !is_callout(&name) {
-                for f in media_files(&p, 1) {
-                    let score = if is_audio(&f) { 80 } else { PUP_VIDEO };
-                    add(f, score);
+            if !p.is_dir() || speech_or_effects(&name) {
+                continue;
+            }
+            let (music, loose) = (has(&name, MUSIC), has(&name, LOOSE));
+            if !music && !loose {
+                continue;
+            }
+            for f in media_files(&p, 1) {
+                if is_audio(&f) {
+                    add(PupFile { path: f, score: 80, bonus: true, min_len: false });
+                } else if music {
+                    add(PupFile { path: f, score: PUP_VIDEO, bonus: false, min_len: false });
+                } else {
+                    add(PupFile { path: f, score: PUP_LOOSE_VIDEO, bonus: false, min_len: true });
                 }
             }
         }
     }
-    // The playlists the pack's triggers send to a music screen
-    // (screens.pup: "Music", "MusicVideos", or Active MusicOnly), such as
-    // music videos whose sound is the table's soundtrack.
-    for folder in pup_music_playlists(pack) {
-        if is_callout(&folder) {
+    // What the pack's triggers play on a music screen (screens.pup:
+    // "Music", "MusicVideos", or Active MusicOnly), such as music videos
+    // whose sound is the table's soundtrack. Packs also send callouts and
+    // effects there: those folders and names are left out, and what's left
+    // must be long enough to be music.
+    for (folder, file) in pup_music_playlists(pack) {
+        if speech_or_effects(&folder) || folder.contains("..") || folder.contains(':') {
             continue;
         }
-        if let Some(dir) = resolve(pack, &folder).filter(|d| d.is_dir()) {
-            for f in media_files(&dir, 0) {
-                add(f, PUP_VIDEO);
+        let Some(dir) = resolve(pack, &folder).filter(|d| d.is_dir()) else {
+            continue;
+        };
+        let files = match file.as_deref() {
+            Some(f) if !f.contains("..") && !f.contains(['\\', '/', ':']) => {
+                child_ci(&dir, f).filter(|p| p.is_file()).into_iter().collect()
             }
+            Some(_) => Vec::new(),
+            None => media_files(&dir, 0),
+        };
+        for f in files {
+            let n = file_name(&f);
+            if is_effect(&n) || is_callout(&n) || is_ambience(&n) {
+                continue;
+            }
+            add(PupFile { path: f, score: PUP_VIDEO, bonus: false, min_len: true });
         }
     }
     out
 }
 
-/// Score of a PuP file found through a music screen or a video in a music
-/// folder: below a pack's audio music folders, ordered by size among
-/// themselves (sound effects on a music screen are small).
+/// A PuP folder of speech or effects, by any part of its name
+/// (`TopperCallOut`, `audiocallouts`, `SFX`, `Sounds`).
+fn speech_or_effects(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["callout", "voice", "speech", "sfx", "sound", "effect", "quote"]
+        .iter()
+        .any(|w| n.contains(w))
+}
+
+/// Score of a PuP video in a music folder or a file played on a music
+/// screen: below a pack's audio music folders, ordered by size among
+/// themselves.
 const PUP_VIDEO: i32 = 78;
+/// A video in an attract or background folder: below a music-named sound
+/// stored in the table.
+const PUP_LOOSE_VIDEO: i32 = 62;
 
 const VIDEO_EXT: &[&str] = &["mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "f4v"];
 
@@ -936,8 +983,9 @@ fn pup_table(pack: &Path, file: &str) -> Vec<std::collections::HashMap<String, S
         .collect()
 }
 
-/// Playlist folders that active triggers play on a music screen.
-fn pup_music_playlists(pack: &Path) -> Vec<String> {
+/// Playlist folders (and the file, when the trigger names one) that
+/// active triggers play on a music screen.
+fn pup_music_playlists(pack: &Path) -> Vec<(String, Option<String>)> {
     let get = |r: &std::collections::HashMap<String, String>, k: &str| {
         r.get(k).cloned().unwrap_or_default()
     };
@@ -950,14 +998,19 @@ fn pup_music_playlists(pack: &Path) -> Vec<String> {
         .map(|r| get(r, "SCREENNUM"))
         .filter(|n| !n.is_empty())
         .collect();
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
     for r in pup_table(pack, "triggers.pup") {
         if get(&r, "ACTIVE") == "0" || !screens.contains(&get(&r, "SCREENNUM")) {
             continue;
         }
         let list = get(&r, "PLAYLIST");
-        if !list.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&list)) {
-            out.push(list);
+        let file = Some(get(&r, "PLAYFILE")).filter(|f| !f.is_empty());
+        if !list.is_empty()
+            && !out
+                .iter()
+                .any(|(l, f)| l.eq_ignore_ascii_case(&list) && *f == file)
+        {
+            out.push((list, file));
         }
     }
     out
@@ -1335,9 +1388,15 @@ End Sub
             std::fs::create_dir_all(dir.path().join(f)).unwrap();
             std::fs::write(dir.path().join(f).join(n), b"x").unwrap();
         }
-        let mut m: Vec<String> = pup_music(dir.path()).iter().map(|(p, _)| file_name(p)).collect();
+        std::fs::create_dir_all(dir.path().join("videoattract")).unwrap();
+        std::fs::write(dir.path().join("videoattract").join("attract.mp4"), b"x").unwrap();
+        let found = pup_music(dir.path());
+        let video = found.iter().find(|f| file_name(&f.path) == "attract.mp4").unwrap();
+        assert_eq!(video.score, PUP_LOOSE_VIDEO);
+        assert!(video.min_len && !video.bonus);
+        let mut m: Vec<String> = found.iter().map(|f| file_name(&f.path)).collect();
         m.sort();
-        assert_eq!(m, ["a.mp3", "b.mp3", "d.mp3"]);
+        assert_eq!(m, ["a.mp3", "attract.mp4", "b.mp3", "d.mp3"]);
     }
 
     #[test]
@@ -1372,9 +1431,9 @@ End Sub
              94,1,BallLost,E817,4,Sounds,thunder3.wav,100\n",
         )
         .unwrap();
-        let mut m: Vec<String> = pup_music(d).iter().map(|(p, _)| file_name(p)).collect();
+        let mut m: Vec<String> = pup_music(d).iter().map(|f| file_name(&f.path)).collect();
         m.sort();
-        assert_eq!(m, ["Faint.mp4", "InTheEnd.mp4", "thunder3.wav"]);
+        assert_eq!(m, ["Faint.mp4", "InTheEnd.mp4"]);
     }
 
     #[test]

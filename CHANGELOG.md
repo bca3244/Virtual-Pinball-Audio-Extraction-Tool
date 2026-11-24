@@ -2,6 +2,16 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0-beta.20
+
+Fixes from a code review of beta.15 to beta.19:
+- A table's own music, kept when its ROM gave none, is now found again on later runs. When every table on a ROM has its own music, the ROM is remembered as silent, so an old jingle of it can't come back over that music.
+- PuP videos count as music only in plain music folders or when played on a music screen. A video in an attract or background folder ranks below a music track stored in the table, and must be at least 20 s long.
+- On a PuP music screen, callout, voice, sound-effect and SFX folders are left out, a trigger that names one file adds only that file, and the result must be long enough to be music.
+- A file that can't be read counts toward the 8 tries per table, and a video with no sound no longer keeps a "no music" verdict from being remembered.
+- A ROM that PinMAME won't start also gets each table's own music.
+- The retry without the script's start switches is skipped when the script gives none, since it would just repeat an earlier try.
+
 ## 0.1.0-beta.19
 
 - A ROM that stays silent after Start is tried once more without the switches read from its script (trough, mechanism rests, init states), which can keep a game from starting when one is wrong for the ROM. Theatre of Magic starts and plays its music this way.

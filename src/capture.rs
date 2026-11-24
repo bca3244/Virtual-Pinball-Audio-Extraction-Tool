@@ -268,10 +268,6 @@ pub fn describe_after_start(
     )
 }
 
-/// The text an alphanumeric display shows (diagnostics). `kind` is the
-/// libpinmame display type; segment bits are a..g = 0..6 (g is the left
-/// middle on 16 segments), then comma 7, and on 16 segments i 8, j 9, k 10,
-/// right middle 11, m 12, n 13, o 14, period 15. None for a DMD or video.
 /// A DMD frame as text, one character per pixel: `#` bright, `+` mid,
 /// `.` dim, space dark (diagnostics).
 pub fn dmd_text(px: &[u8], width: usize, height: usize) -> String {
@@ -296,6 +292,10 @@ pub fn dmd_text(px: &[u8], width: usize, height: usize) -> String {
     out
 }
 
+/// The text an alphanumeric display shows (diagnostics). `kind` is the
+/// libpinmame display type; segment bits are a..g = 0..6 (g is the left
+/// middle on 16 segments), then comma 7, and on 16 segments i 8, j 9, k 10,
+/// right middle 11, m 12, n 13, o 14, period 15. None for a DMD or video.
 pub fn segment_text(kind: i32, cells: &[u16]) -> Option<String> {
     const SEG16: &[(char, &[u8])] = &[
         ('A', &[0, 1, 2, 4, 5, 6, 11]),

@@ -268,8 +268,13 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             out.push(entry);
             continue;
         };
+        // The table's own music, kept when its ROM gave none.
+        let own = table
+            .as_deref()
+            .and_then(|t| cache.clip(&state::table_key(t), opts.seconds, opts.format.ext()));
         if let Some(clip) = cache
             .clip(&rom, opts.seconds, opts.format.ext())
+            .or(own)
             .filter(|_| !opts.retry)
         {
             entry.status = Status::Cached(clip);
@@ -861,7 +866,15 @@ impl Runner<'_> {
                 }
             }
         }
-        if outcome == Outcome::Nothing && !self.cancelled() {
+        // Worth it only when the script gave switches to leave out.
+        let has_start_switches = job
+            .entries
+            .iter()
+            .filter_map(|e| e.table.as_deref())
+            .filter(|t| t.is_file())
+            .find_map(|t| vpx::read_script(t).ok())
+            .is_some_and(|s| !vpx::start_switches(&s).is_empty());
+        if outcome == Outcome::Nothing && has_start_switches && !self.cancelled() {
             // The switches read from the script (trough, mechanism rests,
             // the init sub's states) can also keep a game from starting
             // when one is wrong for the ROM (Theatre of Magic): once with
@@ -906,12 +919,24 @@ impl Runner<'_> {
         // Each table's own music (its PuP pack, say: The Beatles plays all
         // its music from one, over a ROM that stays silent), kept per
         // table, since many PuP tables share one ROM.
+        // A ROM PinMAME won't start (a missing parent set) says nothing
+        // of the tables' own music either.
         let mut rest = job.entries.clone();
-        if outcome == Outcome::Nothing && !self.cancelled() {
+        if matches!(outcome, Outcome::Nothing | Outcome::NotStarted) && !self.cancelled() {
             rest.retain(|e| !self.own_music(e, summary));
             if rest.is_empty() {
                 let _ = std::fs::remove_file(&best);
                 let _ = std::fs::remove_dir_all(&tmp);
+                // Every table has its own music now: the ROM still gave
+                // none, so a clip of it from an earlier run (a jingle)
+                // mustn't come back, and the next run needn't try it again.
+                if outcome == Outcome::Nothing {
+                    self.cache.remove_clips(&job.rom, self.opts.seconds);
+                    let why = "the ROM gave no music";
+                    if let Err(e) = self.cache.set_verdict(&job.rom, self.opts.seconds, &fp, why) {
+                        log::warn!("{}: couldn't remember the result: {e:#}", job.rom);
+                    }
+                }
                 return Outcome::Recorded;
             }
         }
