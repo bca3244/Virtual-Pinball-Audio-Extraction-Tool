@@ -2,6 +2,19 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.2
+
+An obvious way back to the ROM recording: the Music… window lists **ROM recording (automatic)** first (*Automatic* for tables without a ROM), and its *Use* installs it at once, keeping the chosen music for Restore…. Tables sent back with 0.3.1's *Automatic* offer it too. Tested on the cabinet with beta.2; no changes since.
+
+## 0.3.2-beta.2
+
+- Tables sent back with 0.3.1's *Automatic* (which kept the chosen file) offer *Use* on the ROM recording row too, instead of showing *In use*.
+- If Popper can't be read when that recording should start, a banner says so.
+
+## 0.3.2-beta.1
+
+- The Music… window lists **ROM recording (automatic)** as its first row (*Automatic* for tables without a ROM). Its *Use* goes back to it at once: the table is recorded again (or a clip already recorded is installed), its old audio kept for Restore…, and the choice forgotten. Before, *Automatic* only forgot the choice and left the chosen music in place. It also shows *In use* only when the audio really is the automatic one.
+
 ## 0.3.1
 
 - *Music…* is offered only for tables whose files hold music to choose from (or whose music was already chosen by hand, to go back to Automatic). The list looks through the table files in the background after it loads (about 45 s for 137 tables), and the log says how many have a choice; hovering a greyed-out button says why. The look pauses while recording.

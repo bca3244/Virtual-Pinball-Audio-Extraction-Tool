@@ -159,6 +159,9 @@ struct App {
     choices: Arc<Mutex<HashMap<Key, usize>>>,
     /// Bumped each scan, so an older count stops.
     choices_gen: Arc<AtomicUsize>,
+    /// A table sent back to its music found by itself (from Music…):
+    /// recorded again at once.
+    go_automatic: Option<Key>,
     /// Tables in the run going on.
     run_tables: usize,
     /// Closing was asked for while recording: asking whether to stop.
@@ -204,6 +207,7 @@ impl App {
             table_failed: false,
             choices: Default::default(),
             choices_gen: Default::default(),
+            go_automatic: None,
             run_tables: 0,
             ask_close: false,
             close_when_done: false,
@@ -290,11 +294,6 @@ impl App {
     }
 
     fn start_recording(&mut self, ctx: &egui::Context) {
-        // A playing file is held open: it couldn't be replaced or moved.
-        self.player.stop();
-        let Some(popper_dir) = self.popper_dir.clone() else {
-            return;
-        };
         let keys: HashSet<Key> = self
             .selected()
             .filter(|e| to_record(e, self.settings.replace))
@@ -304,9 +303,24 @@ impl App {
             self.notice = Some((false, "Nothing selected that can be recorded.".into()));
             return;
         }
+        self.record_tables(ctx, keys, self.settings.replace);
+    }
+
+    /// Records these tables; `replace`: also those with audio (kept for
+    /// Restore).
+    fn record_tables(&mut self, ctx: &egui::Context, keys: HashSet<Key>, replace: bool) {
+        // A playing file is held open: it couldn't be replaced or moved.
+        self.player.stop();
+        let Some(popper_dir) = self.popper_dir.clone() else {
+            self.notice = Some((
+                true,
+                "Popper's tables couldn't be read, so nothing was recorded.".into(),
+            ));
+            return;
+        };
         // Picking a table is asking for it: earlier "gave nothing" results
         // don't hold it back.
-        let opts = self.options(self.settings.replace, true);
+        let opts = self.options(replace, true);
         let settings = self.settings.clone();
         let cache_dir = self.cache.clone();
         let parallel = self.parallel;
@@ -1688,6 +1702,14 @@ impl eframe::App for App {
         self.dialogs(&ctx);
         self.restore_window(&ctx);
         self.picker_window(&ctx);
+        if let Some(k) = self.go_automatic.take() {
+            if !self.busy() {
+                self.record_tables(&ctx, HashSet::from([k]), true);
+            } else {
+                // The list is being read: once it's done.
+                self.go_automatic = Some(k);
+            }
+        }
         self.settings_window(&ctx);
         self.close_window(&ctx);
     }

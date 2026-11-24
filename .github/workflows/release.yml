@@ -7,7 +7,7 @@ name: Release
 # - when a tag like v0.1.0 is pushed (or a release is made on GitHub).
 on:
   push:
-    branches: [main, feat/music-button]
+    branches: [main, feat/rom-choice]
     tags: ["v*"]
 
 permissions:

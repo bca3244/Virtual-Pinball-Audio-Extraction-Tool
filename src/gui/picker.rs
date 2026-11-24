@@ -1,5 +1,6 @@
 //! The "Music…" window: choosing a table's music by hand.
 
+use crate::view::key;
 use crate::widgets::play_button;
 use crate::App;
 use eframe::egui;
@@ -24,6 +25,9 @@ pub struct Picker {
     pub closed: Arc<AtomicBool>,
     /// Audio replaced from this window goes into one Restore batch.
     pub batch: Arc<Mutex<Option<PathBuf>>>,
+    /// Its audio is a music file chosen by hand (now, or before the choice
+    /// was forgotten), not the ROM recording or the best source found.
+    pub picked_audio: bool,
 }
 
 #[derive(Default)]
@@ -44,6 +48,19 @@ pub struct PickState {
 impl App {
     pub(crate) fn open_picker(&mut self, entry: Entry) {
         self.player.stop();
+        let picked_audio = self
+            .rows
+            .iter()
+            .find(|r| key(&r.entry) == key(&entry))
+            .and_then(|r| r.installed.as_ref())
+            .is_some_and(|i| {
+                // 0.3.1's Automatic kept the chosen file but noted it as
+                // from the ROM: its what= still names the file.
+                i.source.starts_with("pick:")
+                    || (entry.rom_zip.is_some()
+                        && !i.what.is_empty()
+                        && i.what != record::ROM_RECORDING)
+            });
         // Previews from earlier windows (the player has let go of them; one
         // still being made fails harmlessly).
         let root = self.cache.join("preview");
@@ -71,6 +88,7 @@ impl App {
             preview_dir: root.join(nonce.to_string()),
             closed: Arc::new(AtomicBool::new(false)),
             batch: Arc::new(Mutex::new(None)),
+            picked_audio,
         });
     }
 
@@ -100,21 +118,34 @@ impl App {
             let working = st.working.is_some();
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let auto = st.pin.is_none();
+                // In use unless a file chosen by hand is what it has.
+                let in_use = st.pin.is_none() && !pk.picked_audio;
+                let rom = pk.entry.rom_zip.is_some();
+                let hover = if rom {
+                    "Install this table's ROM recording now (recorded again unless one with \
+                     these settings is kept; the audio it has is kept for Restore…). From then \
+                     on its music is found by itself."
+                } else {
+                    "Install the best music found in this table's files now (the audio it has is \
+                     kept for Restore…). From then on its music is found by itself."
+                };
                 if ui
                     .add_enabled(
-                        !working && !auto,
-                        egui::Button::new(if auto { "In use" } else { "Use" }),
+                        !working && !in_use,
+                        egui::Button::new(if in_use { "In use" } else { "Use" }),
                     )
-                    .on_hover_text(
-                        "Forget the choice: the next recording finds the music by itself \
-                         (the audio it has now stays)",
-                    )
+                    .on_hover_text(hover)
                     .clicked()
                 {
                     automatic = true;
                 }
-                ui.label("Automatic: the ROM recording, or the best source below");
+                if rom {
+                    ui.strong("ROM recording (automatic)");
+                    ui.weak("the table's own ROM; if it gives no music, the best source below");
+                } else {
+                    ui.strong("Automatic");
+                    ui.weak("the best music found below");
+                }
             });
             ui.separator();
             match &st.choices {
@@ -341,23 +372,37 @@ impl App {
         });
     }
 
+    /// Back to the music found by itself: the choice is forgotten and the
+    /// table recorded again at once (its audio kept for Restore).
     fn picker_automatic(&mut self) {
-        let Some(pk) = &mut self.picker else { return };
-        let mut st = pk.state.lock().unwrap_or_else(|e| e.into_inner());
-        match state::Cache::open(Some(&self.cache))
-            .and_then(|c| record::forget_choice(&c, &pk.entry, &pk.opts))
-        {
+        let Some(pk) = &self.picker else { return };
+        let r = pk
+            .entry
+            .emu
+            .media_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("its emulator has no media folder in Popper"))
+            .and_then(|media| {
+                state::Cache::open(Some(&self.cache))?
+                    .set_pin(media, &pk.entry.game.name, None)
+                    .map_err(anyhow::Error::from)
+            });
+        match r {
             Ok(()) => {
-                st.pin = None;
-                st.message = Some((
-                    false,
-                    "Its music is found by itself again from the next recording on (the audio \
-                     it has now stays)."
-                        .into(),
-                ));
-                self.pending_rescan.store(true, Ordering::SeqCst);
+                log::info!(
+                    "{}: back to its music found by itself",
+                    pk.entry.game.display
+                );
+                self.go_automatic = Some(key(&pk.entry));
+                self.player.stop();
+                if let Some(pk) = self.picker.take() {
+                    pk.closed.store(true, Ordering::SeqCst);
+                }
             }
-            Err(err) => st.message = Some((true, format!("Couldn't forget the choice: {err:#}"))),
+            Err(err) => {
+                pk.state.lock().unwrap_or_else(|e| e.into_inner()).message =
+                    Some((true, format!("Couldn't forget the choice: {err:#}")))
+            }
         }
     }
 }
