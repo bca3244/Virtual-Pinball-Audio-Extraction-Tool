@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.1.0
+
+First full release. On the cabinet it gave 136 of 137 tables their music: ROM recordings (with retries from the cabinet's nvram, Start pressed twice, without the script's start switches, and without the service key), and for tables whose ROM gives none, altsound, music the script plays, sounds stored in the table, and PuP pack music including music videos. The GUI lists every table with its ROM and lets you play, record and remove Audio media. Changes since beta.23: none.
+
 ## 0.1.0-beta.23
 
 - The ROM column also shows the ROM for tables that already have audio: their script is read for it when Popper's ROM field is empty (most tables), as it already was for tables without audio.
