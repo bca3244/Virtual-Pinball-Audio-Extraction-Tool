@@ -15,7 +15,9 @@ mod widgets;
 use applog::{init_log, log_lines, LOG};
 use picker::Picker;
 use settings::Settings;
-use view::{has_audio, key, replaces, to_record, Key};
+use view::{
+    has_audio, key, range_between, replaces, row_clip, sort_rows, to_record, Chip, Key, SortBy,
+};
 use widgets::{ago, path_label, play_button};
 
 use eframe::egui;
@@ -47,7 +49,7 @@ struct Job {
 }
 
 enum JobResult {
-    Scanned(anyhow::Result<(PathBuf, Vec<Entry>)>),
+    Scanned(anyhow::Result<(PathBuf, Vec<Entry>, Vec<popper::Emulator>)>),
     /// How it went, and whether it failed.
     Recorded(bool, String),
 }
@@ -79,6 +81,17 @@ struct App {
     /// Something changed a table's audio in the background: list the
     /// tables again as soon as nothing else is running.
     pending_rescan: Arc<AtomicBool>,
+    settings_open: bool,
+    /// Popper's emulators, from the last scan (to find libpinmame).
+    emus: Vec<popper::Emulator>,
+    /// The libpinmame recordings would use, found again when it changes.
+    dll_found: Option<PathBuf>,
+    chip: Chip,
+    sort: (SortBy, bool),
+    /// The row last clicked: the end of a Shift-click range, and what
+    /// Space plays.
+    last_clicked: Option<Key>,
+    focus_filter: bool,
 }
 
 impl App {
@@ -104,6 +117,13 @@ impl App {
             picker: None,
             notice: None,
             pending_rescan: Arc::new(AtomicBool::new(false)),
+            settings_open: false,
+            emus: Vec::new(),
+            dll_found: None,
+            chip: Chip::All,
+            sort: (SortBy::Title, true),
+            last_clicked: None,
+            focus_filter: false,
         };
         app.parallel = app
             .settings
@@ -151,7 +171,8 @@ impl App {
                 let dir = popper::find(popper.as_deref())?;
                 let db = popper::Db::open(&dir)?;
                 let cache = state::Cache::open(Some(&cache))?;
-                Ok((dir, record::plan(&db, &cache, &opts)?))
+                let emus = db.emulators()?;
+                Ok((dir, record::plan(&db, &cache, &opts)?, emus))
             })();
             *r.lock().unwrap_or_else(|e| e.into_inner()) = Some(JobResult::Scanned(scanned));
             ctx.request_repaint();
@@ -376,7 +397,9 @@ impl App {
         };
         self.job = None;
         match result {
-            JobResult::Scanned(Ok((dir, entries))) => {
+            JobResult::Scanned(Ok((dir, entries, emus))) => {
+                self.emus = emus;
+                self.find_dll();
                 let was: HashSet<Key> = self
                     .rows
                     .iter()
@@ -417,7 +440,45 @@ impl App {
         }
     }
 
+    /// Finds libpinmame again (after a scan, or when it's chosen).
+    fn find_dll(&mut self) {
+        self.dll_found = record::find_pinmame(self.settings.dll.as_deref(), &self.emus, None);
+    }
+
+    /// Whether any table would be recorded from its ROM (libpinmame is
+    /// needed only then).
+    fn needs_dll(&self) -> bool {
+        self.rows.iter().any(|r| r.entry.rom_zip.is_some())
+    }
+
+    /// What's wrong with libpinmame, if anything.
+    fn dll_problem(&self) -> Option<String> {
+        if let Some(p) = &self.settings.dll {
+            if !p.is_file() {
+                return Some(format!(
+                    "The chosen libpinmame isn't there: {}",
+                    p.display()
+                ));
+            }
+            let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            if name.is_some_and(|n| n.starts_with("vpinmame")) {
+                return Some(
+                    "That's VPinMAME, the COM server VPX tables use, not libpinmame. VPX 10.8.1+ ships libpinmame as plugins\\pinmame\\pinmame64.dll.".into(),
+                );
+            }
+        }
+        if self.dll_found.is_none() {
+            return Some(
+                "libpinmame not found. VPX 10.8.1+ ships it as plugins\\pinmame\\pinmame64.dll; otherwise choose a libpinmame build in Settings….".into(),
+            );
+        }
+        None
+    }
+
     fn visible(&self, e: &Entry) -> bool {
+        if !self.chip.matches(e) {
+            return false;
+        }
         let f = self.filter.trim().to_lowercase();
         f.is_empty()
             || e.game.display.to_lowercase().contains(&f)
@@ -436,37 +497,7 @@ impl App {
                 .add_enabled(!busy, egui::Button::new("Choose…"))
                 .clicked()
             {
-                if let Some(d) = rfd::FileDialog::new()
-                    .set_title("Popper's PinUPSystem folder")
-                    .pick_folder()
-                {
-                    // Saved once it reads (see poll_job).
-                    self.settings.popper = Some(d);
-                    self.rescan(ui.ctx());
-                }
-            }
-            ui.separator();
-            ui.label("libpinmame:");
-            path_label(ui, self.settings.dll.as_deref(), "automatic");
-            if ui
-                .add_enabled(!busy, egui::Button::new("libpinmame…"))
-                .clicked()
-            {
-                if let Some(f) = rfd::FileDialog::new()
-                    .add_filter("libpinmame", &["dll", "so", "dylib"])
-                    .pick_file()
-                {
-                    self.settings.dll = Some(f);
-                    self.settings.save(&self.cache);
-                }
-            }
-            if self.settings.dll.is_some()
-                && ui
-                    .add_enabled(!busy, egui::Button::new("Automatic"))
-                    .clicked()
-            {
-                self.settings.dll = None;
-                self.settings.save(&self.cache);
+                self.choose_popper(ui.ctx());
             }
             ui.separator();
             if ui.add_enabled(!busy, egui::Button::new("Rescan")).clicked() {
@@ -479,122 +510,216 @@ impl App {
             {
                 self.open_restore();
             }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Clip length:");
-            let mut changed = ui
-                .add_enabled(
-                    !busy,
-                    egui::Slider::new(
-                        &mut self.settings.seconds,
-                        capture::MIN_SECONDS..=capture::MAX_SECONDS,
-                    )
-                    .suffix(" s"),
-                )
-                .changed();
-            ui.label("Format:");
-            ui.add_enabled_ui(!busy, |ui| {
-                egui::ComboBox::from_id_salt("format")
-                    .selected_text(self.settings.format.ext())
-                    .show_ui(ui, |ui| {
-                        for f in [Format::Mp3, Format::Ogg, Format::Wav] {
-                            changed |= ui
-                                .selectable_value(&mut self.settings.format, f, f.ext())
-                                .changed();
-                        }
-                    });
-            });
-            ui.add_enabled(
-                !busy,
-                egui::Checkbox::new(&mut self.settings.replace, "Replace existing audio"),
-            )
-            .on_hover_text(
-                "Re-record selected tables that already have Audio media (asks first; \
-                     not remembered next time)",
-            );
-            ui.label("At once:");
             if ui
-                .add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.parallel).range(1..=record::max_parallel()),
-                )
-                .on_hover_text(
-                    "Recordings run in real time, about one CPU core each. Going past your \
-                     core count makes them fall behind and the music comes out wrong.",
-                )
-                .changed()
+                .add_enabled(!busy, egui::Button::new("Settings…"))
+                .on_hover_text("libpinmame, clip length, format, loudness and fades")
+                .clicked()
             {
-                self.settings.parallel = Some(self.parallel);
-                changed = true;
+                self.settings_open = true;
             }
-            if changed {
-                self.settings.save(&self.cache);
+            ui.separator();
+            let s = &self.settings;
+            ui.weak(format!(
+                "{} s {} · {}",
+                s.seconds,
+                s.format.ext(),
+                if s.level {
+                    format!("{} LUFS", s.lufs)
+                } else {
+                    "peak".into()
+                }
+            ));
+            if self.needs_dll() {
+                if let Some(p) = self.dll_problem() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 70), "libpinmame not found")
+                        .on_hover_text(p);
+                }
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            let mut changed = false;
-            ui.label("Fade in:");
-            changed |= ui
-                .add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.settings.fade_in)
-                        .range(0.0..=capture::MAX_FADE)
-                        .speed(0.1)
+    }
+
+    fn choose_popper(&mut self, ctx: &egui::Context) {
+        if let Some(d) = rfd::FileDialog::new()
+            .set_title("Popper's PinUPSystem folder")
+            .pick_folder()
+        {
+            // Saved once it reads (see poll_job).
+            self.settings.popper = Some(d);
+            self.rescan(ctx);
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let busy = self.busy();
+        let mut changed = false;
+        let mut dll_changed = false;
+        let width = (ctx.content_rect().width() - 48.0).clamp(280.0, 560.0);
+        let modal = egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
+            ui.set_width(width);
+            ui.heading("Settings");
+            ui.add_space(4.0);
+            ui.strong("libpinmame");
+            ui.horizontal_wrapped(|ui| {
+                path_label(
+                    ui,
+                    self.dll_found.as_deref().or(self.settings.dll.as_deref()),
+                    "not found",
+                );
+                if self.settings.dll.is_none() {
+                    ui.weak("(found by itself)");
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Choose…"))
+                    .clicked()
+                {
+                    if let Some(f) = rfd::FileDialog::new()
+                        .set_title("libpinmame (e.g. VPX's plugins\\pinmame\\pinmame64.dll)")
+                        .add_filter("libpinmame", &["dll", "so", "dylib"])
+                        .pick_file()
+                    {
+                        self.settings.dll = Some(f);
+                        dll_changed = true;
+                    }
+                }
+                if self.settings.dll.is_some()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Automatic"))
+                        .clicked()
+                {
+                    self.settings.dll = None;
+                    dll_changed = true;
+                }
+            });
+            if let Some(p) = self.dll_problem() {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 70), p);
+            }
+            ui.separator();
+            ui.strong("Clips");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Clip length:");
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::Slider::new(
+                            &mut self.settings.seconds,
+                            capture::MIN_SECONDS..=capture::MAX_SECONDS,
+                        )
                         .suffix(" s"),
-                )
-                .on_hover_text(
-                    "Seconds the music takes to rise at the start of each clip (0: none)",
-                )
-                .changed();
-            ui.label("Fade out:");
-            changed |= ui
-                .add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.settings.fade_out)
-                        .range(0.0..=capture::MAX_FADE)
-                        .speed(0.1)
-                        .suffix(" s"),
-                )
-                .on_hover_text("Seconds the music takes to fade away at the end of each clip")
-                .changed();
-            changed |= ui
-                .add_enabled(
-                    !busy,
-                    egui::Checkbox::new(&mut self.settings.level, "Even loudness"),
-                )
-                .on_hover_text(
-                    "Level every clip to the same loudness (EBU R128) with a limiter, \
+                    )
+                    .changed();
+                ui.label("Format:");
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("format")
+                        .selected_text(self.settings.format.ext())
+                        .show_ui(ui, |ui| {
+                            for f in [Format::Mp3, Format::Ogg, Format::Wav] {
+                                changed |= ui
+                                    .selectable_value(&mut self.settings.format, f, f.ext())
+                                    .changed();
+                            }
+                        });
+                });
+                ui.label("At once:");
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut self.parallel).range(1..=record::max_parallel()),
+                    )
+                    .on_hover_text(
+                        "Recordings run in real time, about one CPU core each. Going past your \
+                     core count makes them fall behind and the music comes out wrong.",
+                    )
+                    .changed()
+                {
+                    self.settings.parallel = Some(self.parallel);
+                    changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Fade in:");
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut self.settings.fade_in)
+                            .range(0.0..=capture::MAX_FADE)
+                            .speed(0.1)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text(
+                        "Seconds the music takes to rise at the start of each clip (0: none)",
+                    )
+                    .changed();
+                ui.label("Fade out:");
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut self.settings.fade_out)
+                            .range(0.0..=capture::MAX_FADE)
+                            .speed(0.1)
+                            .suffix(" s"),
+                    )
+                    .on_hover_text("Seconds the music takes to fade away at the end of each clip")
+                    .changed();
+                changed |= ui
+                    .add_enabled(
+                        !busy,
+                        egui::Checkbox::new(&mut self.settings.level, "Even loudness"),
+                    )
+                    .on_hover_text(
+                        "Level every clip to the same loudness (EBU R128) with a limiter, \
                      instead of only by its loudest peak",
-                )
-                .changed();
-            changed |= ui
-                .add_enabled(
-                    !busy && self.settings.level,
-                    egui::DragValue::new(&mut self.settings.lufs)
-                        .range(-40.0..=-6.0)
-                        .speed(0.5)
-                        .suffix(" LUFS"),
-                )
-                .on_hover_text(
-                    "How loud every clip is made. -16 is typical for music players; \
+                    )
+                    .changed();
+                changed |= ui
+                    .add_enabled(
+                        !busy && self.settings.level,
+                        egui::DragValue::new(&mut self.settings.lufs)
+                            .range(-40.0..=-6.0)
+                            .speed(0.5)
+                            .suffix(" LUFS"),
+                    )
+                    .on_hover_text(
+                        "How loud every clip is made. -16 is typical for music players; \
                      closer to 0 is louder, -23 is broadcast level.",
-                )
-                .changed();
-            if changed {
-                self.settings.save(&self.cache);
+                    )
+                    .changed();
+            });
+            ui.add_space(6.0);
+            if ui.button("Close").clicked() {
+                self.settings_open = false;
             }
         });
+        if modal.should_close() {
+            self.settings_open = false;
+        }
+        if dll_changed {
+            self.find_dll();
+            changed = true;
+        }
+        if changed {
+            self.settings.save(&self.cache);
+        }
     }
 
     fn selection_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("table or ROM")
-                    .desired_width(180.0),
-            );
+            let f = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("table or ROM (Ctrl+F)")
+                        .desired_width(180.0),
+                );
+            if std::mem::take(&mut self.focus_filter) {
+                f.request_focus();
+            }
+            if !self.filter.is_empty() && ui.small_button("✕").on_hover_text("Clear the filter").clicked() {
+                self.filter.clear();
+            }
             ui.separator();
             if ui
                 .add_enabled(!busy, egui::Button::new("Select all"))
@@ -643,6 +768,14 @@ impl App {
                 ui.label(format!("{n} selected"));
             }
             ui.separator();
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut self.settings.replace, "Replace existing audio"),
+            )
+            .on_hover_text(
+                "Re-record selected tables that already have Audio media (asks first; \
+                 not remembered next time)",
+            );
             if ui
                 .add_enabled(
                     !busy && to_record > 0,
@@ -699,14 +832,35 @@ impl App {
         });
     }
 
-    fn table(&mut self, ui: &mut egui::Ui) {
-        if let Some(e) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 70), e);
-            return;
-        }
-        let shown: Vec<usize> = (0..self.rows.len())
+    /// The rows shown, in order (filter, chip and sort applied).
+    fn shown(&self) -> Vec<usize> {
+        let mut shown: Vec<usize> = (0..self.rows.len())
             .filter(|&i| self.visible(&self.rows[i].entry))
             .collect();
+        let entries: Vec<&Entry> = self.rows.iter().map(|r| &r.entry).collect();
+        sort_rows(&entries, &mut shown, self.sort.0, self.sort.1);
+        shown
+    }
+
+    fn table(&mut self, ui: &mut egui::Ui) {
+        if let Some(e) = self.error.clone() {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 70), e);
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Choose Popper folder…"))
+                .on_hover_text("Popper's PinUPSystem folder, the one with PUPDatabase.db")
+                .clicked()
+            {
+                self.choose_popper(ui.ctx());
+            }
+            return;
+        }
+        let shown = self.shown();
+        let shown_keys: Vec<Key> = shown.iter().map(|&i| key(&self.rows[i].entry)).collect();
+        let mut sort = self.sort;
+        let last = self.last_clicked.clone();
+        let mut clicked: Option<(Key, bool)> = None;
+        let shift = ui.input(|i| i.modifiers.shift);
         let busy = self.busy();
         let height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let mut pick: Option<Entry> = None;
@@ -728,21 +882,41 @@ impl App {
             .column(Column::remainder().clip(true))
             .header(height, |mut h| {
                 h.col(|_| {});
-                h.col(|ui| {
-                    ui.strong("Table");
-                });
-                h.col(|ui| {
-                    ui.strong("ROM");
-                });
-                h.col(|ui| {
-                    ui.strong("Audio");
-                });
+                let mut head = |h: &mut egui_extras::TableRow, label: &str, by: SortBy| {
+                    h.col(|ui| {
+                        let arrow = match sort {
+                            (b, true) if b == by => " ↑",
+                            (b, false) if b == by => " ↓",
+                            _ => "",
+                        };
+                        if ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(format!("{label}{arrow}")).strong())
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Sort by this column (click again to reverse)")
+                            .clicked()
+                        {
+                            sort = if sort.0 == by { (by, !sort.1) } else { (by, true) };
+                        }
+                    });
+                };
+                head(&mut h, "Table", SortBy::Title);
+                head(&mut h, "ROM", SortBy::Rom);
+                head(&mut h, "Audio", SortBy::Status);
             })
             .body(|body| {
                 body.rows(height, shown.len(), |mut row| {
                     let r = &mut rows[shown[row.index()]];
+                    let k = key(&r.entry);
+                    row.set_selected(last.as_ref() == Some(&k));
                     row.col(|ui| {
-                        ui.add_enabled(!busy, egui::Checkbox::without_text(&mut r.selected));
+                        if ui
+                            .add_enabled(!busy, egui::Checkbox::without_text(&mut r.selected))
+                            .clicked()
+                        {
+                            clicked = Some((k.clone(), shift));
+                        }
                     });
                     row.col(|ui| {
                         let l = ui.add(
@@ -752,8 +926,12 @@ impl App {
                         );
                         if l.clicked() && !busy {
                             r.selected = !r.selected;
+                            clicked = Some((k.clone(), shift));
                         }
-                        l.on_hover_text(&r.entry.game.name);
+                        l.on_hover_text(format!(
+                            "{}\nGameName: {}\nShift-click selects a range; Space plays the highlighted row",
+                            r.entry.game.display, r.entry.game.name
+                        ));
                     });
                     row.col(|ui| {
                         ui.monospace(r.entry.rom.as_deref().unwrap_or("–"));
@@ -791,13 +969,7 @@ impl App {
                             ),
                             s => (ui.visuals().weak_text_color(), record::describe(s)),
                         };
-                        let clip = match &r.entry.status {
-                            Status::HasAudio(p) => Some(p),
-                            _ if r.entry.existing.is_some() => r.entry.existing.as_ref(),
-                            Status::Cached(p) => Some(p),
-                            _ => None,
-                        };
-                        if let Some(p) = clip {
+                        if let Some(p) = row_clip(&r.entry) {
                             let on = playing.as_deref() == Some(p.as_path());
                             let b = play_button(ui, on, !busy || on).on_hover_text(if on {
                                 "Stop"
@@ -831,8 +1003,70 @@ impl App {
                     });
                 });
             });
+        self.sort = sort;
+        if let Some((k, shift)) = clicked {
+            // Shift: every row between the last one clicked and this one
+            // takes this one's tick.
+            if let (true, Some(from)) = (shift, self.last_clicked.clone()) {
+                let on = self
+                    .rows
+                    .iter()
+                    .find(|r| key(&r.entry) == k)
+                    .is_some_and(|r| r.selected);
+                let range: HashSet<Key> =
+                    range_between(&shown_keys, &from, &k).into_iter().collect();
+                for r in &mut self.rows {
+                    if range.contains(&key(&r.entry)) {
+                        r.selected = on;
+                    }
+                }
+            }
+            self.last_clicked = Some(k);
+        }
         if let Some(e) = pick {
             self.open_picker(e);
+        }
+    }
+
+    /// Keyboard shortcuts for the main window (not while a dialog is open
+    /// or a text box has the keyboard).
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let dialog = self.confirm != Confirm::None
+            || self.restore_open
+            || self.picker.is_some()
+            || self.settings_open;
+        if dialog {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.focus_filter = true;
+        }
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if !self.filter.is_empty() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.filter.clear();
+        }
+        if !self.busy() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+        {
+            let shown: HashSet<usize> = self.shown().into_iter().collect();
+            for (i, r) in self.rows.iter_mut().enumerate() {
+                if shown.contains(&i) {
+                    r.selected = true;
+                }
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            let clip = self.last_clicked.as_ref().and_then(|k| {
+                self.rows
+                    .iter()
+                    .find(|r| &key(&r.entry) == k)
+                    .and_then(|r| row_clip(&r.entry).cloned())
+            });
+            let playing = self.player.playing().map(Path::to_path_buf);
+            if let Some(p) = clip.filter(|p| !self.busy() || playing.as_ref() == Some(p)) {
+                self.player.toggle(&p);
+            }
         }
     }
 
@@ -909,7 +1143,12 @@ impl App {
                 if ui.button(egui::RichText::new(label).color(egui::Color32::from_rgb(220, 80, 70))).clicked() {
                     go = true;
                 }
-                if ui.button("Cancel").clicked() {
+                let cancel = ui.button("Cancel");
+                // Enter or Space presses Cancel, not the red button.
+                if ui.memory(|m| m.focused().is_none()) {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
                     close = true;
                 }
             });
@@ -939,6 +1178,7 @@ impl eframe::App for App {
         if self.busy() || self.picker.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+        self.shortcuts(&ctx);
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
@@ -954,14 +1194,25 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.toggle_value(&mut self.show_log, "Log");
-                    let counts =
-                        |f: fn(&Entry) -> bool| self.rows.iter().filter(|r| f(&r.entry)).count();
-                    ui.label(format!(
-                        "{} tables · {} with audio · {} can be recorded",
-                        self.rows.len(),
-                        counts(has_audio),
-                        counts(|e| matches!(e.status, Status::Todo | Status::Cached(_)))
-                    ));
+                    ui.separator();
+                    for c in Chip::ALL {
+                        let n = self.rows.iter().filter(|r| c.matches(&r.entry)).count();
+                        if c != Chip::All && n == 0 && self.chip != c {
+                            continue;
+                        }
+                        if ui
+                            .selectable_label(self.chip == c, format!("{} {n}", c.label()))
+                            .on_hover_text(c.hover())
+                            .clicked()
+                        {
+                            self.chip = c;
+                        }
+                    }
+                    let shown = self.rows.iter().filter(|r| self.visible(&r.entry)).count();
+                    if shown < self.rows.len() {
+                        ui.separator();
+                        ui.weak(format!("showing {shown} of {}", self.rows.len()));
+                    }
                 });
                 if self.show_log {
                     egui::ScrollArea::vertical()
@@ -978,6 +1229,7 @@ impl eframe::App for App {
         self.dialogs(&ctx);
         self.restore_window(&ctx);
         self.picker_window(&ctx);
+        self.settings_window(&ctx);
     }
 }
 

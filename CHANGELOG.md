@@ -2,6 +2,16 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.0-beta.1
+
+GUI:
+- Chips under the list show one kind of table at a time (*Has audio*, *Missing*, *Changed*, *No music last time*, *Can't record*), with counts and "showing X of Y".
+- Click a column header to sort by title, ROM or status.
+- The options moved into *Settings…*; the toolbar keeps the Popper folder, Rescan, Restore… and a short summary of the settings. *Replace existing audio* sits next to Record.
+- The toolbar warns when libpinmame can't be found (or the chosen file is VPinMAME's), and Settings shows the DLL it found.
+- When Popper can't be read, the list says why and offers *Choose Popper folder…*.
+- Keyboard: Ctrl+F filter, Esc clears it, Ctrl+A ticks the rows shown, Shift-click ticks a range, Space plays or stops the last row clicked. Confirm dialogs focus Cancel.
+
 ## 0.2.0
 
 Every clip at an even loudness (EBU R128, -16 LUFS, true peak under -1 dBTP), with fades and lengths up to 120 s. Tables whose ROM or table changed since their audio was made can be recorded again (`--changed`, or in the GUI). Each table's music can be chosen by hand in the GUI (*Music…*). The GUI shows results in a banner and only acts on the rows shown. Changes since beta.4, from the final review:
