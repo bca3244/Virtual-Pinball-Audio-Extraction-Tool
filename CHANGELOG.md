@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.3.2
+
+An obvious way back to the ROM recording: the Music… window lists **ROM recording (automatic)** first (*Automatic* for tables without a ROM), and its *Use* installs it at once, keeping the chosen music for Restore…. Tables sent back with 0.3.1's *Automatic* offer it too. Tested on the cabinet with beta.2; no changes since.
+
 ## 0.3.2-beta.2
 
 - Tables sent back with 0.3.1's *Automatic* (which kept the chosen file) offer *Use* on the ROM recording row too, instead of showing *In use*.
