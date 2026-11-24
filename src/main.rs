@@ -71,8 +71,8 @@ struct Common {
     fade_out: f64,
     /// Loudness to level each clip to, in LUFS (-40 to -6), or "off" to
     /// normalise by peak instead.
-    #[arg(long, default_value = "-16", value_parser = capture::Finish::parse_lufs)]
-    lufs: Option<f64>,
+    #[arg(long, default_value = "-16", allow_hyphen_values = true, value_parser = capture::Finish::parse_lufs_arg)]
+    lufs: capture::Lufs,
     /// Replace existing Audio media (same file name and format).
     #[arg(long)]
     force: bool,
@@ -97,7 +97,7 @@ impl Common {
             finish: capture::Finish {
                 fade_in: self.fade_in,
                 fade_out: self.fade_out,
-                lufs: self.lufs,
+                lufs: self.lufs.0,
             }
             .clamped(),
             format: self.format,
@@ -295,4 +295,28 @@ fn print_plan(entries: &[record::Entry]) {
                 | record::Status::NoMediaDir
         )),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Cmd};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn command_line_parses() {
+        Cli::command().debug_assert();
+        for (args, want) in [
+            (vec!["x", "scan"], Some(-16.0)),
+            (vec!["x", "record", "--lufs", "-20"], Some(-20.0)),
+            (vec!["x", "record", "--lufs=-12"], Some(-12.0)),
+            (vec!["x", "record", "--lufs", "off"], None),
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let opts = match cli.command {
+                Cmd::Scan(c) | Cmd::Record { common: c, .. } => c.options(),
+                Cmd::Restore { .. } => unreachable!(),
+            };
+            assert_eq!(opts.finish.lufs, want, "{args:?}");
+        }
+    }
 }

@@ -35,8 +35,8 @@ struct WorkerCli {
     #[arg(long, default_value_t = 1.0)]
     fade_out: f64,
     /// Loudness target, or "off" for peak normalisation.
-    #[arg(long, default_value = "-16", value_parser = capture::Finish::parse_lufs)]
-    lufs: Option<f64>,
+    #[arg(long, default_value = "-16", allow_hyphen_values = true, value_parser = capture::Finish::parse_lufs_arg)]
+    lufs: capture::Lufs,
     #[arg(long)]
     dll: PathBuf,
     #[arg(long = "rom-dir")]
@@ -100,7 +100,7 @@ pub fn run_worker_if_requested() {
         finish: capture::Finish {
             fade_in: w.fade_in,
             fade_out: w.fade_out,
-            lufs: w.lufs,
+            lufs: w.lufs.0,
         }
         .clamped(),
         dll: w.dll,
@@ -146,4 +146,36 @@ pub fn run_worker_if_requested() {
             .collect(),
     };
     record::terminate(record::worker_main(&a));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerCli;
+    use clap::Parser;
+
+    #[test]
+    fn worker_reads_every_loudness_form() {
+        let base = [
+            "--rom",
+            "afm",
+            "--scratch",
+            "s",
+            "--out",
+            "o",
+            "--seconds",
+            "30",
+            "--dll",
+            "d",
+        ];
+        for (arg, want) in [
+            (None, Some(-16.0)),
+            (Some(["--lufs", "-14"]), Some(-14.0)),
+            (Some(["--lufs", "off"]), None),
+        ] {
+            let mut v: Vec<&str> = base.to_vec();
+            v.extend(arg.into_iter().flatten());
+            let w = WorkerCli::try_parse_from(v).unwrap();
+            assert_eq!(w.lufs.0, want);
+        }
+    }
 }

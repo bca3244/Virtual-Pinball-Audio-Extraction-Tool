@@ -496,7 +496,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
                     score: 100 + music_bonus(&name) + order - if is_effect(&name) { 40 } else { 0 },
                     src: Src::File(f),
                     size: s,
-                min_len: false,
+                    min_len: false,
                 });
             }
             break;
@@ -536,7 +536,7 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             },
             score,
             size: e.size,
-                min_len: false,
+            min_len: false,
         });
     }
 
@@ -568,7 +568,11 @@ fn candidates(t: &Table) -> Vec<Candidate> {
             for pf in pup_music(&dir) {
                 let f = pf.path;
                 let s = size(&f);
-                let bonus = if pf.bonus { music_bonus(&file_name(&f)) } else { 0 };
+                let bonus = if pf.bonus {
+                    music_bonus(&file_name(&f))
+                } else {
+                    0
+                };
                 push(Candidate {
                     what: format!("PuP pack music {}", f.display()),
                     score: pf.score + bonus,
@@ -829,11 +833,26 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
             }
             for f in media_files(&p, 1) {
                 if is_audio(&f) {
-                    add(PupFile { path: f, score: 80, bonus: true, min_len: false });
+                    add(PupFile {
+                        path: f,
+                        score: 80,
+                        bonus: true,
+                        min_len: false,
+                    });
                 } else if music {
-                    add(PupFile { path: f, score: PUP_VIDEO, bonus: false, min_len: false });
+                    add(PupFile {
+                        path: f,
+                        score: PUP_VIDEO,
+                        bonus: false,
+                        min_len: false,
+                    });
                 } else {
-                    add(PupFile { path: f, score: PUP_LOOSE_VIDEO, bonus: false, min_len: true });
+                    add(PupFile {
+                        path: f,
+                        score: PUP_LOOSE_VIDEO,
+                        bonus: false,
+                        min_len: true,
+                    });
                 }
             }
         }
@@ -851,9 +870,10 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
             continue;
         };
         let files = match file.as_deref() {
-            Some(f) if !f.contains("..") && !f.contains(['\\', '/', ':']) => {
-                child_ci(&dir, f).filter(|p| p.is_file()).into_iter().collect()
-            }
+            Some(f) if !f.contains("..") && !f.contains(['\\', '/', ':']) => child_ci(&dir, f)
+                .filter(|p| p.is_file())
+                .into_iter()
+                .collect(),
             Some(_) => Vec::new(),
             None => media_files(&dir, 0),
         };
@@ -862,7 +882,12 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
             if is_effect(&n) || is_callout(&n) || is_ambience(&n) {
                 continue;
             }
-            add(PupFile { path: f, score: PUP_VIDEO, bonus: false, min_len: true });
+            add(PupFile {
+                path: f,
+                score: PUP_VIDEO,
+                bonus: false,
+                min_len: true,
+            });
         }
     }
     out
@@ -872,9 +897,11 @@ fn pup_music(pack: &Path) -> Vec<PupFile> {
 /// (`TopperCallOut`, `audiocallouts`, `SFX`, `Sounds`).
 fn speech_or_effects(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["callout", "voice", "speech", "sfx", "sound", "effect", "quote"]
-        .iter()
-        .any(|w| n.contains(w))
+    [
+        "callout", "voice", "speech", "sfx", "sound", "effect", "quote",
+    ]
+    .iter()
+    .any(|w| n.contains(w))
 }
 
 /// Score of a PuP video in a music folder or a file played on a music
@@ -885,7 +912,9 @@ const PUP_VIDEO: i32 = 78;
 /// stored in the table.
 const PUP_LOOSE_VIDEO: i32 = 62;
 
-const VIDEO_EXT: &[&str] = &["mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "f4v"];
+const VIDEO_EXT: &[&str] = &[
+    "mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "f4v",
+];
 
 fn is_video(p: &Path) -> bool {
     p.extension()
@@ -1359,7 +1388,10 @@ End Sub
         std::fs::create_dir_all(dir.path().join("videoattract")).unwrap();
         std::fs::write(dir.path().join("videoattract").join("attract.mp4"), b"x").unwrap();
         let found = pup_music(dir.path());
-        let video = found.iter().find(|f| file_name(&f.path) == "attract.mp4").unwrap();
+        let video = found
+            .iter()
+            .find(|f| file_name(&f.path) == "attract.mp4")
+            .unwrap();
         assert_eq!(video.score, PUP_LOOSE_VIDEO);
         assert!(video.min_len && !video.bonus);
         let mut m: Vec<String> = found.iter().map(|f| file_name(&f.path)).collect();
@@ -1504,9 +1536,16 @@ End Sub
             vpx_dirs: &dirs,
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &capture::Finish::default(), &dir.path().join("tmp"), &|| false)
-            .found
-            .unwrap();
+        let f = find(
+            &t,
+            None,
+            20,
+            &capture::Finish::default(),
+            &dir.path().join("tmp"),
+            &|| false,
+        )
+        .found
+        .unwrap();
         assert!(f.what.contains("script music"), "{}", f.what);
         let secs = f.pcm.samples.len() as f64 / rate as f64;
         assert!((19.0..=20.5).contains(&secs), "{secs}");
@@ -1572,9 +1611,16 @@ End Sub
             vpx_dirs: &[],
             popper_dir: None,
         };
-        let f = find(&t, None, 20, &capture::Finish::default(), &dir.path().join("tmp"), &|| false)
-            .found
-            .unwrap();
+        let f = find(
+            &t,
+            None,
+            20,
+            &capture::Finish::default(),
+            &dir.path().join("tmp"),
+            &|| false,
+        )
+        .found
+        .unwrap();
         assert!(f.what.contains("TableLoop"), "{}", f.what);
     }
 }

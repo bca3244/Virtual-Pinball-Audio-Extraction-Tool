@@ -272,9 +272,14 @@ pub fn plan(db: &Db, cache: &Cache, opts: &Options) -> Result<Vec<Entry>> {
             continue;
         };
         // The table's own music, kept when its ROM gave none.
-        let own = table
-            .as_deref()
-            .and_then(|t| cache.clip(&state::table_key(t), opts.seconds, &opts.finish, opts.format.ext()));
+        let own = table.as_deref().and_then(|t| {
+            cache.clip(
+                &state::table_key(t),
+                opts.seconds,
+                &opts.finish,
+                opts.format.ext(),
+            )
+        });
         if let Some(clip) = cache
             .clip(&rom, opts.seconds, &opts.finish, opts.format.ext())
             .or(own)
@@ -820,7 +825,13 @@ impl Runner<'_> {
             .as_deref()
             .filter(|t| t.is_file())
             .and_then(|t| vpx::read_script(t).ok());
-        let fp = rom_fingerprint(zip, nvram.as_deref(), first, first_script.as_deref(), self.opts);
+        let fp = rom_fingerprint(
+            zip,
+            nvram.as_deref(),
+            first,
+            first_script.as_deref(),
+            self.opts,
+        );
         // A recording much shorter than the clip is a start jingle, not the
         // music (a blank nvram leaves Attack from Mars' volume near zero
         // after it): the other ways are tried.
@@ -940,7 +951,10 @@ impl Runner<'_> {
                 if outcome == Outcome::Nothing {
                     self.cache.remove_clips(&job.rom, self.opts.seconds);
                     let why = "the ROM gave no music";
-                    if let Err(e) = self.cache.set_verdict(&job.rom, self.opts.seconds, &fp, why) {
+                    if let Err(e) = self
+                        .cache
+                        .set_verdict(&job.rom, self.opts.seconds, &fp, why)
+                    {
                         log::warn!("{}: couldn't remember the result: {e:#}", job.rom);
                     }
                 }
@@ -1024,7 +1038,9 @@ impl Runner<'_> {
         let found = self.music_from_table(&one, &tmp).found;
         let mut ok = false;
         if found {
-            let stem = self.cache.clip_stem(&key, self.opts.seconds, &self.opts.finish);
+            let stem = self
+                .cache
+                .clip_stem(&key, self.opts.seconds, &self.opts.finish);
             match encode::encode(
                 &tmp.join("clip.wav"),
                 &stem,
@@ -1058,7 +1074,9 @@ impl Runner<'_> {
             Outcome::Recorded => {
                 drop(s);
                 let wav_out = tmp.join("clip.wav");
-                let stem = self.cache.clip_stem(&job.rom, self.opts.seconds, &self.opts.finish);
+                let stem = self
+                    .cache
+                    .clip_stem(&job.rom, self.opts.seconds, &self.opts.finish);
                 match encode::encode(&wav_out, &stem, self.opts.format, self.ffmpeg.as_deref()) {
                     Ok(clip) => {
                         self.cache.clear_verdict(&job.rom);
@@ -1167,7 +1185,12 @@ impl Runner<'_> {
             .arg("--fade-out")
             .arg(self.opts.finish.fade_out.to_string())
             .arg("--lufs")
-            .arg(self.opts.finish.lufs.map_or("off".to_string(), |l| l.to_string()))
+            .arg(
+                self.opts
+                    .finish
+                    .lufs
+                    .map_or("off".to_string(), |l| l.to_string()),
+            )
             .arg("--dll")
             .arg(self.dll.as_deref().context("libpinmame not found")?);
         if no_escape {
@@ -1419,7 +1442,9 @@ mod tests {
 
         // A clip recorded earlier for the ROM is reused.
         std::fs::write(
-            cache.clip_stem("afm_113b", 30, &capture::Finish::default()).with_extension("mp3"),
+            cache
+                .clip_stem("afm_113b", 30, &capture::Finish::default())
+                .with_extension("mp3"),
             [7u8; 2048],
         )
         .unwrap();

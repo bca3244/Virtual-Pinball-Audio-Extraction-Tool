@@ -2,6 +2,10 @@
 
 Releases are published automatically when the version in `Cargo.toml` changes.
 
+## 0.2.0-beta.2
+
+- Fixed: beta.1's `record` and `scan` crashed at startup (the new `--lufs` option was declared and read as different types). `--lufs -16` with a space also works now, as well as `--lufs=-16`.
+
 ## 0.2.0-beta.1
 
 - Every clip is levelled to the same loudness (EBU R128 integrated loudness, -16 LUFS by default) with a look-ahead limiter keeping peaks under -1 dBFS, so quiet tables like Apollo 13 or Goldeneye play about as loud as the rest. `--lufs off` (or unticking "Even loudness" in the GUI) keeps the old peak normalisation.

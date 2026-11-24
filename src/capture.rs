@@ -403,7 +403,11 @@ pub fn assess(samples: &[i16], channels: u32, rate: u32) -> (f64, bool) {
     // The quiet level as it would be after peak normalisation (0.8 FS, at
     // most 32x), whatever levelling the clip had.
     let top = samples.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0) as f64;
-    let norm = if top > 0.0 { (0.8 * i16::MAX as f64 / top).min(32.0) } else { 1.0 };
+    let norm = if top > 0.0 {
+        (0.8 * i16::MAX as f64 / top).min(32.0)
+    } else {
+        1.0
+    };
     let floor = (QUIET / norm).max(peak * 0.03);
     let loud: Vec<usize> = (0..l.rms.len()).filter(|&i| l.rms[i] > floor).collect();
     let noisy = loud.iter().filter(|&&i| l.zcr[i] > NOISY_ZCR).count();
@@ -442,11 +446,20 @@ pub const MAX_FADE: f64 = 10.0;
 impl Finish {
     /// Within bounds: fades 0 to [`MAX_FADE`] s, loudness -40 to -6 LUFS.
     pub fn clamped(self) -> Finish {
-        let fade = |f: f64| if f.is_finite() { f.clamp(0.0, MAX_FADE) } else { 0.0 };
+        let fade = |f: f64| {
+            if f.is_finite() {
+                f.clamp(0.0, MAX_FADE)
+            } else {
+                0.0
+            }
+        };
         Finish {
             fade_in: fade(self.fade_in),
             fade_out: fade(self.fade_out),
-            lufs: self.lufs.filter(|l| l.is_finite()).map(|l| l.clamp(-40.0, -6.0)),
+            lufs: self
+                .lufs
+                .filter(|l| l.is_finite())
+                .map(|l| l.clamp(-40.0, -6.0)),
         }
     }
 
@@ -473,7 +486,19 @@ impl Finish {
                 .map_err(|_| format!("{s:?} isn't a loudness (like -16) or \"off\"")),
         }
     }
+
+    /// [`Finish::parse_lufs`] for clap, which can't take an `Option` field
+    /// as a value of its own (it reads it as "the option may be left out").
+    pub fn parse_lufs_arg(s: &str) -> Result<Lufs, String> {
+        Self::parse_lufs(s).map(Lufs)
+    }
 }
+
+/// A `--lufs` value: a target loudness, or `None` for peak normalisation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lufs(pub Option<f64>);
+
+impl Finish {}
 
 /// From the music after Start (the coin chimes before it, and a short Start
 /// sound, are dropped), cut at the first 3 s of silence after it and at
@@ -534,7 +559,9 @@ const CEILING: f64 = 0.891 * i16::MAX as f64;
 pub fn integrated_lufs(samples: &[i16], channels: usize, rate: usize) -> Option<f64> {
     let mut m = ebur128::EbuR128::new(channels as u32, rate as u32, ebur128::Mode::I).ok()?;
     m.add_frames_i16(samples).ok()?;
-    m.loudness_global().ok().filter(|l| l.is_finite() && *l > -70.0)
+    m.loudness_global()
+        .ok()
+        .filter(|l| l.is_finite() && *l > -70.0)
 }
 
 /// Levels a cut clip (to `lufs` through a limiter, or by its peak) and
@@ -544,7 +571,10 @@ pub fn finish_clip(cut: &[i16], channels: usize, rate: usize, finish: &Finish) -
     let peak = cut.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0) as f64;
     let mut x: Vec<f64> = cut.iter().map(|&s| s as f64).collect();
     if peak > 0.0 {
-        match finish.lufs.and_then(|t| Some((t, integrated_lufs(cut, channels, rate)?))) {
+        match finish
+            .lufs
+            .and_then(|t| Some((t, integrated_lufs(cut, channels, rate)?)))
+        {
             Some((target, measured)) => {
                 // The limiter takes some loudness off: measured again and
                 // made up for, a couple of times, within the gain limit.
@@ -619,7 +649,7 @@ fn limit(x: &mut [f64], channels: usize, rate: usize) {
         return;
     }
     let look = (rate / 200).max(1); // 5 ms
-    // Smallest need within ±look (a monotonic queue).
+                                    // Smallest need within ±look (a monotonic queue).
     let mut held = vec![1.0; frames];
     let mut q: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut next = 0;
@@ -649,7 +679,11 @@ fn limit(x: &mut [f64], channels: usize, rate: usize) {
     for i in 0..frames {
         let (a, b) = (i.saturating_sub(half), (i + half + 1).min(frames));
         let avg = (sum[b] - sum[a]) / (b - a) as f64;
-        env = if avg < env { avg } else { env + (avg - env) * release };
+        env = if avg < env {
+            avg
+        } else {
+            env + (avg - env) * release
+        };
         let g = env.min(need[i]);
         for v in &mut x[i * channels..(i + 1) * channels] {
             *v *= g;
@@ -672,12 +706,18 @@ mod tests {
         let rate = 44100usize;
         // A quiet tone with rare loud clicks: peak mode can't lift it.
         let mut s: Vec<i16> = (0..rate * 20)
-            .map(|i| ((i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 300.0) as i16)
+            .map(|i| {
+                ((i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 300.0) as i16
+            })
             .collect();
         for k in (0..s.len()).step_by(rate) {
             s[k] = 30000;
         }
-        let f = Finish { fade_in: 0.0, fade_out: 0.0, lufs: Some(-16.0) };
+        let f = Finish {
+            fade_in: 0.0,
+            fade_out: 0.0,
+            lufs: Some(-16.0),
+        };
         let out = finish_clip(&s, 1, rate, &f);
         let l = integrated_lufs(&out, 1, rate).unwrap();
         assert!((l - -16.0).abs() < 1.5, "{l}");
@@ -689,7 +729,11 @@ mod tests {
     fn fades_both_ends() {
         let rate = 1000usize;
         let s = vec![1000i16; rate * 10];
-        let f = Finish { fade_in: 2.0, fade_out: 1.0, lufs: None };
+        let f = Finish {
+            fade_in: 2.0,
+            fade_out: 1.0,
+            lufs: None,
+        };
         let out = finish_clip(&s, 1, rate, &f);
         assert_eq!(out[0], 0);
         assert!(out[rate] < out[3 * rate] / 2 + 10);

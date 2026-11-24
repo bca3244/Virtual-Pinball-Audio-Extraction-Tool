@@ -837,7 +837,10 @@ mod tests {
 
     #[test]
     fn rom_name_from_controller_gamename() {
-        assert_eq!(rom_name("Const cGameName = \"tz_94h\"\n").as_deref(), Some("tz_94h"));
+        assert_eq!(
+            rom_name("Const cGameName = \"tz_94h\"\n").as_deref(),
+            Some("tz_94h")
+        );
         let s = "Sub Table1_Init\n vpmInit Me\n With Controller\n  .GameName = cGameName\n End With\n Controller.GameName=\"shrkysht\"\nEnd Sub\n";
         assert_eq!(rom_name(s).as_deref(), Some("shrkysht"));
         let w = "With Controller\n .GameName = \"afm_113b\"\nEnd With\n";

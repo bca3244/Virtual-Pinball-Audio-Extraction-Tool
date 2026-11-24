@@ -337,9 +337,8 @@ unsafe extern "system" fn on_display_updated(
         return;
     };
     if !data.is_null() && (16..=256).contains(&l.width) && (8..=64).contains(&l.height) {
-        let px = unsafe {
-            std::slice::from_raw_parts(data as *const u8, (l.width * l.height) as usize)
-        };
+        let px =
+            unsafe { std::slice::from_raw_parts(data as *const u8, (l.width * l.height) as usize) };
         let text = capture::dmd_text(px, l.width as usize, l.height as usize);
         if let Ok(mut d) = SHARED.dmd.lock() {
             *d = text;

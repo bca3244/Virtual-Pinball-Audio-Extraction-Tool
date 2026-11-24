@@ -243,9 +243,12 @@ mod tests {
         let clips = dir.path().join("clips");
         // A clip from before the static guard: never reused.
         std::fs::write(clips.join("diner_l4-30s.ogg"), [0u8; 2048]).unwrap();
-        assert!(c.clip("diner_l4", 30, &crate::capture::Finish::default(), "ogg").is_none());
+        assert!(c
+            .clip("diner_l4", 30, &crate::capture::Finish::default(), "ogg")
+            .is_none());
         std::fs::write(
-            c.clip_stem("diner_l4", 30, &crate::capture::Finish::default()).with_extension("mp3"),
+            c.clip_stem("diner_l4", 30, &crate::capture::Finish::default())
+                .with_extension("mp3"),
             [0u8; 2048],
         )
         .unwrap();
@@ -265,24 +268,49 @@ mod tests {
     fn clip_lookup_wants_the_format_and_a_real_file() {
         let dir = tempfile::tempdir().unwrap();
         let c = Cache::open(Some(dir.path())).unwrap();
-        assert!(c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").is_none());
-        std::fs::write(c.clip_stem("afm", 30, &crate::capture::Finish::default()).with_extension("wav"), [0u8; 2048]).unwrap();
+        assert!(c
+            .clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+            .is_none());
+        std::fs::write(
+            c.clip_stem("afm", 30, &crate::capture::Finish::default())
+                .with_extension("wav"),
+            [0u8; 2048],
+        )
+        .unwrap();
         assert!(
-            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").is_none(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+                .is_none(),
             "a WAV doesn't stand in for an MP3"
         );
-        std::fs::write(c.clip_stem("afm", 30, &crate::capture::Finish::default()).with_extension("mp3"), b"x").unwrap();
+        std::fs::write(
+            c.clip_stem("afm", 30, &crate::capture::Finish::default())
+                .with_extension("mp3"),
+            b"x",
+        )
+        .unwrap();
         assert!(
-            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").is_none(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+                .is_none(),
             "an empty leftover isn't a clip"
         );
-        std::fs::write(c.clip_stem("afm", 30, &crate::capture::Finish::default()).with_extension("mp3"), [0u8; 2048]).unwrap();
+        std::fs::write(
+            c.clip_stem("afm", 30, &crate::capture::Finish::default())
+                .with_extension("mp3"),
+            [0u8; 2048],
+        )
+        .unwrap();
         assert_eq!(
-            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3").unwrap().extension().unwrap(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "mp3")
+                .unwrap()
+                .extension()
+                .unwrap(),
             "mp3"
         );
         assert_eq!(
-            c.clip("afm", 30, &crate::capture::Finish::default(), "wav").unwrap().extension().unwrap(),
+            c.clip("afm", 30, &crate::capture::Finish::default(), "wav")
+                .unwrap()
+                .extension()
+                .unwrap(),
             "wav"
         );
     }
